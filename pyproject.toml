@@ -1,0 +1,48 @@
+[project]
+name = "quota-board"
+version = "0.1.0"
+description = "统一查看各 AI 渠道余额、订阅用量与 Coding Plan 额度的本地 WebUI"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.4",
+    "uvicorn[standard]>=0.52.1",
+]
+
+[project.scripts]
+quotaboard = "app.cli:main"
+
+[tool.uv]
+# 无 build-system 的项目默认不安装 entry points；声明为可安装包才能生成
+# `uv run quotaboard` 这个命令入口（用 uv 内置的构建支持）。
+package = true
+
+[tool.setuptools]
+# flat-layout 下 setuptools 会把 static/ 等非包目录误判为顶层包，显式声明
+# 包列表（scripts 入口只需要 app 包）。
+packages = ["app", "app.providers"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.1",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+# BLE001（except Exception 广泛捕获）：本项目里每个 provider 查询函数都靠它兜底，
+# 单渠道异常绝不能拖垮整批查询——这是有意设计，不是疏漏。
+ignore = ["BLE001"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["DTZ", "S101"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]

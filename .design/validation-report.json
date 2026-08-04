@@ -1,0 +1,109 @@
+{
+  "success": true,
+  "outcome": "passed",
+  "repairable": true,
+  "terminalViolations": [],
+  "terminalBlockingSummary": null,
+  "skillProvenance": {
+    "name": "solo-design",
+    "version": "2026.07.22.00.00.00",
+    "version_source": "skill-release-manifest.json",
+    "runtime_skill_dir": null,
+    "recorded_at": null,
+    "expected_version": "2026.07.22.00.00.00",
+    "status": "matched",
+    "read_status": "ok"
+  },
+  "operatingMode": "free-explore",
+  "renderBlockingErrorCount": 0,
+  "softWarningCount": 4,
+  "renderBlockingErrors": [],
+  "errorSignatures": [],
+  "softWarnings": [
+    "[repair-ledger] validationRepairLedger[0].repairActions[0].preEditFileHashes[] is missing (legacy optional evidence)",
+    "[repair-ledger] validationRepairLedger[0].repairActions[0].postEditFileHashes[] is missing (legacy optional evidence)",
+    "[html-quality] colors_and_type.css: free-explore brand CSS must use one primary hue only; forbidden secondary/accent brand variables found (--secondary, --on-secondary, --secondary-container, --on-secondary-container). Use --state-success/warning/error/info only for semantic states.",
+    "[html-quality] index.html: free-explore pages must not use secondary/accent brand variables. Use the single primary hue, neutral tints, or --state-success/warning/error/info for real semantic states."
+  ],
+  "repairPlanHints": [],
+  "repairActionTable": [],
+  "errorCount": 0,
+  "warningCount": 4,
+  "errors": [],
+  "warnings": [
+    "[repair-ledger] validationRepairLedger[0].repairActions[0].preEditFileHashes[] is missing (legacy optional evidence)",
+    "[repair-ledger] validationRepairLedger[0].repairActions[0].postEditFileHashes[] is missing (legacy optional evidence)",
+    "[html-quality] colors_and_type.css: free-explore brand CSS must use one primary hue only; forbidden secondary/accent brand variables found (--secondary, --on-secondary, --secondary-container, --on-secondary-container). Use --state-success/warning/error/info only for semantic states.",
+    "[html-quality] index.html: free-explore pages must not use secondary/accent brand variables. Use the single primary hue, neutral tints, or --state-success/warning/error/info for real semantic states."
+  ],
+  "validationRunDisciplineStatus": {
+    "declared": true,
+    "restoreMode": false,
+    "maxFullValidationRuns": 2,
+    "validationHistoryCount": 2,
+    "repairLedgerCount": 1,
+    "softWarningsTriggerRepair": false,
+    "terminalState": null,
+    "nextAction": null,
+    "violations": [],
+    "success": true
+  },
+  "terminalState": null,
+  "nextCheck": {
+    "type": "finish-readiness",
+    "command": "node '/Users/runhua/.trae-cn/builtin/design/default/skills/solo-design/shared-runtime/deterministic-tooling/validate-finish-readiness.mjs' '/Users/runhua/Runhua MBP/Python/额度监控/.design' --check=all",
+    "fullValidationAllowed": false,
+    "reason": "workspace validation passed; run complete finish readiness before final delivery"
+  },
+  "repairBatch": [],
+  "repairContextPacket": {
+    "schema_version": "1.0",
+    "purpose": "small-context repair packet; read this before full validation-report.json",
+    "success": true,
+    "terminalState": null,
+    "skillProvenance": {
+      "name": "solo-design",
+      "version": "2026.07.22.00.00.00",
+      "version_source": "skill-release-manifest.json",
+      "runtime_skill_dir": null,
+      "recorded_at": null,
+      "expected_version": "2026.07.22.00.00.00",
+      "status": "matched",
+      "read_status": "ok"
+    },
+    "renderBlockingErrorCount": 0,
+    "softWarningCount": 4,
+    "renderBlockingErrors": [],
+    "repairActionTable": [],
+    "nextCheck": {
+      "type": "finish-readiness",
+      "command": "node '/Users/runhua/.trae-cn/builtin/design/default/skills/solo-design/shared-runtime/deterministic-tooling/validate-finish-readiness.mjs' '/Users/runhua/Runhua MBP/Python/额度监控/.design' --check=all",
+      "fullValidationAllowed": false,
+      "reason": "workspace validation passed; run complete finish readiness before final delivery"
+    },
+    "forbidden": [
+      "do not read validator source",
+      "do not rerun full validation when nextCheck.fullValidationAllowed=false",
+      "do not start preview/browser unless user explicitly asks",
+      "do not hand-edit repair ledger fields"
+    ]
+  },
+  "projectFileHashes": {
+    "quota-board.design": "d10dc98f8d5fdc26f139587c54b5c816f492bf954a92739ac4fcd7b3715abb27",
+    "colors_and_type.css": "2c12bf9cabe9ee16a1577a37f8ff69dcab5685899d36b5eb28c13b4eedb2fedf",
+    "runtime-orchestration-summary.json": "d0f913afad896de21c73748d8a3ad86d525147e190ec284ea33a5f66ec6b31b8",
+    "pages/index.html": "85b64cc777822b8fb1071fb1a534df685bbb74a26179f05a221b0959a3d04516",
+    "assets/config-modal-dark.png": "bc813491ab536469c0c641dccb7bb60ced671b4c5ff8b7d156f544b1071ce266",
+    "assets/config-modal-light.png": "84b8e3c2025a1033aed509dbd9b1a6b8a3568228b2cd2d275250c214937eff3e",
+    "assets/dashboard-dark-desktop.png": "12bf4fa26214b42ff836ccc0ce914bf8b34bf36e815fe89b71637109a808ce21",
+    "assets/dashboard-dark-mobile.png": "31002478f16ccb7a2fca135aff87d550f10e2919e9890b6b39ed7682bdb3bf2e",
+    "assets/dashboard-light-desktop.png": "5bf40908cf2976e6837b04af866af6c5378f71b219133bdc15654c6c793a7f0a",
+    "assets/dashboard-light-mobile.png": "8febb14e5a7728cc807f12fdbc7e88d7023c7a4d903790e1b0e16ff88c35d821",
+    "assets/history-modal-dark.png": "339ebbc0a6c811821e603f387c36f9246e6badaeaa170cd9a9a3682401f7c436",
+    "assets/history-modal-light.png": "8de4760bcc7fecd970d15b6219693d3ce8839585d57a398a537d5ebdd3cc0aa6"
+  },
+  "designDir": "/Users/runhua/Runhua MBP/Python/额度监控/.design",
+  "expectedPages": null,
+  "requireInteractions": null,
+  "checkedAt": "2026-08-04T10:07:27.275Z"
+}

@@ -1,0 +1,177 @@
+{
+  "data": [
+    {
+      "id": "page-index",
+      "title": "QuotaBoard 额度监控",
+      "type": "page",
+      "version": 1,
+      "createdAt": 1785828000000,
+      "canvasData": {
+        "x": 0,
+        "y": 0,
+        "group": 0,
+        "layoutSnapshot": {
+          "version": 1,
+          "contentHeight": 282,
+          "viewportWidth": 1440,
+          "sourceHash": "fnv1a-34e3dbe3",
+          "measuredAt": 1785832738771
+        }
+      },
+      "devMetadata": {
+        "htmlSrc": "pages/index.html",
+        "interactions": []
+      }
+    },
+    {
+      "id": "image-001",
+      "title": "渠道配置深色界面",
+      "type": "image",
+      "version": 1,
+      "createdAt": 1785828000000,
+      "canvasData": {
+        "x": 0,
+        "y": 377,
+        "naturalSize": {
+          "width": 2880,
+          "height": 1800
+        }
+      },
+      "devMetadata": {
+        "imageSrc": "assets/config-modal-dark.png"
+      }
+    },
+    {
+      "id": "image-002",
+      "title": "渠道配置浅色界面",
+      "type": "image",
+      "version": 1,
+      "createdAt": 1785828000000,
+      "canvasData": {
+        "x": 620,
+        "y": 377,
+        "naturalSize": {
+          "width": 2880,
+          "height": 1800
+        }
+      },
+      "devMetadata": {
+        "imageSrc": "assets/config-modal-light.png"
+      }
+    },
+    {
+      "id": "image-003",
+      "title": "额度看板深色桌面界面",
+      "type": "image",
+      "version": 1,
+      "createdAt": 1785828000000,
+      "canvasData": {
+        "x": 1240,
+        "y": 377,
+        "naturalSize": {
+          "width": 2880,
+          "height": 3988
+        }
+      },
+      "devMetadata": {
+        "imageSrc": "assets/dashboard-dark-desktop.png"
+      }
+    },
+    {
+      "id": "image-004",
+      "title": "额度看板深色移动界面",
+      "type": "image",
+      "version": 1,
+      "createdAt": 1785828000000,
+      "canvasData": {
+        "x": 1860,
+        "y": 377,
+        "naturalSize": {
+          "width": 780,
+          "height": 7068
+        }
+      },
+      "devMetadata": {
+        "imageSrc": "assets/dashboard-dark-mobile.png"
+      }
+    },
+    {
+      "id": "image-005",
+      "title": "额度看板浅色桌面界面",
+      "type": "image",
+      "version": 1,
+      "createdAt": 1785828000000,
+      "canvasData": {
+        "x": 2480,
+        "y": 377,
+        "naturalSize": {
+          "width": 2880,
+          "height": 3988
+        }
+      },
+      "devMetadata": {
+        "imageSrc": "assets/dashboard-light-desktop.png"
+      }
+    },
+    {
+      "id": "image-006",
+      "title": "额度看板浅色移动界面",
+      "type": "image",
+      "version": 1,
+      "createdAt": 1785828000000,
+      "canvasData": {
+        "x": 3100,
+        "y": 377,
+        "naturalSize": {
+          "width": 780,
+          "height": 7068
+        }
+      },
+      "devMetadata": {
+        "imageSrc": "assets/dashboard-light-mobile.png"
+      }
+    },
+    {
+      "id": "image-007",
+      "title": "历史趋势深色界面",
+      "type": "image",
+      "version": 1,
+      "createdAt": 1785828000000,
+      "canvasData": {
+        "x": 3720,
+        "y": 377,
+        "naturalSize": {
+          "width": 2880,
+          "height": 1800
+        }
+      },
+      "devMetadata": {
+        "imageSrc": "assets/history-modal-dark.png"
+      }
+    },
+    {
+      "id": "image-008",
+      "title": "历史趋势浅色界面",
+      "type": "image",
+      "version": 1,
+      "createdAt": 1785828000000,
+      "canvasData": {
+        "x": 4340,
+        "y": 377,
+        "naturalSize": {
+          "width": 2880,
+          "height": 1800
+        }
+      },
+      "devMetadata": {
+        "imageSrc": "assets/history-modal-light.png"
+      }
+    }
+  ],
+  "config": {
+    "autoLayout": true,
+    "deviceType": "desktop",
+    "projectName": "QuotaBoard 额度监控",
+    "designLibrary": null
+  }
+}

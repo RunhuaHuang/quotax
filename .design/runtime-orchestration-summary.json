@@ -1,0 +1,235 @@
+{
+  "skillProvenance": {
+    "name": "solo-design",
+    "version": "2026.07.22.00.00.00",
+    "version_source": "skill-release-manifest.json",
+    "read_status": "ok"
+  },
+  "designSource": {
+    "operatingMode": "free-explore",
+    "libraryIdentity": null
+  },
+  "project": {
+    "resolvedLane": "existing_edit_add_comparison",
+    "selectedIntentWorkflowRead": true,
+    "contextRequirementsLoaded": [
+      {
+        "path": "shared-runtime/runtime-boundaries/lane-runtime-contracts.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "shared-runtime/agent-dispatch-runtime/lane-dispatch-index.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "delivery-quality/page-rendering-quality-gate.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "delivery-quality/design-artifact-validation.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      },
+      {
+        "path": "delivery-quality/delivery-evidence-contract.md",
+        "readStatus": "loaded",
+        "bodyRead": true
+      }
+    ],
+    "contextReadScope": "selected-lane-only",
+    "validationRunDiscipline": {
+      "maxFullValidationRuns": 2,
+      "softWarningsTriggerRepair": false,
+      "blockingRepairMode": "targeted-once",
+      "forbiddenRepairTriggers": [
+        "soft-warning-only",
+        "provenance-warning-only",
+        "style-warning-only"
+      ]
+    },
+    "lowValueCallWatchdog": {
+      "enabled": true,
+      "noProgressNextAction": "readiness-or-blocked-summary"
+    },
+    "deviceType": "desktop",
+    "mutationMode": "delivery-structure-repair",
+    "sourceProjectLaneHeritage": "legacy-html-page",
+    "affectedPageIds": [
+      "page-index"
+    ],
+    "inPlaceProof": "用户明确要求注册当前既有页面并保持现有视觉实现和业务功能不变",
+    "styleContinuityAnchors": {
+      "colorSystem": "保留现有 Material 3 浅色/深色变量和渠道状态色",
+      "shapeSystem": "保留现有卡片、按钮、弹窗圆角",
+      "typographySystem": "保留现有 Google Sans、Roboto 与中文系统字体栈",
+      "spacingSystem": "保留现有 4pt 间距体系",
+      "componentLanguage": "保留额度卡片、状态标签、进度环、配置与趋势弹窗",
+      "surfaceAndDepth": "保留现有表面层级、描边与阴影",
+      "imageryAndIconography": "保留现有内联 SVG 图标和已生成截图资产",
+      "interactionTone": "保留刷新、配置、主题、趋势和渠道管理交互"
+    },
+    "dispatchPreflightManifest": [],
+    "validationHistory": [
+      {
+        "reportPath": "validation-report.json",
+        "reportHash": "71e9f8019e1fe47dc6ae8bad0711e656e27b8a4c5cef5bbb86aeba7a0183538f",
+        "checkedAt": "2026-08-04T06:04:59.556Z",
+        "success": false,
+        "exitCode": 1,
+        "renderBlockingErrorCount": 3,
+        "repairPlanHints": [],
+        "errorSignatures": [
+          {
+            "errorClass": "directory-structure",
+            "normalized": "[directory-structure] Missing required directory: pages/",
+            "signature": "ad7a75b0a68dffd65d4b66b315e90d4505c9f8f0c848074a8ac936493bf5ab79"
+          },
+          {
+            "errorClass": "artifact-readiness",
+            "normalized": "[design-files] No .design file found in the root directory",
+            "signature": "a75ac2d4561c46b582aba4649aa5f965a9ee0675db3788dcfa750004e3052ac8"
+          },
+          {
+            "errorClass": "html-files",
+            "normalized": "[html-files] pages/ directory not found, cannot check HTML files",
+            "signature": "cab9c782029c06022ddd48a655bbb039ca5a21006de34368d163b37de40000a3"
+          }
+        ],
+        "terminalState": null
+      },
+      {
+        "reportPath": "validation-report.json",
+        "reportHash": "6eda91a1310218ffbc865fd6a6d1714d9df9fcb1c72ed46674b0a26ae6ad842f",
+        "checkedAt": "2026-08-04T06:08:54.534Z",
+        "success": true,
+        "exitCode": 0,
+        "renderBlockingErrorCount": 0,
+        "repairPlanHints": [],
+        "errorSignatures": [],
+        "terminalState": null
+      }
+    ],
+    "validationRepairLedger": [
+      {
+        "failedReportPath": "validation-report.json",
+        "failedReportHash": "71e9f8019e1fe47dc6ae8bad0711e656e27b8a4c5cef5bbb86aeba7a0183538f",
+        "repairWorkflowReadPath": "intent-workflows/intent-project-mutation/main-agent-repair-workflow.md",
+        "repairStartedAt": "2026-08-04T06:07:46.815Z",
+        "repairEntryStatus": "revalidated-success",
+        "ownerTriage": [
+          {
+            "owner": "main-agent",
+            "errorClass": "unknown-blocking",
+            "affectedFiles": [],
+            "repairScope": "read validation report, classify owner, then use the narrowest targeted repair",
+            "strategy": "no validator source read; targeted affected-file excerpt only"
+          },
+          {
+            "owner": "main-agent",
+            "errorClass": "artifact-readiness",
+            "affectedFiles": [],
+            "repairScope": "repair_design_registration_or_file_reference_only",
+            "strategy": "read .design and affected file metadata only"
+          },
+          {
+            "owner": "main-agent",
+            "errorClass": "unknown-blocking",
+            "affectedFiles": [],
+            "repairScope": "read validation report, classify owner, then use the narrowest targeted repair",
+            "strategy": "no validator source read; targeted affected-file excerpt only"
+          }
+        ],
+        "repairPlanHints": [],
+        "repairActions": [
+          {
+            "owner": "main-agent",
+            "errorClass": "artifact-readiness",
+            "affectedFiles": [
+              "quota-board.design",
+              "pages/index.html",
+              "colors_and_type.css",
+              "app.js",
+              "runtime-orchestration-summary.json"
+            ],
+            "action": "repair_design_registration_or_file_reference_only",
+            "observedFileHashes": [
+              {
+                "path": "quota-board.design",
+                "hash": "77fe96382a51d8faf2b8d662f01926f8bec4e6e93774bc419952f603eea7df01"
+              },
+              {
+                "path": "pages/index.html",
+                "hash": "e797cc77e94681f6cebd96371820a7f41e639fbd31489c41ad5eee17aad51f92"
+              },
+              {
+                "path": "colors_and_type.css",
+                "hash": "8c45f46a2561af5a3c4d09f0c31a8bdf4bd3369e020f4e65e00a530168b54a46"
+              },
+              {
+                "path": "app.js",
+                "hash": "a22695aacec49834216bd718eeb3e81940d1f886ed62ef9454e9250d8b6b3f0d"
+              },
+              {
+                "path": "runtime-orchestration-summary.json",
+                "hash": "52c74adb7be297e78343d0c8df1b19409c996c9cc44fb286281de2503bc7a09a"
+              }
+            ],
+            "preEditFileHashes": [],
+            "postEditFileHashes": [],
+            "repairOwnedFields": [
+              "artifact-readiness"
+            ],
+            "recordedAt": "2026-08-04T06:08:04.011Z",
+            "repairActionTableRequired": true
+          }
+        ],
+        "revalidationReportPath": "validation-report.json",
+        "revalidationReportHash": "6eda91a1310218ffbc865fd6a6d1714d9df9fcb1c72ed46674b0a26ae6ad842f",
+        "revalidationSuccess": true,
+        "blockedReason": null,
+        "revalidationRecordedAt": "2026-08-04T06:09:03.891Z"
+      }
+    ],
+    "repairEntryEvidence": [
+      {
+        "failedReportPath": "validation-report.json",
+        "failedReportHash": "71e9f8019e1fe47dc6ae8bad0711e656e27b8a4c5cef5bbb86aeba7a0183538f",
+        "repairWorkflowReadPath": "intent-workflows/intent-project-mutation/main-agent-repair-workflow.md",
+        "repairStartedAt": "2026-08-04T06:07:46.815Z",
+        "ledgerIndex": 0,
+        "ownerTriageCount": 3,
+        "repairActionCount": 1,
+        "revalidationReportPath": "validation-report.json",
+        "revalidationReportHash": "6eda91a1310218ffbc865fd6a6d1714d9df9fcb1c72ed46674b0a26ae6ad842f",
+        "revalidationSuccess": true
+      }
+    ]
+  },
+  "pages": [
+    {
+      "nodeId": "page-index",
+      "slug": "index",
+      "title": "QuotaBoard 额度监控",
+      "htmlSrc": "pages/index.html",
+      "pageType": "information-dense",
+      "businessScenario": "统一查看 AI 渠道余额、订阅用量与 Coding Plan 额度",
+      "componentPlan": [],
+      "imagePlan": [
+        {
+          "role": "reference-screenshot",
+          "status": "reused",
+          "assetCount": 8
+        }
+      ],
+      "qualityRisks": [
+        "动态数据依赖后端 API",
+        "桌面与移动端响应式布局"
+      ],
+      "visualNorthStar": "清晰、紧凑且可快速扫描的开发者额度看板",
+      "sourceContextPreserved": true
+    }
+  ]
+}

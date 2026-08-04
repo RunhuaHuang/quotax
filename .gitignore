@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 本地配置（含密钥，权限 600）
+config.json
+# 解析失败时 _load_raw() 自动生成的备份，里面是**明文密钥**，绝不能进版本库
+config.json.corrupted.*
+# 原子写入过程中的临时文件（.config.json.<hex>.tmp），同样含明文密钥
+.config.json.*.tmp
+# 手动导出的配置（GET /api/config/export?include_secrets=true 含明文密钥）
+config-export*.json
+
+# 历史趋势数据（个人用量记录）
+history/
+
+# Codex 上传凭据文件（用户通过 Web 上传的 auth.json，含明文 token）
+credentials/
+
+# 测试产物
+.playwright-mcp/
+.ruff_cache/
+.pytest_cache/
+
+# 系统文件
+.DS_Store
