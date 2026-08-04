@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 
 
 @dataclass
@@ -72,3 +73,23 @@ def ok(**kwargs) -> ChannelResult:
 
 def fail(status: str, message: str, **kwargs) -> ChannelResult:
     return ChannelResult(status=status, message=message, **kwargs)
+
+
+def to_ts(value) -> int | None:
+    """统一的时间戳归一：兼容秒/毫秒/ISO8601 字符串 → epoch 毫秒。
+
+    各 provider（volcengine / coding_plans / mimo / subscriptions）原本各有一份
+    近乎相同的私有 _to_ts/_iso_to_ts，逻辑一致，集中到这里避免四份实现慢慢漂移。
+    返回 None 表示无法解析（调用方应保留上游原值或留空）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and value > 0:
+        # < 1e10 视为秒级，否则毫秒级
+        return int(value * 1000 if value < 10_000_000_000 else value)
+    if isinstance(value, str):
+        try:
+            return int(datetime.fromisoformat(value).timestamp() * 1000)
+        except ValueError:
+            return None
+    return None

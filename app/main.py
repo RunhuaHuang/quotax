@@ -29,6 +29,21 @@ from .providers import channel_category, query_channel
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
+# 火山渠道在后端 /api/quotas 里被拆成 <id>_agent / <id>_coding 两张卡展示（前端
+# 拿到的 channel id 带后缀），但 config / 缓存 / 历史都按原始 id（不带后缀）存取。
+# 前端"刷新此渠道"按钮发的 ids 会带后缀，必须归一化回 config id 才能匹配到渠道。
+# create_or_update_channel / get_channel_secret 里也有同样的后缀归一逻辑。
+_VOLC_PLAN_SUFFIXES = ("_agent", "_coding")
+
+
+def _canonical_channel_id(channel_id: str) -> str:
+    """去掉火山渠道 id 的 _agent/_coding 后缀，归一到 config 里的真实 id。"""
+    for suffix in _VOLC_PLAN_SUFFIXES:
+        if channel_id.endswith(suffix):
+            return channel_id[: -len(suffix)]
+    return channel_id
+
+
 # 结果缓存：按渠道 id 分别缓存，成功 60s / 失败 15s（对齐 cc-switch：错误短缓存
 # 以便快速重试，同时避免高频打官方接口触发风控）。之前是整体 all-or-nothing——
 # 任一渠道失败就把全局 TTL 都降到 15s，导致成功的渠道也被牵连着每 15 秒重查。
@@ -151,10 +166,7 @@ async def create_or_update_channel(payload: ChannelPayload):
     # 火山渠道在前端按 Plan 拆成 <id>_agent / <id>_coding 展示，前端开关发的 id 带
     # 这些后缀。停用/启用只需归一回真实 config id（不带后缀），否则会被当成新建。
     if payload.id:
-        for suffix in ("_agent", "_coding"):
-            if payload.id.endswith(suffix):
-                payload.id = payload.id[: -len(suffix)]
-                break
+        payload.id = _canonical_channel_id(payload.id)
 
     is_new = not payload.id or config_store.get_channel(payload.id) is None
     if is_new:
@@ -202,11 +214,7 @@ async def remove_channel(channel_id: str):
 async def get_channel_secret(channel_id: str):
     """返回指定渠道的明文密钥（仅本机无认证访问，供编辑表单"显示密钥"使用）。"""
     # 火山子渠道 id 带 _agent/_coding 后缀，归一到真实 config id
-    base_id = channel_id
-    for suffix in ("_agent", "_coding"):
-        if base_id.endswith(suffix):
-            base_id = base_id[: -len(suffix)]
-            break
+    base_id = _canonical_channel_id(channel_id)
     channel = config_store.get_channel(base_id)
     if not channel:
         raise HTTPException(status_code=404, detail="渠道不存在")
@@ -369,7 +377,11 @@ async def quotas(force: bool = False, ids: str | None = None):
     """
     channels = config_store.list_channels()
     if ids:
-        wanted = {x.strip() for x in ids.split(",") if x.strip()}
+        # 归一化 _agent/_coding 后缀：火山渠道在 /api/quotas 返回层被拆成两张卡
+        # （id 带 _agent/_coding），前端"刷新此渠道"按钮发的 ids 会带后缀，必须
+        # 归一回 config id 才能匹配到渠道，否则单卡刷新火山子卡时返回空、卡上的
+        # 数据永远更新不了。
+        wanted = {_canonical_channel_id(x.strip()) for x in ids.split(",") if x.strip()}
         channels = [c for c in channels if c.id in wanted]
     enabled = [c for c in channels if c.enabled]
 

@@ -147,6 +147,24 @@ def test_quotas_ids_filter_ignores_unknown_ids(client):
     assert len(resp.json()["channels"]) == 1
 
 
+def test_quotas_ids_strips_volcengine_plan_suffix(client):
+    """回归：火山渠道在 /api/quotas 返回层被拆成 <id>_agent/<id>_coding 两张卡，
+    前端"刷新此渠道"按钮发的 ids 带后缀。后端必须归一回 config id 才能匹配到
+    渠道，否则单卡刷新火山子卡时返回空、卡上的数据永远更新不了。"""
+    created = client.post(
+        "/api/channels",
+        json={"type": "volcengine", "name": "火山", "ak": "ak-x", "sk": "sk-x", "enabled": False},
+    ).json()
+    # 带 _agent 后缀（停用渠道直接返回 disabled，不发起网络请求，便于断言）
+    resp = client.get(f"/api/quotas?ids={created['id']}_agent")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["channels"]) == 1
+    # 停用渠道返回的 id 是原始 config id（无后缀）
+    assert body["channels"][0]["id"] == created["id"]
+    assert body["channels"][0]["status"] == "disabled"
+
+
 def test_quotas_no_ids_param_returns_everything(client):
     client.post(
         "/api/channels",

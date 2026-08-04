@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from ..config import Channel
-from ..models import ChannelResult, fail, ok, window
+from ..models import ChannelResult, fail, ok, to_ts, window
 from ..net import ParseError, ResponseError, request_json
 
 BASE_URL = "https://platform.xiaomimimo.com/api/v1"
@@ -47,18 +47,6 @@ def _error_result(base: dict, e: Exception) -> ChannelResult:
     from ..net import friendly_error
 
     return fail("error", friendly_error(e), **base)
-
-
-def _to_ts(value) -> int | None:
-    """ISO 字符串（如 "2026-08-31T23:59:59+08:00"）→ epoch 毫秒。"""
-    if not isinstance(value, str) or not value:
-        return None
-    from datetime import datetime
-
-    try:
-        return int(datetime.fromisoformat(value).timestamp() * 1000)
-    except ValueError:
-        return None
 
 
 async def query_mimo(channel: Channel) -> ChannelResult:
@@ -142,7 +130,7 @@ async def query_mimo(channel: Channel) -> ChannelResult:
         if isinstance(d, dict):
             if d.get("planName"):
                 plan_name = str(d["planName"])
-            reset_at = _to_ts(d.get("currentPeriodEnd"))
+            reset_at = to_ts(d.get("currentPeriodEnd"))
             expired = bool(d.get("expired"))
     except Exception:  # noqa: S110 — detail 是附加信息，失败不影响 usage 主数据
         pass

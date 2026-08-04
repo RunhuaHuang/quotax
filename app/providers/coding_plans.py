@@ -3,26 +3,8 @@
 from __future__ import annotations
 
 from ..config import Channel
-from ..models import ChannelResult, fail, ok, window
+from ..models import ChannelResult, fail, ok, to_ts, window
 from ..net import ParseError, ResponseError, request_json
-
-
-def _to_ts(value) -> int | None:
-    """兼容秒/毫秒/ISO 字符串 → epoch 毫秒。"""
-    if value is None:
-        return None
-    if isinstance(value, (int, float)) and value > 0:
-        ms = value * 1000 if value < 10_000_000_000 else value
-        return int(ms)
-    if isinstance(value, str):
-        from datetime import datetime
-
-        try:
-            dt = datetime.fromisoformat(value)
-            return int(dt.timestamp() * 1000)
-        except ValueError:
-            return None
-    return None
 
 
 def _clamp(v: float) -> float:
@@ -77,7 +59,7 @@ async def query_kimi_coding(channel: Channel) -> ChannelResult:
                 "每周额度",
                 used_percent=used,
                 remaining_percent=100 - used,
-                reset_at=_to_ts(usage.get("resetTime")),
+                reset_at=to_ts(usage.get("resetTime")),
             )
         )
 
@@ -108,7 +90,7 @@ async def query_kimi_coding(channel: Channel) -> ChannelResult:
                 label,
                 used_percent=used,
                 remaining_percent=100 - used,
-                reset_at=_to_ts(detail.get("resetTime")),
+                reset_at=to_ts(detail.get("resetTime")),
             )
         )
 
@@ -199,7 +181,7 @@ def _parse_zhipu_data(data, plan_name: str, base: dict) -> ChannelResult:
     windows = []
     token_limits = sorted(
         [item for item in limits if item.get("type") == "TOKENS_LIMIT"],
-        key=lambda item: _to_ts(item.get("nextResetTime")) or 0,
+        key=lambda item: to_ts(item.get("nextResetTime")) or 0,
     )
     for i, item in enumerate(token_limits):
         used = float(item.get("percentage") or 0)
@@ -216,7 +198,7 @@ def _parse_zhipu_data(data, plan_name: str, base: dict) -> ChannelResult:
                 label,
                 used_percent=used,
                 remaining_percent=100 - used,
-                reset_at=_to_ts(item.get("nextResetTime")),
+                reset_at=to_ts(item.get("nextResetTime")),
             )
         )
     time_limit = next((item for item in limits if item.get("type") == "TIME_LIMIT"), None)
@@ -284,7 +266,7 @@ async def query_minimax(channel: Channel) -> ChannelResult:
                 "每 5 小时",
                 used_percent=100 - interval,
                 remaining_percent=interval,
-                reset_at=_to_ts(item.get("end_time")),
+                reset_at=to_ts(item.get("end_time")),
             )
         )
         # 周额度判断用 remaining_percent 是否为空，而不是 current_weekly_total_count
@@ -300,7 +282,7 @@ async def query_minimax(channel: Channel) -> ChannelResult:
                     "每周额度",
                     used_percent=100 - weekly,
                     remaining_percent=weekly,
-                    reset_at=_to_ts(item.get("weekly_end_time")),
+                    reset_at=to_ts(item.get("weekly_end_time")),
                 )
             )
     return ok(plan_name="MiniMax Token Plan", windows=windows, **base)
@@ -353,7 +335,7 @@ async def query_zenmux(channel: Channel) -> ChannelResult:
                 remaining_percent=max(0.0, 100 - used_pct),
                 used_label=f"${float(used_usd):,.2f}" if used_usd is not None else None,
                 max_label=f"${float(max_usd):,.2f}" if max_usd is not None else None,
-                reset_at=_to_ts(item.get("resets_at")),
+                reset_at=to_ts(item.get("resets_at")),
             )
         )
     if not windows:

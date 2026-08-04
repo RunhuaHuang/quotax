@@ -24,7 +24,7 @@ from ..credentials import (
     read_gemini_credentials,
     read_grok_credentials,
 )
-from ..models import ChannelResult, fail, ok, window
+from ..models import ChannelResult, fail, ok, to_ts, window
 from ..net import ParseError, ResponseError, request_json
 
 USER_AGENT = "quota-board/1.0 (macOS; read-only usage checker)"
@@ -65,16 +65,6 @@ def _fail_from_error(base: dict, e: Exception, provider: str) -> ChannelResult:
     from ..net import friendly_error
 
     return fail("error", friendly_error(e), **base)
-
-
-def _iso_to_ts(value: str | None) -> int | None:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-        return int(dt.timestamp() * 1000)
-    except ValueError:
-        return None
 
 
 def _cred_fail(cred, base: dict) -> ChannelResult:
@@ -147,7 +137,7 @@ async def query_claude(channel: Channel) -> ChannelResult:
                     label,
                     used_percent=used,
                     remaining_percent=max(0.0, 100 - used),
-                    reset_at=_iso_to_ts(item.get("resets_at")),
+                    reset_at=to_ts(item.get("resets_at")),
                 )
             )
     # 未知窗口也展示（API 可能新增窗口类型）
@@ -168,7 +158,7 @@ async def query_claude(channel: Channel) -> ChannelResult:
                     key.replace("_", " "),
                     used_percent=used,
                     remaining_percent=max(0.0, 100 - used),
-                    reset_at=_iso_to_ts(item.get("resets_at")),
+                    reset_at=to_ts(item.get("resets_at")),
                 )
             )
 
@@ -187,7 +177,7 @@ async def query_claude(channel: Channel) -> ChannelResult:
                         remaining_percent=max(0.0, 100 - used_credits / limit * 100),
                         used_label=f"${used_credits:,.2f}",
                         max_label=f"${limit:,.2f}",
-                        reset_at=_iso_to_ts(extra.get("reset_at")),
+                        reset_at=to_ts(extra.get("reset_at")),
                     )
                 )
         currency = extra.get("currency")
@@ -278,7 +268,7 @@ async def query_gemini(channel: Channel) -> ChannelResult:
                 label_map.get(category, category),
                 used_percent=100 - remaining,
                 remaining_percent=remaining,
-                reset_at=_to_ts(entry["reset"]),
+                reset_at=to_ts(entry["reset"]),
             )
         )
     if not windows:
@@ -295,21 +285,6 @@ def _classify_gemini_model(model_id: str) -> str:
     if "flash" in lower:
         return "gemini_flash"
     return "other"
-
-
-def _to_ts(value) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)) and value > 0:
-        ms = value * 1000 if value < 10_000_000_000 else value
-        return int(ms)
-    if isinstance(value, str):
-        try:
-            dt = datetime.fromisoformat(value)
-            return int(dt.timestamp() * 1000)
-        except ValueError:
-            return None
-    return None
 
 
 # ── Grok (SuperGrok / X) 订阅 ───────────────────────────────
@@ -351,7 +326,7 @@ async def query_grok(channel: Channel) -> ChannelResult:
                     label,
                     used_percent=float(used_pct),
                     remaining_percent=max(0.0, 100 - float(used_pct)),
-                    reset_at=_to_ts(period.get("end")),
+                    reset_at=to_ts(period.get("end")),
                 )
             )
         # 产品维度分解
@@ -462,7 +437,7 @@ async def query_codex(channel: Channel) -> ChannelResult:
                 label,
                 used_percent=used,
                 remaining_percent=100 - used,
-                reset_at=_to_ts(item.get("reset_at")),
+                reset_at=to_ts(item.get("reset_at")),
             )
         )
     if not windows:

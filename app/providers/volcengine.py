@@ -18,7 +18,7 @@ import json
 from datetime import UTC, datetime
 
 from ..config import Channel
-from ..models import ChannelResult, fail, ok, window
+from ..models import ChannelResult, fail, ok, to_ts, window
 from ..net import ParseError, ResponseError, request_text
 
 HOST = "open.volcengineapi.com"
@@ -85,21 +85,6 @@ def _sign(ak: str, sk: str, region: str, action: str) -> tuple[str, str, str]:
     return authorization, x_date, x_content_sha256
 
 
-def _to_ts(value) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)) and value > 0:
-        ms = value * 1000 if value < 10_000_000_000 else value
-        return int(ms)
-    if isinstance(value, str):
-        try:
-            dt = datetime.fromisoformat(value)
-            return int(dt.timestamp() * 1000)
-        except ValueError:
-            return None
-    return None
-
-
 async def _openapi_call(region: str, ak: str, sk: str, action: str) -> dict:
     authorization, x_date, x_content_sha256 = _sign(ak, sk, region, action)
     url = f"https://{HOST}/?{_canonical_query(action, region)}"
@@ -155,70 +140,6 @@ def _error_of(body: dict) -> tuple[str, str] | None:
     if not code and not msg:
         return None
     return code, msg
-
-
-async def query_volcengine_agent(channel: Channel) -> ChannelResult:
-    """仅查询火山 Agent Plan (GetAFPUsage)。"""
-    base = {
-        "id": channel.id,
-        "type": channel.type,
-        "name": channel.name,
-        "category": "coding_plan",
-    }
-    if not channel.ak or not channel.sk:
-        return fail("error", "未配置 AK/SK", **base)
-    region = channel.region or DEFAULT_REGION
-    try:
-        body = await _openapi_call(region, channel.ak, channel.sk, "GetAFPUsage")
-        err = _error_of(body)
-        if err:
-            if _is_signature_error(err[0]):
-                return fail("error", f"火山签名计算错误: {err[0]} {err[1]}", **base)
-            if _is_auth_error(err[0]):
-                return fail("expired", f"火山鉴权失败: {err[0]} {err[1]}", **base)
-            return fail("error", f"Agent Plan 查询失败: {err[0]} {err[1]}", **base)
-        
-        result = body.get("Result") or body
-        agent_windows = _parse_afp_tiers(result)
-        agent_plan_type = result.get("PlanType")
-        if not agent_windows:
-            return fail("error", "未检测到火山 Agent Plan 订阅", **base)
-            
-        plan_name = f"火山 Agent Plan {agent_plan_type}" if agent_plan_type else "火山 Agent Plan"
-        return ok(plan_name=plan_name, windows=agent_windows, **base)
-    except (ResponseError, ParseError) as e:
-        return fail("error", f"Agent Plan 查询失败: {e}", **base)
-
-
-async def query_volcengine_coding(channel: Channel) -> ChannelResult:
-    """仅查询火山 Coding Plan (GetCodingPlanUsage)。"""
-    base = {
-        "id": channel.id,
-        "type": channel.type,
-        "name": channel.name,
-        "category": "coding_plan",
-    }
-    if not channel.ak or not channel.sk:
-        return fail("error", "未配置 AK/SK", **base)
-    region = channel.region or DEFAULT_REGION
-    try:
-        body = await _openapi_call(region, channel.ak, channel.sk, "GetCodingPlanUsage")
-        err = _error_of(body)
-        if err:
-            if _is_signature_error(err[0]):
-                return fail("error", f"火山签名计算错误: {err[0]} {err[1]}", **base)
-            if _is_auth_error(err[0]):
-                return fail("expired", f"火山鉴权失败: {err[0]} {err[1]}", **base)
-            return fail("error", f"Coding Plan 查询失败: {err[0]} {err[1]}", **base)
-            
-        result = body.get("Result") or body
-        coding_windows = _parse_coding_plan_tiers(result)
-        if not coding_windows:
-            return fail("error", "未检测到火山 Coding Plan 订阅", **base)
-            
-        return ok(plan_name="火山 Coding Plan", windows=coding_windows, **base)
-    except (ResponseError, ParseError) as e:
-        return fail("error", f"Coding Plan 查询失败: {e}", **base)
 
 
 async def query_volcengine(channel: Channel) -> ChannelResult:
@@ -321,7 +242,7 @@ def _parse_afp_tiers(result: dict) -> list:
                 remaining_percent=max(0.0, 100 - used_pct),
                 used_label=f"{used:,.0f} APF",
                 max_label=f"{quota:,.0f} APF",
-                reset_at=_to_ts(item.get("ResetTime")),
+                reset_at=to_ts(item.get("ResetTime")),
             )
         )
     return windows
@@ -354,7 +275,7 @@ def _parse_coding_plan_tiers(result: dict) -> list:
                 tier_label,
                 used_percent=used,
                 remaining_percent=max(0.0, 100 - used),
-                reset_at=_to_ts(item.get("ResetTime") or item.get("ResetTimestamp")),
+                reset_at=to_ts(item.get("ResetTime") or item.get("ResetTimestamp")),
             )
         )
     return windows

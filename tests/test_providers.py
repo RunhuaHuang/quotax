@@ -95,8 +95,9 @@ def test_parse_afp_tiers_basic():
     five_hour = next(w for w in windows if w.key == "five_hour")
     assert five_hour.used_percent == 25.0
     assert five_hour.remaining_percent == 75.0
-    assert five_hour.used_label == "25 次"
-    assert five_hour.max_label == "100 次"
+    # 火山 Agent Plan 的配额单位是 APF（Agent Plan tokens），不是"次"
+    assert five_hour.used_label == "25 APF"
+    assert five_hour.max_label == "100 APF"
 
 
 def test_parse_afp_tiers_skips_zero_quota():
@@ -205,7 +206,10 @@ def test_query_volcengine_one_plan_error_keeps_other(monkeypatch):
     )
     assert result.status == "ok"
     assert any(w.label.startswith("Agent ") for w in result.windows)
-    assert "Coding Plan (GetCodingPlanUsage)" in result.message
+    # soft_errors 格式 "Coding Plan: <Code> <Message>"——包含错误码，比只给 Action
+    # 名更有助于排查。这里验证 Coding Plan 失败信息确实附在了 message 上。
+    assert "Coding Plan" in result.message
+    assert "NotSubscribed" in result.message
 
 
 def test_query_volcengine_neither_plan(monkeypatch):
