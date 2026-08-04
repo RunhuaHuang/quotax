@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from ..config import Channel
 from ..models import ChannelResult, amount, fail, ok, window
 from ..net import ParseError, ResponseError, request_json
+from ._common import _require
 
 
 def _origin(base_url: str | None, fallback: str) -> str:
@@ -24,20 +25,11 @@ def _status_for_error(e: Exception) -> tuple[str, str]:
         return "error", f"接口返回错误 (HTTP {e.status}): {e.body[:200]}"
     if isinstance(e, ParseError):
         return "error", str(e)
-    return "error", str(e) or e.__class__.__name__
+    # 底层网络异常（DNS 解析失败 / TLS 握手被中断 / 连接超时等）：httpx 抛出的是
+    # 英文技术串，用户看不懂。翻译成中文，和 coding_plans / mimo 的兜底行为对齐。
+    from ..net import friendly_error
 
-
-def _require(value: str | None, field_label: str, base: dict) -> ChannelResult | None:
-    """必填字段缺失时的统一友好报错：缺失时返回一个 error 结果，否则返回 None。
-
-    Pydantic 层（app/main.py）已经会在新建渠道时挡掉必填字段缺失的情况，但这里
-    仍然兜底一层——避免 base_url=None 时拼出 "None/api/xxx" 这种丑陋 URL，或者
-    sk=None 时报 "'NoneType' object has no attribute 'encode'" 这种没法排查的
-    Python 内部异常。
-    """
-    if not value:
-        return fail("error", f"未配置 {field_label}", **base)
-    return None
+    return "error", friendly_error(e)
 
 
 # ── DeepSeek ────────────────────────────────────────────────

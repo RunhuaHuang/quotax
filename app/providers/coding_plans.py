@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..config import Channel
 from ..models import ChannelResult, fail, ok, to_ts, window
 from ..net import ParseError, ResponseError, request_json
+from ._common import _require
 
 
 def _clamp(v: float) -> float:
@@ -34,6 +35,10 @@ async def query_kimi_coding(channel: Channel) -> ChannelResult:
         "name": channel.name,
         "category": "coding_plan",
     }
+    # 缺 api_key 时不校验直接拼 Authorization 头，会发出裸的 "Bearer None"——
+    # 上游大概率回 401，但错误文案对用户毫无意义，这里提前挡住给出中文提示。
+    if (err := _require(channel.api_key, "API Key", base)) is not None:
+        return err
     headers = {
         "Authorization": f"Bearer {channel.api_key}",
         "Content-Type": "application/json",
@@ -109,6 +114,11 @@ async def query_zhipu(channel: Channel) -> ChannelResult:
         "name": channel.name,
         "category": "coding_plan",
     }
+    # 智谱的 Authorization 头直接放 API Key（不带 Bearer 前缀，见下方 headers）；
+    # 缺失时不挡住的话，四个候选 URL 会各打一遍空鉴权请求，最后拼出一堆无意义的
+    # HTTP 错误堆叠在一起，不如提前给出清晰的中文提示。
+    if (err := _require(channel.api_key, "API Key", base)) is not None:
+        return err
     # 固定顺序的 tuple（原来是 {...} 字面量，也就是 set——Python 字符串哈希每进程
     # 随机，"先试 bigmodel.cn 再试 api.z.ai" 这个优先级在不同进程里会随机失效）。
     urls = (
@@ -150,6 +160,8 @@ async def query_zhipu_team(channel: Channel) -> ChannelResult:
         "name": channel.name,
         "category": "coding_plan",
     }
+    if (err := _require(channel.api_key, "API Key", base)) is not None:
+        return err
     headers = {
         "Authorization": channel.api_key or "",
         "Accept": "application/json, text/plain, */*",
@@ -201,23 +213,6 @@ def _parse_zhipu_data(data, plan_name: str, base: dict) -> ChannelResult:
                 reset_at=to_ts(item.get("nextResetTime")),
             )
         )
-    time_limit = next((item for item in limits if item.get("type") == "TIME_LIMIT"), None)
-    if time_limit:
-        remaining_count = float(time_limit.get("remaining") or 0)
-        total_count = float(time_limit.get("usage") or 0)
-        used_count = float(time_limit.get("currentValue") or (total_count - remaining_count if total_count > 0 else 0))
-        total = total_count if total_count > 0 else remaining_count + used_count
-        remaining_pct = remaining_count / total * 100 if total > 0 else 0
-        windows.append(
-            window(
-                "custom",
-                "MCP 每月",
-                used_percent=100 - remaining_pct,
-                remaining_percent=remaining_pct,
-                used_label=f"{used_count:,.0f} 次",
-                max_label=f"{total:,.0f} 次",
-            )
-        )
     if not windows:
         return fail("error", "智谱 Coding Plan 未返回窗口额度数据", **base)
     return ok(plan_name=plan_name, windows=windows, **base)
@@ -233,6 +228,8 @@ async def query_minimax(channel: Channel) -> ChannelResult:
         "name": channel.name,
         "category": "coding_plan",
     }
+    if (err := _require(channel.api_key, "API Key", base)) is not None:
+        return err
     url = "https://www.minimaxi.com/v1/token_plan/remains"
     if channel.base_url and "minimax.io" in channel.base_url:
         url = url.replace(".minimaxi.com", ".minimax.io")
@@ -259,7 +256,10 @@ async def query_minimax(channel: Channel) -> ChannelResult:
         return fail("error", "MiniMax Token Plan 未返回通用额度数据", **base)
     windows = []
     for item in general:
-        interval = float(item.get("current_interval_remaining_percent") or 100)
+        # remaining_percent == 0（配额用尽）是有效值，绝不能用 `or 100` 兜底——
+        # `0 or 100` 会求值成 100，把"已耗尽"误报成"完全没用过"。字段缺失才默认满额。
+        interval_raw = item.get("current_interval_remaining_percent")
+        interval = float(interval_raw) if interval_raw is not None else 100.0
         windows.append(
             window(
                 "five_hour",
@@ -269,13 +269,15 @@ async def query_minimax(channel: Channel) -> ChannelResult:
                 reset_at=to_ts(item.get("end_time")),
             )
         )
-        # 周额度判断用 remaining_percent 是否为空，而不是 current_weekly_total_count
-        # 的 truthy——实测 total_count 为 0 的套餐（按百分比计额，不按次数）仍会
-        # 返回有效的 current_weekly_remaining_percent，truthy 判断会把 0 误当成
-        # "没有周额度"而整条跳过，导致只显示 5 小时窗口。
-        # 月额度：上游 token_plan/remains 目前只返回 5 小时 + 每周两档，没有月字段。
+        # 周额度判断用 remaining_percent 是否为空（is not None），而不是
+        # current_weekly_total_count 的 truthy——实测 total_count 为 0 的套餐
+        # （按百分比计额，不按次数）仍会返回有效的 current_weekly_remaining_percent，
+        # truthy 判断会把 0 误当成"没有周额度"而整条跳过，导致只显示 5 小时窗口。
+        # 取值时同理：is not None 已挡住了缺失，进入分支后值必非 None，不能再叠加
+        # `or 100`——那会再次把 0（配额用尽）篡改成 100。月额度：上游目前只返回
+        # 5 小时 + 每周两档，没有月字段。
         if item.get("current_weekly_remaining_percent") is not None:
-            weekly = float(item.get("current_weekly_remaining_percent") or 100)
+            weekly = float(item.get("current_weekly_remaining_percent"))
             windows.append(
                 window(
                     "weekly",
@@ -298,6 +300,14 @@ async def query_zenmux(channel: Channel) -> ChannelResult:
         "name": channel.name,
         "category": "coding_plan",
     }
+    # ZenMux 的 base_url 直接就是完整的请求 URL（不是拼接前缀），为 None 时传给
+    # request_json 会被 httpx 当成非法 URL 抛出内部异常，而不是一个能看懂的中文
+    # 提示——必须提前挡住。api_key 同样是必填字段（PROVIDERS["zenmux"]["fields"]），
+    # 缺失只会拼出裸的 "Bearer None"，一并校验。
+    if (err := _require(channel.base_url, "Base URL", base)) is not None:
+        return err
+    if (err := _require(channel.api_key, "API Key", base)) is not None:
+        return err
     headers = {
         "Authorization": f"Bearer {channel.api_key}",
         "Accept": "application/json",

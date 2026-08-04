@@ -78,6 +78,43 @@ def test_quota_json_structure(monkeypatch, capsys, isolated_config):
     assert ch["windows"][0]["remaining_percent"] == 61.7
 
 
+def test_quota_json_splits_volcengine_dual_plan(monkeypatch, capsys, isolated_config):
+    # 回归：火山双套餐渠道在 CLI --json 里也必须像 /api/quotas 一样拆成两张卡
+    # （id 带 _agent/_coding 后缀、windows 按 plan 分桶）。README 明确承诺 --json
+    # 输出结构与 /api/quotas 完全一致，之前 CLI 没复用拆分逻辑，火山渠道会少一条。
+    _make_channel(id="ch_volc", type="volcengine", name="火山", ak="AK", sk="SK")
+
+    async def dual_plan(channel):
+        return ok(
+            id=channel.id,
+            type=channel.type,
+            name=channel.name,
+            category="coding_plan",
+            plan_name="火山 Agent Plan · 火山 Coding Plan",
+            windows=[
+                window("agent_five_hour", "每 5 小时", remaining_percent=80),
+                window("agent_weekly", "每周额度", remaining_percent=60),
+                window("coding_five_hour", "每 5 小时", remaining_percent=50),
+                window("coding_weekly", "每周额度", remaining_percent=40),
+            ],
+            extra={"agent_plan_name": "火山 Agent Plan small", "coding_plan_name": "火山 Coding Plan"},
+        )
+
+    code, out, _ = _run(monkeypatch, capsys, ["quota", "--json"], query=dual_plan)
+    assert code == 0
+    import json
+
+    body = json.loads(out)
+    ids = [c["id"] for c in body["channels"]]
+    assert ids == ["ch_volc_agent", "ch_volc_coding"]
+    agent = body["channels"][0]
+    assert agent["plan_name"] == "火山 Agent Plan small"
+    assert all((w["key"] or "").startswith("agent_") for w in agent["windows"])
+    coding = body["channels"][1]
+    assert coding["plan_name"] == "火山 Coding Plan"
+    assert all((w["key"] or "").startswith("coding_") for w in coding["windows"])
+
+
 def test_quota_brief_single_line(monkeypatch, capsys, isolated_config):
     _make_channel()
     _make_channel(id="ch2", name="另一个渠道", type="claude_subscription")
@@ -240,6 +277,25 @@ def test_cost_unavailable_source(monkeypatch, capsys, isolated_config):
     assert code == 0
     assert "不可用" in out
     assert "目录不存在" in out
+
+
+def test_cost_days_clamped_to_valid_range(monkeypatch, capsys, isolated_config):
+    """回归：--days 的 help 文本写的是 "1-90"，但之前直接把 args.days 原样传给
+    get_local_usage，没有范围校验——传 0/负数会得到空结果（since_ms 落到未来），
+    传超大值会全盘扫描。这里和 GET /api/local-usage 端点一致做 min(max(d,1),90)
+    clamp。"""
+    captured_days = []
+
+    def fake_get_local_usage(days):
+        captured_days.append(days)
+        return {"days": days, "sources": []}
+
+    monkeypatch.setattr(cli.local_usage, "get_local_usage", fake_get_local_usage)
+    _run(monkeypatch, capsys, ["cost", "--days", "0"])
+    _run(monkeypatch, capsys, ["cost", "--days", "-5"])
+    _run(monkeypatch, capsys, ["cost", "--days", "10000"])
+    _run(monkeypatch, capsys, ["cost", "--days", "30"])  # 范围内的值不受影响
+    assert captured_days == [1, 1, 90, 30]
 
 
 def test_config_corrupted_exit_code_2(monkeypatch, capsys, isolated_config):

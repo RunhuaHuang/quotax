@@ -429,6 +429,38 @@ def validate_base_url(url: str | None) -> str | None:
     return url
 
 
+def resolve_codex_auth_file(rel_path: str) -> Path | None:
+    """把渠道 extra.codex_auth_file 解析成绝对路径，并做路径穿越防护。
+
+    codex_auth_file 正常由 upload_codex_credentials 端点生成，值固定为
+    `credentials/codex_<channel_id>.json`。但 extra 是用户可通过 POST /api/channels
+    自由设置的开放字段，如果不校验，用户（或导入的恶意配置）可以传入
+    `../../etc/passwd` 或绝对路径 `/etc/passwd`：读取侧会让 query_codex 去读本目录
+    之外的任意文件（违反"只读 CLI 凭据"的边界），更糟的是删除渠道时 main.py 会
+    `unlink()` 这个路径——配合一个绝对路径的 codex_auth_file，删除渠道会变成任意
+    文件删除。
+
+    这里把传入值拼到 config 同目录后 resolve，并校验结果必须落在 credentials/
+    子目录内、文件名匹配 codex_*.json。任一不满足就返回 None（调用方据此走"无
+    关联凭据 / 路径非法"的正常分支），绝不返回一个越界的路径。
+    """
+    if not rel_path or not isinstance(rel_path, str):
+        return None
+    base = CONFIG_PATH.parent
+    try:
+        resolved = (base / rel_path).resolve()
+    except (OSError, ValueError):
+        return None
+    cred_root = (base / "credentials").resolve()
+    try:
+        resolved.relative_to(cred_root)
+    except ValueError:
+        return None
+    if not resolved.name.startswith("codex_") or resolved.suffix != ".json":
+        return None
+    return resolved
+
+
 # ── 配置导入/导出 ─────────────────────────────────────────────
 
 

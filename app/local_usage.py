@@ -1,8 +1,10 @@
 """本地已用统计：多数据源只读聚合（不查任何远程接口）。
 
 目前接入两个数据源：
-- Claude Code：解析 ~/.claude/projects/**/*.jsonl 会话 transcript（无远程用量接口
-  可查时——见 app/credentials.py 的 CRED_NO_TOKEN——用本地统计兜底）；
+- Claude Code：解析 ~/.claude/projects/*/*.jsonl 会话 transcript（单层目录结构，
+  即 <项目名>/<会话id>.jsonl，这就是 Claude Code 实际落盘的层级，不需要递归
+  扫描；无远程用量接口可查时——见 app/credentials.py 的 CRED_NO_TOKEN——用本地
+  统计兜底）；
 - OpenCode：读取 ~/.local/share/opencode/opencode.db（SQLite），与 cc-switch 思路
   一致，opencode 没有远程额度接口，只能做本地已用统计。
 
@@ -30,6 +32,22 @@ EMPTY_TOTALS = {
     "cost": 0.0,
     "has_cost": False,
 }
+
+
+def _safe_int(value, default: int = 0) -> int:
+    """把本地 transcript / SQLite 里取到的字段安全转成 int。
+
+    Claude Code / OpenCode 落盘的 token 字段正常都是 JSON 整数，但 transcript 是
+    明文 JSONL，任何畸形或被改动的行都可能带非数值字段（字符串、列表、对象）。
+    直接 int(value or 0) 在遇到 "abc" / [1] / {} 时会抛 ValueError/TypeError，
+    而外层 try 只接 OSError，异常会冒泡让整个 /api/local-usage 返回 500——单条
+    坏行连累所有数据源（Claude + OpenCode）都拿不到统计。这里吞掉转换异常，
+    把畸形字段当 0 处理（与 None/缺失一致），保证统计永远能给出一个数。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _unavailable(key: str, label: str, message: str, path: str | None = None) -> dict:
@@ -61,7 +79,11 @@ def _parse_claude_ts(value) -> int | None:
 
 
 def get_claude_code_usage(days: int = 14) -> dict:
-    """扫描 ~/.claude/projects/**/*.jsonl，统计最近 N 天的本地 token 用量。
+    """扫描 ~/.claude/projects/*/*.jsonl，统计最近 N 天的本地 token 用量。
+
+    只扫一层子目录（<项目名>/<会话id>.jsonl），不用 "**" 递归——Claude Code 的
+    transcript 实际就存在这一层，不存在更深的嵌套，递归扫描只是徒增无意义的
+    目录遍历开销。
 
     只统计 type == "assistant" 的行；模型名在 message.model；用量在 message.usage
     （input_tokens / output_tokens / cache_creation_input_tokens /
@@ -146,10 +168,10 @@ def get_claude_code_usage(days: int = 14) -> dict:
                     )
                     entry_stats["sessions"].add(session_id)
                     entry_stats["messages"] += 1
-                    entry_stats["input"] += int(usage.get("input_tokens") or 0)
-                    entry_stats["output"] += int(usage.get("output_tokens") or 0)
-                    entry_stats["cache_read"] += int(usage.get("cache_read_input_tokens") or 0)
-                    entry_stats["cache_write"] += int(usage.get("cache_creation_input_tokens") or 0)
+                    entry_stats["input"] += _safe_int(usage.get("input_tokens"))
+                    entry_stats["output"] += _safe_int(usage.get("output_tokens"))
+                    entry_stats["cache_read"] += _safe_int(usage.get("cache_read_input_tokens"))
+                    entry_stats["cache_write"] += _safe_int(usage.get("cache_creation_input_tokens"))
                     sessions_seen.add(session_id)
         except OSError as e:
             read_errors.append(f"{file_path.name}: {e}")
@@ -225,11 +247,11 @@ def _parse_message_data(data_json: str | None) -> dict | None:
     cache = tokens.get("cache") or {}
     cost = data.get("cost")
     return {
-        "input": int(tokens.get("input") or 0),
-        "output": int(tokens.get("output") or 0),
-        "reasoning": int(tokens.get("reasoning") or 0),
-        "cache_read": int(cache.get("read") or 0),
-        "cache_write": int(cache.get("write") or 0),
+        "input": _safe_int(tokens.get("input")),
+        "output": _safe_int(tokens.get("output")),
+        "reasoning": _safe_int(tokens.get("reasoning")),
+        "cache_read": _safe_int(cache.get("read")),
+        "cache_write": _safe_int(cache.get("write")),
         "cost": float(cost) if isinstance(cost, (int, float)) else None,
         "model": str(data.get("modelID") or "unknown"),
         "created": (data.get("time") or {}).get("created") if isinstance(data.get("time"), dict) else None,

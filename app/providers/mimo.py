@@ -17,6 +17,7 @@ from __future__ import annotations
 from ..config import Channel
 from ..models import ChannelResult, fail, ok, to_ts, window
 from ..net import ParseError, ResponseError, request_json
+from ._common import _require
 
 BASE_URL = "https://platform.xiaomimimo.com/api/v1"
 
@@ -57,12 +58,20 @@ async def query_mimo(channel: Channel) -> ChannelResult:
         "category": "coding_plan",
     }
     cookie = (channel.extra or {}).get("cookie") or channel.api_key
-    if not cookie:
-        return fail(
-            "error",
-            "未配置 Cookie（请登录 platform.xiaomimimo.com 后，从浏览器复制完整 Cookie 填入）",
-            **base,
+    # 复用 balances.py 同款的 _require 校验（现已挪到 _common.py 供三个 provider
+    # 模块共用），但字段标签是 "Cookie" 而不是 "API Key"——MiMo 这个渠道类型
+    # 存的其实是 Cookie（借用了 api_key 这个存储字段，见 README「支持的渠道」）。
+    # message 用自定义完整文案覆盖 _require 默认的"未配置 Cookie"模板，保留原有
+    # 的操作指引（去哪个页面、复制哪个字段），不能被通用模板文案顶掉。
+    if (
+        err := _require(
+            cookie,
+            "Cookie",
+            base,
+            message="未配置 Cookie（请登录 platform.xiaomimimo.com 后，从浏览器复制完整 Cookie 填入）",
         )
+    ) is not None:
+        return err
 
     headers = dict(_COMMON_HEADERS)
     headers["Cookie"] = cookie

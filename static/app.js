@@ -1,5 +1,9 @@
 /* ── QuotaX 前端逻辑 ─────────────────────────────────── */
 
+// 不依赖 DOM/localStorage 的纯函数抽到 view-utils.js（可被 node:test 直接
+// import 测试），这里只 import 使用，避免同一份逻辑两处维护。
+import { normalizeThreeWindows, canonicalChannelId, channelBreachesThreshold, noPercentData, fmtReset } from "./view-utils.js";
+
 const $ = (sel) => document.querySelector(sel);
 
 const CATEGORY_ORDER = ["coding_plan", "subscription", "balance", "local"];
@@ -383,44 +387,6 @@ function setupThemeReactivity() {
 
 /* ── 仪表盘渲染 ─────────────────────────────────────────── */
 
-/* 统一补齐标准的周期窗口（5小时 / 周 / 月）。
-   如果同一个卡片下包含多个子 Plan（如火山 Agent Plan + Coding Plan），分别按组补齐 3 个窗口，
-   保证卡片高度一致，且所有存在的 Plan 均全量展示。 */
-function normalizeThreeWindows(windows) {
-  // 检查是否包含带前缀的分组窗口 (如 agent_ / coding_)
-  const agentWindows = windows.filter((w) => (w.key || "").startsWith("agent_"));
-  const codingWindows = windows.filter((w) => (w.key || "").startsWith("coding_"));
-
-  const TIER_DEFS = [
-    { key: "five_hour", label: "每 5 小时" },
-    { key: "weekly",    label: "每周额度" },
-    { key: "monthly",   label: "每月额度" },
-  ];
-
-  const fillGroup = (groupWindows, prefix = "") => {
-    return TIER_DEFS.map((def) => {
-      const fullKey = prefix ? `${prefix}${def.key}` : def.key;
-      const existing = groupWindows.find((w) => w.key === fullKey || w.key === def.key);
-      if (existing) return existing;
-      return {
-        key: fullKey,
-        label: prefix ? `${prefix === "agent_" ? "Agent " : "Coding "}${def.label}` : def.label,
-        used_percent: null,
-        remaining_percent: null,
-        max_label: "未提供",
-      };
-    });
-  };
-
-  if (agentWindows.length || codingWindows.length) {
-    const res = [];
-    if (agentWindows.length) res.push(...fillGroup(agentWindows, "agent_"));
-    if (codingWindows.length) res.push(...fillGroup(codingWindows, "coding_"));
-    return res;
-  }
-
-  return fillGroup(windows);
-}
 const SNAPSHOT_KEY = "quotaboard_snapshot";
 
 function saveSnapshot(patch) {
@@ -524,18 +490,21 @@ function renderDashboard() {
   // 已知分类按固定顺序展示，未知分类（防御性：后端以后新增分类时不至于让渠道悄悄消失）追加在后面
   const knownCats = CATEGORY_ORDER.filter((cat) => groups[cat]);
   const extraCats = Object.keys(groups).filter((cat) => !CATEGORY_ORDER.includes(cat));
-  // 卡片顺序：用户拖拽排序后存 localStorage（card_order），组内按该顺序排列
+  // 卡片顺序：以用户拖拽顺序（localStorage card_order）为主——拖到哪就停在哪，
+  // 不再用名字字母序覆盖用户的显式排序（之前的 bug：先按名字 localeCompare，
+  // 名字不同就直接 return，_cardRank 只在同名时才比较，于是不同名渠道拖了等于没拖）。
+  // card_order 里没记录的渠道（新建的 / 第一次出现的）追加在已排序渠道之后，
+  // 之间用名字字母序做稳定 tiebreaker，保证每次刷新顺序不抖动。
   const cardOrder = loadCardOrder();
 
   container.innerHTML = [...knownCats, ...extraCats]
     .map((cat) => {
-      // 组内排序：先按渠道名聚拢（同账号的 Agent/Coding 卡、主/次账号相邻），
-      // 同名内再按用户拖拽顺序（localStorage card_order）。
       const items = [...groups[cat]]
         .sort((a, b) => {
-          const nameCmp = (a.name || "").localeCompare(b.name || "", "zh");
-          if (nameCmp !== 0) return nameCmp;
-          return _cardRank(cardOrder, a.id) - _cardRank(cardOrder, b.id);
+          const ra = _cardRank(cardOrder, a.id);
+          const rb = _cardRank(cardOrder, b.id);
+          if (ra !== rb) return ra - rb;
+          return (a.name || "").localeCompare(b.name || "", "zh");
         })
         .map(renderCard)
         .join("");
@@ -557,7 +526,10 @@ function renderSummaryChips(list) {
   const warn = list.filter((q) => q.status === "error" || q.status === "not_found").length;
   const bad = list.filter((q) => q.status === "expired").length;
   const off = list.filter((q) => q.status === "disabled").length;
-  const low = list.filter(channelBreachesThreshold).length; // 低余额阈值告警
+  // channelBreachesThreshold 现在接受 thresholds 表作为参数（纯函数、可测试），
+  // 不能直接当 Array.filter 的回调传——filter 会把 (index, array) 当成第二、
+  // 三个参数塞给它，必须包一层箭头函数显式传 getThresholds()。
+  const low = list.filter((q) => channelBreachesThreshold(q, getThresholds())).length; // 低余额阈值告警
   $("#summaryChips").innerHTML = `
     <span class="chip ok"><span class="chip-dot"></span>正常 <b>${ok}</b></span>
     ${low ? `<span class="chip low"><span class="chip-dot"></span>低额度 <b>${low}</b></span>` : ""}
@@ -587,10 +559,11 @@ function renderCard(q) {
   const statusText = STATUS_TEXT[q.status] || q.status;
   const isDisabled = q.status === "disabled";
   const isAbnormal = !(q.status === "ok" || q.status === "info");
-  const isLowAlert = channelBreachesThreshold(q); // 低余额阈值告警
+  const isLowAlert = channelBreachesThreshold(q, getThresholds()); // 低余额阈值告警
   const typeLabel = esc(providersCatalog[q.type]?.label || q.type);
-  const manageUrl =
-    providersCatalog[q.type]?.manage_url || channels.find((c) => c.id === q.id)?.base_url || "";
+  const manageUrl = safeUrl(
+    providersCatalog[q.type]?.manage_url || channels.find((c) => c.id === q.id)?.base_url || ""
+  );
 
   let body = "";
   if (q.status === "ok") {
@@ -679,25 +652,6 @@ function renderCard(q) {
     </article>`;
 }
 
-/* 窗口按 plan 分组（火山双套餐：key 以 agent_/coding_ 开头）。每个 plan 渲染成
-   一个左右 tab，每个 tab 内是一行窗口（5h / 周 / 月横排）；没查到的 plan 自然
-   没有对应窗口，tab 就不渲染。普通渠道的窗口不带前缀，归入"其它"组，渲染结果
-   与未分组时完全一致。 */
-function groupWindowsByPlan(windows) {
-  const groups = [];
-  const push = (key, title, list) => {
-    if (list.length) groups.push({ key, title, windows: list });
-  };
-  push("agent", "Agent Plan", windows.filter((w) => (w.key || "").startsWith("agent_")));
-  push("coding", "Coding Plan", windows.filter((w) => (w.key || "").startsWith("coding_")));
-  const rest = windows.filter((w) => {
-    const k = w.key || "";
-    return !k.startsWith("agent_") && !k.startsWith("coding_");
-  });
-  push("other", "", rest);
-  return groups;
-}
-
 function renderWindows(windows) {
   // 所有额度窗口统一渲染为进度条（.window-bar）模式，不再渲染为圆环
   return `<div class="windows-bar-list">${windows.map(renderBar).join("")}</div>`;
@@ -740,16 +694,9 @@ function onDropCard(to) {
   renderDashboard();
 }
 
-/* 两个百分比字段都缺失：这个条目只是文本标签（如"充值余额""订阅计划"），没有百分比概念 */
-function noPercentData(w) {
-  const noUsed = w.used_percent === null || w.used_percent === undefined;
-  const noRemaining = w.remaining_percent === null || w.remaining_percent === undefined;
-  return noUsed && noRemaining;
-}
-
-/* ringColor() 在 renderRing/renderBar 里逐个窗口调用（N 张卡 × M 个窗口），
-   如果每次都 getComputedStyle() 会是大量强制样式读取。这里改成每轮渲染只读一次、
-   缓存到 themeColorCache，renderDashboard() 开头负责刷新它（自然也覆盖了主题切换的场景）。 */
+/* ringColor() 在 renderBar 里逐个窗口调用（N 张卡 × M 个窗口），如果每次都
+   getComputedStyle() 会是大量强制样式读取。这里改成每轮渲染只读一次、缓存到
+   themeColorCache，renderDashboard() 开头负责刷新它（自然也覆盖了主题切换的场景）。 */
 let themeColorCache = null;
 
 function refreshThemeColorCache() {
@@ -768,59 +715,6 @@ function ringColor(remainingPct) {
   if (remainingPct >= 60) return themeColorCache.green;
   if (remainingPct >= 30) return themeColorCache.amber;
   return themeColorCache.red;
-}
-
-function renderRing(w) {
-  if (noPercentData(w)) return renderRingFlat(w);
-  const C = 2 * Math.PI * 24;
-  const remaining = w.remaining_percent ?? (100 - w.used_percent);
-  const pct = Math.max(0, Math.min(100, remaining));
-  const offset = C * (1 - pct / 100);
-  const color = ringColor(pct);
-  
-  let displayLabel = w.label || "";
-  let subResetTxt = "";
-  if (displayLabel.includes(" · ")) {
-    const parts = displayLabel.split(" · ");
-    displayLabel = parts[0];
-    subResetTxt = parts[1];
-  }
-  const resetTxt = w.reset_at ? fmtReset(w.reset_at) : subResetTxt;
-  const subText = w.max_label || (resetTxt ? resetTxt : "");
-
-  return `
-    <div class="window-ring">
-      <div class="ring-wrap">
-        <svg viewBox="0 0 58 58">
-          <circle class="ring-bg" cx="29" cy="29" r="24" fill="none" stroke-width="5"/>
-          <circle class="ring-fg" cx="29" cy="29" r="24" fill="none" stroke-width="5"
-                  stroke="${color}" stroke-dasharray="${C}" stroke-dashoffset="${offset}"/>
-        </svg>
-        <span class="ring-pct" style="color:${color}">${Math.round(pct)}%</span>
-      </div>
-      <span class="ring-label" title="${esc(w.label)}">${esc(displayLabel)}</span>
-      <span class="ring-sub">${esc(subText)}</span>
-    </div>`;
-}
-
-/* 没有百分比概念的窗口条目：画一个空的中性灰环（不画色弧、不显示百分数），
-   真正的文本内容放在环下方的 sub 行——绝不能显示成 100% 满环 */
-function renderRingFlat(w) {
-  const reset = w.reset_at ? ` · <span class="window-reset">${fmtReset(w.reset_at)}</span>` : "";
-  const subText = w.max_label || w.used_label || "";
-  const sub = subText ? `<span class="ring-sub">${esc(subText)}</span>` : "";
-  let displayLabel = w.label || "";
-  displayLabel = displayLabel.replace(/^(Agent|Coding)\s+/, "");
-  return `
-    <div class="window-ring ring-flat">
-      <div class="ring-wrap">
-        <svg viewBox="0 0 58 58">
-          <circle class="ring-bg" cx="29" cy="29" r="24" fill="none" stroke-width="5"/>
-        </svg>
-      </div>
-      <span class="ring-label" title="${esc(w.label)}">${esc(displayLabel)}${reset}</span>
-      ${sub}
-    </div>`;
 }
 
 function renderBar(w) {
@@ -875,30 +769,45 @@ async function onRefreshOneCard(btn) {
   try {
     // 只强刷这一张卡：force=1 强制绕过缓存，ids=id 只让后端查这一个渠道
     // （其余渠道的缓存条目完全不受影响——这正是按 channel id 分别缓存的意义）。
+    // 但火山子卡的 id 带 _agent/_coding 后缀，后端会归一成配置 id 去查询，于是
+    // 哪怕只点了一张子卡的刷新按钮，也可能一次性把同配置下的两张子卡都返回。
+    // 必须把返回的每一张卡都合并进 quotas 并各自重绘，否则"多返回的那张卡"的
+    // 新数据会被直接丢弃，兄弟卡还停在刷新前的旧值上（数据都查回来了却白白丢掉）。
     const data = await fetchQuotas(`/api/quotas?force=1&ids=${encodeURIComponent(id)}`);
-    const fresh = data.channels.find((c) => c.id === id);
-    if (fresh) {
-      // 局部替换这一条数据 + 局部重绘这张卡（不触发全屏重绘，避免其他卡片闪烁）
-      const idx = quotas.findIndex((c) => c.id === id);
+    for (const fresh of data.channels) {
+      // 局部替换这一条数据（数组先更新，DOM 补丁失败也不会丢数据）
+      const idx = quotas.findIndex((c) => c.id === fresh.id);
       if (idx >= 0) quotas[idx] = fresh;
       else quotas.push(fresh);
-      renderSummaryChips(quotas);
-      const newCard = renderCard(fresh);
-      card?.insertAdjacentHTML("afterend", newCard);
-      card?.remove();
+      // 被点击的卡片已经有 DOM 引用（card）；一并返回的兄弟卡（如火山 coding 卡）
+      // 需要重新按 id 查 DOM。局部替换（insertAdjacentHTML + remove）是为了避免
+      // 全屏重绘导致其他卡片闪烁，这里对每张返回的卡都做同样的局部替换。
+      const target = fresh.id === id ? card : document.querySelector(`.card[data-id="${CSS.escape(fresh.id)}"]`);
+      if (target) {
+        const newCard = renderCard(fresh);
+        target.insertAdjacentHTML("afterend", newCard);
+        target.remove();
+      }
+      // 找不到对应 DOM 节点（比如这张卡是首次出现）：数据已经写进 quotas 了，
+      // 不强行插入 DOM，下一次全量 renderDashboard() 会自然带出它，不会丢数据。
     }
+    renderSummaryChips(quotas);
   } catch (e) {
     toast("刷新该渠道失败: " + e.message, "err");
   } finally {
     btn.disabled = false;
     btn.classList.remove("spinning");
+    // 失败路径下卡片没有被局部替换（旧节点还留在 DOM 上），card-busy 必须在这里
+    // 清掉，否则刷新一旦失败卡片会永久停留在 busy 视觉态，直到下一次全量重绘。
+    // 成功路径下旧节点已被 detach，对它 classList.remove 是无害 no-op。
+    card?.classList.remove("card-busy");
   }
 }
 
 /* 卡片上的编辑按钮：打开配置弹窗并直接进入该渠道的编辑模式。
    火山子渠道 id 带 _agent/_coding 后缀，需归一到真实 config id 再匹配 channels。 */
 function onEditCard(cardId) {
-  const baseId = cardId.replace(/_(agent|coding)$/, "");
+  const baseId = canonicalChannelId(cardId);
   const ch = channels.find((c) => c.id === baseId);
   if (!ch) {
     toast("未找到该渠道的配置信息", "err");
@@ -1301,18 +1210,18 @@ function fmtTime(ms) {
   return d.toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" });
 }
 
-function fmtReset(ms) {
-  const d = new Date(ms);
-  const now = Date.now();
-  const diff = ms - now;
-  if (diff <= 0) return "已重置";
-  if (diff < 3600_000) return `${Math.ceil(diff / 60_000)} 分钟后`;
-  if (diff < 86400_000) return `${Math.ceil(diff / 3600_000)} 小时后`;
-  return `${Math.ceil(diff / 86400_000)} 天后`;
-}
-
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* 渲染到 href/src 的 URL 必须限制 scheme。esc() 只转义 HTML 特殊字符，挡不住
+   javascript: / data: 这类危险协议——它们经过 esc() 后不含任何需要转义的字符，
+   原样输出到 href="javascript:..." 仍可被点击触发脚本执行。base_url 是用户自填、
+   且会出现在"导出（脱敏）"配置里被分享，构成真实的投递路径，这里用 scheme 白名单
+   做纵深防御：非 http/https 一律不输出到可点击链接。 */
+function safeUrl(u) {
+  const s = String(u ?? "").trim();
+  return /^https?:\/\//i.test(s) ? s : "";
 }
 
 function toast(message, kind = "info") {
@@ -1443,18 +1352,6 @@ function renderThresholdList() {
       setThreshold(input.dataset.thresholdId, input.value);
     });
   });
-}
-
-/* 判断某渠道是否触发阈值告警（remaining_percent < 阈值）。
-   只对有百分比窗口的 ok 渠道生效；info/error/disabled 不参与。 */
-function channelBreachesThreshold(q) {
-  if (q.status !== "ok" || !q.windows) return false;
-  const threshold = getThresholds()[q.id];
-  if (threshold === undefined) return false;
-  // 任一百分比窗口剩余低于阈值即告警
-  return q.windows.some(
-    (w) => w.remaining_percent !== null && w.remaining_percent !== undefined && w.remaining_percent < threshold
-  );
 }
 
 /* ── 配置导入/导出 ─────────────────────────────────────── */
@@ -1682,5 +1579,17 @@ function renderSparkline(series, allRecords) {
       </svg>
     </div>`;
 }
+
+/* 调试/测试专用钩子：改成 ES module 之后顶层函数不会再像经典 script 那样自动
+   挂到 window 上，浏览器手动验证（比如没有真实后端数据时，往 quotas 里塞一份
+   构造好的假数据走一遍完整渲染路径，检查 normalizeThreeWindows 修复后 Gemini
+   那种三个 custom 窗口的卡片是否真的渲染出来）就没有入口了，所以显式暴露一个
+   最小的调试接口。仅用于调试/校验，不是给业务代码调用的正式 API。 */
+function setQuotas(list) {
+  quotas = Array.isArray(list) ? list : [];
+  dashboardLoadedOnce = true;
+  renderDashboard();
+}
+window.__quotax = { renderDashboard, setQuotas };
 
 init();

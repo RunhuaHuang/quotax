@@ -197,13 +197,6 @@ main { animation: 0.4s cubic-bezier(0.16, 1, 0.3, 1) backwards page-enter; }
   gap: 10px;
 }
 
-.brand-zh {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--muted-foreground);
-  letter-spacing: 2px;
-}
-
 .brand-text p {
   font-size: 12.5px;
   color: var(--muted-foreground);
@@ -592,6 +585,12 @@ main {
 }
 .card:hover .card-drag-handle { opacity: 0.7; }
 .card.dragging { opacity: 0.4; }
+/* 拖拽落点高亮：dragover 时给目标卡加 drop-target，让用户看到"松手会放到这里"。
+   没有这条规则的话拖拽仍能工作（drop 仍交换顺序），但完全没有视觉反馈。 */
+.card.drop-target {
+  border-color: color-mix(in srgb, var(--brand) 55%, var(--border));
+  box-shadow: var(--shadow-md), 0 0 0 2px color-mix(in srgb, var(--brand) 35%, transparent);
+}
 .card.card-busy { pointer-events: none; opacity: 0.75; }
 
 /* 卡片内容区 */
@@ -673,7 +672,6 @@ main {
   box-shadow: 0 0 8px -1px color-mix(in srgb, var(--bar-c, var(--primary)) 50%, transparent);
 }
 .window-bar .bar-extra { font-size: 11px; color: var(--muted-foreground); margin-top: 4px; font-variant-numeric: tabular-nums; }
-.window-reset { font-size: 10.5px; color: var(--muted-foreground); }
 
 /* 无百分比的占位 bar（bar-flat）：与正常 bar 几何等高，保证同卡片各窗口行高一致。
    正常 bar = bar-head + 6px 轨道 + 说明行；bar-flat 缺这两层，用伪元素补齐空轨道与占位说明。 */
@@ -695,16 +693,6 @@ main {
 /* bar-flat 若自带 reset 说明（.bar-extra），其真实说明行会与伪元素占位叠加，
    用负 margin 把占位说明收掉，让真实说明替代它，避免多出一行空白 */
 .window-bar.bar-flat .bar-extra { margin-top: -22px; }
-
-/* 圆环窗口（renderRing，仍保留渲染路径以兼容） */
-.window-ring { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 4px; }
-.window-ring svg { width: 58px; height: 58px; transform: rotate(-90deg); flex: none; }
-.window-ring .ring-bg { stroke: color-mix(in srgb, var(--muted-foreground) 18%, transparent); }
-.window-ring .ring-fg { stroke-linecap: round; transition: stroke-dashoffset 0.8s cubic-bezier(0.4, 0, 0.2, 1), stroke 0.3s; }
-.ring-wrap { position: relative; display: flex; align-items: center; justify-content: center; width: 58px; height: 58px; }
-.window-ring .ring-pct { position: absolute; font-size: 12px; font-weight: 700; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-.window-ring .ring-label { font-size: 11px; color: var(--muted-foreground); }
-.window-ring .ring-sub { font-size: 10.5px; color: var(--muted-foreground); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 
 /* 卡片底部 */
 .card-foot {

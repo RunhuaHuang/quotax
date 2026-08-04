@@ -6,6 +6,7 @@ ids 过滤、404、config 损坏时的错误暴露。
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -13,14 +14,22 @@ from fastapi.testclient import TestClient
 
 from app import config as config_store
 from app import main as app_main
+from app.models import ok, window
 
 
 @pytest.fixture
-def client(isolated_config):
+def client(isolated_config, monkeypatch):
     # main.py 里的缓存字典是模块级全局，测试之间可能残留——每个用到 client 的
     # 测试开始前清空，避免相互干扰。
     app_main._cache.clear()
     app_main._inflight.clear()
+    # config_store.HISTORY_DIR 是模块级全局，在 app/config.py 导入时基于
+    # CONFIG_PATH 计算一次；isolated_config 只替换了 CONFIG_PATH，不会连带更新
+    # 它。如果某个测试触发一次真正成功（status=="ok"）的查询，_query_and_cache
+    # 会用 fire-and-forget 后台任务把结果写进 HISTORY_DIR——不隔离的话会写进
+    # 项目根目录真实的 history/ 目录，污染用户数据。这里和 test_history.py 的
+    # isolated_history fixture 做同样的隔离。
+    monkeypatch.setattr(config_store, "HISTORY_DIR", isolated_config.parent / "history")
     return TestClient(app_main.app)
 
 
@@ -365,3 +374,275 @@ def test_delete_channel_removes_uploaded_credentials_file(client, isolated_confi
     assert path.exists()
     client.delete(f"/api/channels/{ch['id']}")
     assert not path.exists()  # 渠道删除后凭据文件一并清理
+
+
+# ── P1 任务 1：_canonical_channel_id 只在真的是火山渠道时才归一 ────
+#
+# 回归背景：旧实现无条件剥掉任何 channel id 结尾的 _agent/_coding 后缀，不看
+# 渠道类型。真实破坏路径：导入一个 id 为 "team_agent" 的 deepseek 渠道后
+# （import_config 会原样保留传入的 id），在卡片上点"停用"，前端发最小 payload
+# {"id":"team_agent","type":"deepseek","enabled":false}——旧逻辑把它归一成不
+# 存在的 "team"，被误判为"新建渠道"，因缺少必填的 api_key 而 400。这个渠道从此
+# 在 UI 里彻底无法编辑/停用，GET /api/channels/{id}/secret 也会 404。
+
+
+def test_toggle_channel_whose_id_ends_with_agent_suffix_is_not_new_upsert(client):
+    """精确复现监工报告的破坏路径：非火山渠道的 id 恰好以 _agent 结尾时，
+    "停用"这种最小 payload 必须被当成编辑已有渠道，而不是被误判成新建。"""
+    created = client.post(
+        "/api/channels",
+        json={"id": "team_agent", "type": "deepseek", "name": "团队", "api_key": "sk-team-x"},
+    ).json()
+    assert created["id"] == "team_agent"  # id 原样保留，未被创建逻辑改写
+
+    resp = client.post(
+        "/api/channels",
+        json={"id": "team_agent", "type": "deepseek", "enabled": False},
+    )
+    assert resp.status_code == 200, resp.json()  # 旧逻辑这里会 400 缺少 api_key
+    body = resp.json()
+    assert body["id"] == "team_agent"  # id 没有被误剥成 "team"
+    assert body["enabled"] is False
+    assert body["name"] == "团队"  # 其它字段未被清空
+
+    # 渠道确实只有一条（没有被误建成一个新的 "team" 渠道）
+    all_channels = client.get("/api/channels").json()
+    assert [c["id"] for c in all_channels] == ["team_agent"]
+
+
+def test_create_new_channel_with_coding_suffix_id_keeps_full_id(client):
+    """POST 一个全新渠道、id 恰好起成 "my_coding"，必须原样存成 "my_coding"，
+    不能被静默剥成 "my"（这个 "my" 渠道压根不存在）。"""
+    created = client.post(
+        "/api/channels",
+        json={"id": "my_coding", "type": "deepseek", "name": "My", "api_key": "sk-my-x"},
+    ).json()
+    assert created["id"] == "my_coding"
+    assert config_store.get_channel("my_coding") is not None
+    assert config_store.get_channel("my") is None
+
+
+def test_get_channel_secret_for_non_volcengine_id_with_agent_suffix(client):
+    """get_channel_secret 同样不能对非火山渠道做后缀归一。"""
+    client.post(
+        "/api/channels",
+        json={"id": "team_agent", "type": "deepseek", "name": "团队", "api_key": "sk-team-x"},
+    )
+    resp = client.get("/api/channels/team_agent/secret")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == "team_agent"
+    assert body["secret"]["api_key"] == "sk-team-x"
+
+
+def test_get_channel_secret_still_strips_suffix_for_real_volcengine_channel(client):
+    """真实火山渠道的子卡 id 仍然要能正确归一——这是任务 1 修复不能破坏的另一半。"""
+    created = client.post(
+        "/api/channels",
+        json={"type": "volcengine", "name": "火山", "ak": "ak-real", "sk": "sk-real"},
+    ).json()
+    resp = client.get(f"/api/channels/{created['id']}_agent/secret")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == created["id"]  # 归一回不带后缀的真实 config id
+    assert body["secret"]["ak"] == "ak-real"
+    assert body["secret"]["sk"] == "sk-real"
+
+
+def test_quotas_ids_filter_does_not_strip_suffix_from_non_volcengine_id(client):
+    """/api/quotas?ids=... 对一个 id 恰好以 _agent 结尾的非火山渠道，必须按
+    原样 id 匹配，不能被归一到一个不存在的 "更短" id 从而查不到任何结果。"""
+    created = client.post(
+        "/api/channels",
+        json={"id": "team_agent", "type": "deepseek", "name": "团队", "api_key": "sk-x", "enabled": False},
+    ).json()
+    resp = client.get(f"/api/quotas?ids={created['id']}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["channels"]) == 1
+    assert body["channels"][0]["id"] == "team_agent"
+    assert body["channels"][0]["status"] == "disabled"
+
+
+# ── P2 任务 2：/api/history 也要做 _agent/_coding 后缀归一 ──────────
+#
+# 回归背景：四个涉及 channel id 的端点（create_or_update_channel /
+# get_channel_secret / quotas / history）里，history 是唯一没做后缀归一的——
+# 目前前端历史下拉用的是不带后缀的配置 id 所以还没暴露，但这是个隐患，必须
+# 和其它三处保持一致。
+
+
+def test_history_endpoint_strips_volcengine_plan_suffix(client):
+    created = client.post(
+        "/api/channels",
+        json={"type": "volcengine", "name": "火山", "ak": "ak-x", "sk": "sk-x"},
+    ).json()
+    resp = client.get(f"/api/history?ids={created['id']}_agent,{created['id']}_coding")
+    assert resp.status_code == 200
+    body = resp.json()
+    # 两个带后缀的子卡 id 都应该归一到同一个真实 config id，返回该渠道的历史
+    # （此时还没有任何 ok 查询结果，历史为空列表，但 key 必须是不带后缀的原始 id）
+    assert list(body["channels"].keys()) == [created["id"]]
+    assert body["channels"][created["id"]] == []
+
+
+def test_history_endpoint_does_not_strip_suffix_from_non_volcengine_id(client):
+    """和 quotas 保持一致：非火山渠道 id 恰好以 _agent 结尾时，history 也不能
+    把它误归一成一个不存在的更短 id。"""
+    created = client.post(
+        "/api/channels",
+        json={"id": "team_agent", "type": "deepseek", "name": "团队", "api_key": "sk-x"},
+    ).json()
+    resp = client.get(f"/api/history?ids={created['id']}")
+    assert resp.status_code == 200
+    assert list(resp.json()["channels"].keys()) == ["team_agent"]
+
+
+# ── P2 任务 3：拆卡后每张卡保留各自真实的 plan_name（含 PlanType 档位）────
+
+
+def test_quotas_splits_volcengine_cards_preserve_real_plan_names(client, monkeypatch):
+    """回归：main.py 曾经把拆分出的 Agent/Coding 两张卡的 plan_name 硬编码成
+    通用的 "Agent Plan"/"Coding Plan"，丢掉了 volcengine._merge_plans 算出来的
+    真实套餐名（尤其 Agent Plan 名字里带 PlanType 档位）。拆卡后必须各自显示
+    真实名称，互不串味，也不能是拼接后的完整串。"""
+    from app.providers import volcengine
+
+    async def fake_openapi(region, ak, sk, action):
+        if action == "GetAFPUsage":
+            return {
+                "Result": {
+                    "AFPFiveHour": {"Quota": 100, "Used": 25},
+                    "PlanType": "small",
+                }
+            }
+        return {"Result": {"QuotaUsage": [{"Level": "week", "Percent": 55.0}]}}
+
+    monkeypatch.setattr(volcengine, "_openapi_call", fake_openapi)
+
+    created = client.post(
+        "/api/channels",
+        json={"type": "volcengine", "name": "火山", "ak": "ak-x", "sk": "sk-x"},
+    ).json()
+
+    resp = client.get("/api/quotas")
+    assert resp.status_code == 200
+    channels = resp.json()["channels"]
+    ids = {c["id"] for c in channels}
+    assert ids == {f"{created['id']}_agent", f"{created['id']}_coding"}
+
+    agent_card = next(c for c in channels if c["id"] == f"{created['id']}_agent")
+    coding_card = next(c for c in channels if c["id"] == f"{created['id']}_coding")
+
+    assert agent_card["plan_name"] == "火山 Agent Plan small"  # 含 PlanType 档位
+    assert coding_card["plan_name"] == "火山 Coding Plan"
+    assert agent_card["plan_name"] != coding_card["plan_name"]  # 不互相串味
+    # 不能是 _merge_plans 拼接后的完整串
+    assert " · " not in agent_card["plan_name"]
+    assert " · " not in coding_card["plan_name"]
+
+
+# ── P2 任务 5：单飞 task 的 shield 保护 ──────────────────────────
+#
+# 回归背景：_inflight 里的共享查询 task 会被多个并发请求 await。如果不用
+# asyncio.shield 隔离，其中一个调用者的外层协程被取消（客户端断连、uvicorn
+# 取消请求处理）时，取消会顺着 await 传播进共享的 task，把它也取消掉，连累
+# 其它正在等同一个结果、客户端根本没断开的调用者。
+
+
+async def test_get_channel_result_shield_protects_other_waiters_from_cancellation(isolated_config, monkeypatch):
+    monkeypatch.setattr(config_store, "HISTORY_DIR", isolated_config.parent / "history")
+    app_main._cache.clear()
+    app_main._inflight.clear()
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_query(channel):
+        started.set()
+        await release.wait()
+        return ok(
+            id=channel.id,
+            type=channel.type,
+            name=channel.name,
+            category="balance",
+            windows=[window("balance", "余额", remaining_percent=50.0)],
+        )
+
+    monkeypatch.setattr(app_main, "query_channel", slow_query)
+    channel = config_store.Channel(id="ch_shield", type="deepseek", name="X", api_key="sk-x")
+
+    task_a = asyncio.create_task(app_main._get_channel_result(channel, False))
+    await started.wait()  # 确保共享查询 task 已经真正发起、_inflight 已登记
+    task_b = asyncio.create_task(app_main._get_channel_result(channel, False))
+    await asyncio.sleep(0)  # 让 task_b 排到共享 task 的等待队列上
+
+    task_a.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task_a
+
+    # task_a 被取消后，共享查询 task 必须还活着（还没跑完），_inflight 的登记
+    # 也不该被 task_a 的 finally 提前摘掉——这正是 task.done() 判断要守住的。
+    shared_task = app_main._inflight.get("ch_shield")
+    assert shared_task is not None
+    assert not shared_task.done()
+
+    release.set()  # 放行真正的查询逻辑
+    result, from_cache = await task_b
+    assert result["status"] == "ok"
+    assert result["windows"][0]["remaining_percent"] == 50.0
+    assert from_cache is False
+
+    # 收尾：共享 task 完成后应该已经从 _inflight 里清理掉
+    await asyncio.sleep(0)
+    assert "ch_shield" not in app_main._inflight
+
+
+# ── 任务 8：DNS rebinding 防护（Host 头白名单）──────────────────────
+
+
+def test_host_whitelist_allows_default_testclient_host(client):
+    """TestClient 默认发送 Host: testserver，必须放行——否则这个中间件会把
+    现有的所有测试都拦成 403。"""
+    resp = client.get("/api/health")
+    assert resp.status_code == 200
+
+
+def test_host_whitelist_rejects_evil_host(client):
+    resp = client.get("/api/health", headers={"Host": "evil.com"})
+    assert resp.status_code == 403
+    assert "detail" in resp.json()
+
+
+def test_host_whitelist_allows_127_0_0_1_with_arbitrary_port(client):
+    """白名单只看主机部分，不管端口——服务可能起在任意端口。"""
+    resp = client.get("/api/health", headers={"Host": "127.0.0.1:59999"})
+    assert resp.status_code == 200
+
+
+def test_host_whitelist_allows_localhost_with_port(client):
+    resp = client.get("/api/health", headers={"Host": "localhost:8931"})
+    assert resp.status_code == 200
+
+
+def test_host_whitelist_allows_ipv6_loopback_with_port(client):
+    resp = client.get("/api/health", headers={"Host": "[::1]:8900"})
+    assert resp.status_code == 200
+
+
+def test_host_whitelist_rejects_evil_host_even_with_plausible_port(client):
+    """攻击者伪造一个"看起来像本机端口"的 Host 也不能通过——校验的是主机部分，
+    不是"这个 Host 长得像不像本机"。"""
+    resp = client.get("/api/health", headers={"Host": "evil.com:8900"})
+    assert resp.status_code == 403
+
+
+def test_host_whitelist_does_not_block_static_files(client):
+    """中间件按 Host 判断、不看路径——合法 Host 下静态文件必须能正常访问。"""
+    resp = client.get("/static/app.js")
+    assert resp.status_code == 200
+
+
+def test_host_whitelist_does_not_block_index_page(client):
+    resp = client.get("/")
+    assert resp.status_code == 200

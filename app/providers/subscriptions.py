@@ -8,9 +8,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from pathlib import Path
 
-from ..config import CONFIG_PATH, Channel
+from ..config import Channel, resolve_codex_auth_file
 from ..credentials import (
     CRED_EXPIRED,
     CRED_NO_TOKEN,
@@ -391,9 +390,12 @@ async def query_codex(channel: Channel) -> ChannelResult:
     base = _base(channel)
     # 渠道可以关联一份用户上传的 auth.json（多账号场景，extra.codex_auth_file
     # 指向 config 同目录 credentials/ 下的文件）；否则读本机 Codex CLI 登录态。
+    # codex_auth_file 经 resolve_codex_auth_file 校验——extra 是用户可自由设置的
+    # 开放字段，不校验的话 ../../ 或绝对路径会读本目录之外的任意文件（且删除渠道
+    # 时会被 unlink 删掉）。
     auth_file = (channel.extra or {}).get("codex_auth_file")
-    if auth_file:
-        path = Path(CONFIG_PATH.parent) / auth_file
+    path = resolve_codex_auth_file(auth_file) if auth_file else None
+    if path is not None:
         cred = await asyncio.to_thread(read_codex_credentials_from_file, path)
     else:
         cred = await asyncio.to_thread(read_codex_credentials)

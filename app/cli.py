@@ -116,22 +116,34 @@ async def _fetch_quotas(ids: set[str] | None) -> list[dict]:
     if ids:
         channels = [c for c in channels if c.id in ids]
 
-    async def one(channel: config_store.Channel) -> dict:
+    async def one(channel: config_store.Channel) -> list[dict]:
         if not channel.enabled:
-            return _disabled_payload(channel)
+            return [_disabled_payload(channel)]
         try:
-            return (await query_channel(channel)).to_dict()
+            res = (await query_channel(channel)).to_dict()
         except Exception as e:  # query_channel 内部已兜底，这里是双重保险
-            return fail(
-                "error",
-                str(e) or e.__class__.__name__,
-                id=channel.id,
-                type=channel.type,
-                name=channel.name,
-                category=channel_category(channel.type),
-            ).to_dict()
+            return [
+                fail(
+                    "error",
+                    str(e) or e.__class__.__name__,
+                    id=channel.id,
+                    type=channel.type,
+                    name=channel.name,
+                    category=channel_category(channel.type),
+                ).to_dict()
+            ]
+        # 与 Web 端 /api/quotas 完全一致的多 Plan 拆分（火山 Agent + Coding 拆成
+        # 两张卡），保证 --json 输出结构与 /api/quotas 一致——README 明确承诺过。
+        # 函数内延迟 import main：避免 cli 模块加载时连带实例化 FastAPI app 等
+        # web 端副作用（cli 是一次性终端进程，不需要 web 框架）。
+        from . import main as main_module
 
-    return list(await asyncio.gather(*(one(c) for c in channels)))
+        return main_module.split_multi_plan_result(channel, res)
+
+    flat: list[dict] = []
+    for cards in await asyncio.gather(*(one(c) for c in channels)):
+        flat.extend(cards)
+    return flat
 
 
 def _exit_code(payloads: list[dict]) -> int:
@@ -183,7 +195,15 @@ def _cmd_channels(args: argparse.Namespace) -> int:
 
 
 def _cmd_cost(args: argparse.Namespace) -> int:
-    data = asyncio.run(asyncio.to_thread(local_usage.get_local_usage, args.days))
+    # --days 的 help 文本写的是 "1-90"，但之前这里直接把 args.days 原样传给
+    # get_local_usage，从不做范围校验——get_local_usage 内部也不 clamp，会直接
+    # 拿 days 算 since_ms。传 0 或负数：timedelta(days<=0) 让 since_ms 落在未来，
+    # 所有记录的时间戳都早于它，结果是空的；传一个很大的值（比如 10000）：
+    # since_ms 落到很古老的时间点，等于不设时间下限，把 transcript/数据库全盘
+    # 扫一遍。GET /api/local-usage 端点（app/main.py）已经用 min(max(days,1),90)
+    # 做了同样的 clamp，这里对齐，不能只有 API 端点做了防护、CLI 没做。
+    days = min(max(args.days, 1), 90)
+    data = asyncio.run(asyncio.to_thread(local_usage.get_local_usage, days))
     if args.json:
         print(json.dumps(data, ensure_ascii=False, indent=2))
         return 0
@@ -201,7 +221,7 @@ def _cmd_cost(args: argparse.Namespace) -> int:
             parts.append(f"费用 {totals.get('cost', 0)}")
         else:
             parts.append("无费用数据")
-        print(f"{label}（近 {data.get('days', args.days)} 天）: " + " · ".join(parts))
+        print(f"{label}（近 {data.get('days', days)} 天）: " + " · ".join(parts))
     return 0
 
 

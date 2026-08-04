@@ -36,6 +36,16 @@ class ChannelResult:
     windows: list[QuotaWindow] = field(default_factory=list)
     source: str | None = None  # 凭据来源说明（如 "~/.claude/.credentials.json"）
     updated_at: int = field(default_factory=lambda: int(time.time() * 1000))
+    # 少数 provider 需要带出比标准字段更细的结构化信息，又不想为每个特例单独加
+    # 一个顶层字段（那样这个 dataclass 会无限膨胀）。目前唯一的使用者：火山方舟
+    # 渠道用 extra["agent_plan_name"]/["coding_plan_name"] 带出 Agent/Coding 两个
+    # 套餐各自的真实名称（含 PlanType 档位，如 "火山 Agent Plan small"），供
+    # app/main.py 把渠道拆成两张卡片时各自取用——而不是从 plan_name 拼接后的
+    # "火山 Agent Plan small · 火山 Coding Plan" 字符串里反过来解析（main.py 曾经
+    # 因为没有这个结构化字段，直接把两张卡的 plan_name 硬编码成通用的
+    # "Agent Plan"/"Coding Plan"，丢掉了套餐档位信息）。默认空 dict，其余 provider
+    # 不使用时序列化结果里只是一个无害的 {}。
+    extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)

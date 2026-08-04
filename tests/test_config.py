@@ -302,3 +302,41 @@ def test_import_rejects_unknown_type(isolated_config):
 def test_import_rejects_non_list_channels(isolated_config):
     with pytest.raises(config_store.ImportConfigError):
         config_store.import_config({"channels": "not a list"})
+
+
+# ── resolve_codex_auth_file：路径穿越防护 ────────────────────────
+#
+# 回归：extra.codex_auth_file 是用户可通过 POST /api/channels 自由设置的开放字段。
+# 不校验的话，"../../etc/passwd" 或绝对路径会让 query_codex 读 config 目录外任意
+# 文件，删除渠道时还会 unlink 删除任意文件。resolve_codex_auth_file 必须把值限制
+# 在 credentials/ 子目录内、且文件名匹配 codex_*.json。
+
+
+def test_resolve_codex_auth_file_normal_path(isolated_config):
+    path = config_store.resolve_codex_auth_file("credentials/codex_ch1.json")
+    assert path is not None
+    assert path.name == "codex_ch1.json"
+    assert path.parent.name == "credentials"
+
+
+def test_resolve_codex_auth_file_rejects_traversal(isolated_config):
+    # 相对路径穿越：解析后落在 credentials/ 之外
+    assert config_store.resolve_codex_auth_file("../../etc/passwd") is None
+    assert config_store.resolve_codex_auth_file("credentials/../../../etc/passwd") is None
+
+
+def test_resolve_codex_auth_file_rejects_absolute_path(isolated_config):
+    # 绝对路径：Path / 操作符会丢弃左边直接用右边，必须被拒
+    assert config_store.resolve_codex_auth_file("/etc/passwd") is None
+    assert config_store.resolve_codex_auth_file("/Users/x/credentials/codex_a.json") is None
+
+
+def test_resolve_codex_auth_file_rejects_wrong_filename_pattern(isolated_config):
+    # 文件名必须匹配 codex_*.json，挡住 credentials/ 下放任意名字的文件
+    assert config_store.resolve_codex_auth_file("credentials/secret.json") is None
+    assert config_store.resolve_codex_auth_file("credentials/codex_a.txt") is None
+
+
+def test_resolve_codex_auth_file_rejects_empty(isolated_config):
+    assert config_store.resolve_codex_auth_file("") is None
+    assert config_store.resolve_codex_auth_file(None) is None

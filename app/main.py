@@ -31,16 +31,44 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 # 火山渠道在后端 /api/quotas 里被拆成 <id>_agent / <id>_coding 两张卡展示（前端
 # 拿到的 channel id 带后缀），但 config / 缓存 / 历史都按原始 id（不带后缀）存取。
-# 前端"刷新此渠道"按钮发的 ids 会带后缀，必须归一化回 config id 才能匹配到渠道。
-# create_or_update_channel / get_channel_secret 里也有同样的后缀归一逻辑。
+# 前端"刷新此渠道"/"停用"按钮发的 ids 会带后缀，必须归一化回 config id 才能匹配
+# 到渠道。create_or_update_channel / get_channel_secret / history 四处都复用
+# 下面同一个 _canonical_channel_id，逻辑必须完全一致，不能有的端点归一有的不归一。
 _VOLC_PLAN_SUFFIXES = ("_agent", "_coding")
 
 
 def _canonical_channel_id(channel_id: str) -> str:
-    """去掉火山渠道 id 的 _agent/_coding 后缀，归一到 config 里的真实 id。"""
+    """把可能带 _agent/_coding 后缀的 channel id 归一到 config 里的真实渠道 id。
+
+    上一版实现无条件剥掉任何 id 结尾的 _agent/_coding，完全不看这个 id 对应的
+    渠道是不是火山类型——这会误伤真实存在的、id 本身就恰好以这两个词结尾的非
+    火山渠道。实测复现的破坏路径：导入一个 id 为 "team_agent" 的 deepseek 渠道
+    （import_config 会原样保留传入的 id），前端点"停用"发送最小 payload
+    {"id":"team_agent","type":"deepseek","enabled":false}，旧逻辑把它归一成
+    并不存在的 "team"，get_channel("team") 返回 None 被误判为"新建渠道"，因
+    缺少必填的 api_key 而 400——这个渠道在 UI 里彻底无法编辑/停用。同理，POST
+    一个新渠道、id 恰好起成 "my_coding"，会被静默存成 id "my"。
+
+    正确做法分两步走，且顺序不能反：
+    1. 先用原始 id（可能带后缀）去 config 里精确查找。只要这个 id 本身就是一个
+       真实存在的渠道——不管它是不是火山、也不管它的 id 是否恰好以 _agent/
+       _coding 结尾——就直接用它，不做任何改写。精确匹配永远优先，是这个函数
+       最基本的不变量，也是修掉上面误伤问题的关键一步。
+    2. 精确查找失败，才尝试剥掉后缀去查——但剥出来的那个 id 必须真的存在，且
+       类型必须恰好是 volcengine，才采纳这个归一结果。这一步保证真实的火山子卡
+       场景不被这次修复连带弄坏：config 里只存了不带后缀的原始火山渠道 id，
+       前端传来的 <id>_agent/<id>_coding 就是通过这一步映射回真实渠道的。
+    3. 两步都找不到，原样返回原始 id——大概率是一个确实不存在的 id，交给调用方
+       走各自"渠道不存在"的正常错误路径（404 / 静默忽略等），不在这里瞎猜。
+    """
+    if config_store.get_channel(channel_id) is not None:
+        return channel_id
     for suffix in _VOLC_PLAN_SUFFIXES:
         if channel_id.endswith(suffix):
-            return channel_id[: -len(suffix)]
+            base_id = channel_id[: -len(suffix)]
+            base_channel = config_store.get_channel(base_id)
+            if base_channel is not None and base_channel.type == "volcengine":
+                return base_id
     return channel_id
 
 
@@ -73,6 +101,72 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="QuotaX", lifespan=lifespan)
+
+
+# ── DNS rebinding 防护：Host 请求头白名单 ────────────────────────
+#
+# 背景：本服务无任何认证，只监听 127.0.0.1，但 GET /api/config/export?
+# include_secrets=true 会返回明文 API Key（config_store.export_config 的
+# docstring 早就点名了这个风险，但一直没有实际防护）。仅仅"监听在 127.0.0.1"
+# 不是安全边界：一个恶意网页可以用 DNS rebinding 攻击——先用一个攻击者控制的
+# 域名（首次 DNS 解析到攻击者自己的服务器，通过浏览器的初始连接/证书检查），
+# 再把这个域名的 DNS 记录（配合很短的 TTL）改指向 127.0.0.1，诱导浏览器重新
+# 解析；后续从同一个页面发出的 fetch/XHR 请求会被发到本机这个服务上，而浏览器
+# 仍然认为这是"同源"请求（域名字符串一直没变，变的只是它背后指向的 IP，不受
+# 同源策略拦截）。
+#
+# 为什么校验 Host 头有效：Host 是浏览器根据请求 URL 的 authority 部分自动
+# 填写的"禁止头"（forbidden header name，Fetch 规范明确禁止 JS 通过 fetch/XHR
+# 显式设置或覆盖它）。即使 DNS 把 evil.com 解析到了 127.0.0.1，浏览器发出的
+# 请求 Host 头仍然是 "evil.com"（或 "evil.com:<port>"），不会变成
+# "127.0.0.1"——所以只要挡住 Host 头不在白名单里的请求，就能挡住这类攻击。
+_ALLOWED_HOSTS = {
+    "127.0.0.1",
+    "localhost",
+    "::1",
+    # Starlette TestClient（httpx 的 ASGITransport）默认发送的 Host 头固定是
+    # "testserver"，测试代码不会也不需要显式设置它。本项目 100+ 个测试全部走
+    # TestClient，不放行这个值的话会全部返回 403。这不是需要额外环境变量开关
+    # 才能豁免的生产风险："testserver" 是一个不含点的单标签名，公网 DNS 无法
+    # 把它解析到攻击者的服务器，残余风险仅限于用户自己在本地 hosts/内网 DNS 里
+    # 把这个名字配置指向本机的极端场景，和本工具"个人本机使用"的定位不冲突。
+    "testserver",
+}
+
+
+def _host_without_port(host_header: str) -> str:
+    """从 Host 请求头里剥掉端口号（以及 IPv6 字面量的方括号），只留主机名/IP。
+
+    服务可能起在任意端口（README 里就有 8900/8931 等不同示例，测试也会用别的
+    端口），白名单不能写死端口，只需要校验冒号前的主机部分——不管请求实际连的
+    是哪个端口。
+    """
+    value = host_header.strip().lower()
+    if value.startswith("["):
+        # IPv6 字面量形如 "[::1]" 或 "[::1]:8900"——地址本身包含多个冒号，不能
+        # 简单按冒号切分，要用配对的 "]" 定位地址边界。
+        end = value.find("]")
+        return value[1:end] if end != -1 else value
+    # IPv4 / 主机名：最多带一个 ":<port>" 后缀（主机名和 IPv4 地址本身都不含
+    # 冒号），直接按最后一个冒号切一次即可。
+    return value.rsplit(":", 1)[0] if ":" in value else value
+
+
+@app.middleware("http")
+async def _enforce_host_whitelist(request: Request, call_next):
+    """DNS rebinding 防护：Host 头不在白名单里一律 403，不进入任何业务路由。
+
+    中间件按 Host 头判断，不看请求路径——静态文件（/static/...）和首页（/）
+    在合法 Host 下会照常通过，不需要针对路径单独放行；本地实测已确认 GET /、
+    /static/app.js、/api/health 在合法 Host 下均为 200（见部署验证脚本）。
+    """
+    if _host_without_port(request.headers.get("host", "")) not in _ALLOWED_HOSTS:
+        host_header = request.headers.get("host") or "(空)"
+        return JSONResponse(
+            status_code=403,
+            content={"detail": f"非法的请求来源（Host: {host_header}），出于防 DNS rebinding 攻击考虑仅允许本机访问"},
+        )
+    return await call_next(request)
 
 
 def _format_validation_error(exc: RequestValidationError) -> str:
@@ -164,7 +258,10 @@ async def create_or_update_channel(payload: ChannelPayload):
     字段允许为空（表示沿用旧值），所以这个"必填"只在新建时强制。
     """
     # 火山渠道在前端按 Plan 拆成 <id>_agent / <id>_coding 展示，前端开关发的 id 带
-    # 这些后缀。停用/启用只需归一回真实 config id（不带后缀），否则会被当成新建。
+    # 这些后缀。停用/启用需要归一回真实 config id（不带后缀），否则会被当成新建；
+    # 但只有精确匹配失败、且剥出来的 id 真的是 volcengine 渠道时才会被改写——见
+    # _canonical_channel_id 的文档字符串，普通渠道 id 恰好以 _agent/_coding
+    # 结尾的情况不会被误伤。
     if payload.id:
         payload.id = _canonical_channel_id(payload.id)
 
@@ -202,18 +299,23 @@ async def remove_channel(channel_id: str):
     await _invalidate_cache(channel_id)
     history_store.delete_channel_history(channel_id)
     if channel and (channel.extra or {}).get("codex_auth_file"):
-        # 清理上传的 Codex 凭据文件（私有文件，渠道删除后没有保留的必要）
-        try:
-            (Path(config_store.CONFIG_PATH.parent) / channel.extra["codex_auth_file"]).unlink(missing_ok=True)
-        except OSError:
-            pass
+        # 清理上传的 Codex 凭据文件（私有文件，渠道删除后没有保留的必要）。
+        # codex_auth_file 经 resolve_codex_auth_file 校验——extra 是用户可自由设置
+        # 的字段，不校验的话 ../../ 或绝对路径会让 unlink 删除本目录之外的任意文件。
+        cred_path = config_store.resolve_codex_auth_file(channel.extra["codex_auth_file"])
+        if cred_path is not None:
+            try:
+                cred_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     return {"ok": True}
 
 
 @app.get("/api/channels/{channel_id}/secret")
 async def get_channel_secret(channel_id: str):
     """返回指定渠道的明文密钥（仅本机无认证访问，供编辑表单"显示密钥"使用）。"""
-    # 火山子渠道 id 带 _agent/_coding 后缀，归一到真实 config id
+    # 火山子渠道 id 带 _agent/_coding 后缀，归一到真实 config id（只在精确匹配
+    # 失败、且剥出来的 id 确实是 volcengine 渠道时才会被改写，见函数文档）。
     base_id = _canonical_channel_id(channel_id)
     channel = config_store.get_channel(base_id)
     if not channel:
@@ -295,6 +397,12 @@ async def upload_codex_credentials(channel_id: str, payload: CodexCredentialPayl
 async def _invalidate_cache(channel_id: str) -> None:
     async with _cache_lock:
         _cache.pop(channel_id, None)
+        # 编辑渠道（如换密钥）后应真正重新查询，而不是复用一个还在 _inflight 里、
+        # 早已完成的旧 task 的旧结果。只摘除已完成的：仍在运行的 task 不能动（否则
+        # 会孤立正在后台跑的查询、让等待它的调用者拿不到结果）。
+        inflight = _inflight.get(channel_id)
+        if inflight is not None and inflight.done():
+            _inflight.pop(channel_id, None)
 
 
 def _disabled_result(channel: config_store.Channel) -> dict:
@@ -306,6 +414,42 @@ def _disabled_result(channel: config_store.Channel) -> dict:
         category=channel_category(channel.type),
         status="disabled",
     ).to_dict()
+
+
+def split_multi_plan_result(channel: config_store.Channel, res: dict) -> list[dict]:
+    """把单个渠道查询结果里"同时查到多套 Plan"的情况拆成多张卡片。
+
+    目前唯一的多 Plan 场景是火山方舟：同一账号同时开了 Agent Plan + Coding Plan，
+    provider 层把两套套餐的窗口放在同一个 ChannelResult.windows 里（key 带
+    agent_ / coding_ 前缀）。这里按前缀把它们拆成两张独立卡片，各自带独立 id
+    （<id>_agent / <id>_coding）、独立 plan_name（取 extra 里 provider 带出的真实
+    套餐名）、各自的窗口子集。
+
+    抽成独立函数是为了让 CLI（app/cli.py 的 _fetch_quotas）和 Web 端（/api/quotas）
+    复用同一套拆分逻辑——README 明确承诺 `quotaboard quota --json` 的 channels
+    数组结构与 `GET /api/quotas` 完全一致，两处必须走同一个函数，否则火山双套餐
+    渠道在 CLI 里会少一条、id 不带后缀、windows 没分桶，脚本无法复用同一套解析。
+
+    不满足拆分条件（没有 agent_/coding_ 前缀的窗口，或只有其一）时原样返回单条。
+    """
+    windows = res.get("windows") or []
+    agent_wins = [w for w in windows if (w.get("key") or "").startswith("agent_")]
+    coding_wins = [w for w in windows if (w.get("key") or "").startswith("coding_")]
+    if not (agent_wins and coding_wins):
+        return [res]
+    # plan_name 取 provider 层通过 extra 带出的、每个套餐各自的真实名称（如
+    # "火山 Agent Plan small"，含 PlanType 档位——见 volcengine._merge_plans 的
+    # 文档字符串）；extra 里没有对应 key 时退回通用兜底文案，不至于没有 plan_name。
+    plan_names = res.get("extra") or {}
+    agent_res = dict(res)
+    agent_res["id"] = f"{channel.id}_agent"
+    agent_res["plan_name"] = plan_names.get("agent_plan_name") or "Agent Plan"
+    agent_res["windows"] = agent_wins
+    coding_res = dict(res)
+    coding_res["id"] = f"{channel.id}_coding"
+    coding_res["plan_name"] = plan_names.get("coding_plan_name") or "Coding Plan"
+    coding_res["windows"] = coding_wins
+    return [agent_res, coding_res]
 
 
 async def _query_and_cache(channel: config_store.Channel) -> dict:
@@ -347,14 +491,41 @@ async def _get_channel_result(channel: config_store.Channel, force: bool) -> tup
                 ttl = QUOTA_CACHE_TTL_MS if cached_result.get("status") == "ok" else QUOTA_ERROR_CACHE_TTL_MS
                 if now - cached_at < ttl:
                     return cached_result, True
+        # 复用 _inflight 里的 task 前，必须先检查它是否已经 done。
+        # 否则会发生一个微妙的脏数据路径：某次请求的 awaiter 在 task 跑完前被取消
+        # （客户端断连），finally 里观察到 task.done()=False 不摘除它；task 之后在
+        # 后台跑完、写进 _cache，但 _inflight[id] 仍指向这个已完成 task。等下次缓存
+        # 失效（编辑渠道 / TTL 到期）再查，缓存未命中 → 拿到这个旧 task → 直接返回
+        # 它当初的结果，而不是发起新查询（force=True 也绕不过这条复用路径）。done
+        # 检查让已完成的残留 task 被当成"没有在飞"对待，从而新建一个真正的新查询。
         task = _inflight.get(channel.id)
-        if task is None:
+        if task is None or task.done():
             task = asyncio.ensure_future(_query_and_cache(channel))
             _inflight[channel.id] = task
 
     try:
-        result = await task
+        # asyncio.shield：多个并发调用者可能在 await 同一个共享 task（见上面的
+        # 请求合并逻辑）。如果这里直接 `await task`，一旦*任意一个*调用者的外层
+        # 协程被取消（比如客户端断连、uvicorn 取消了这一次请求处理），asyncio
+        # 的语义是取消会顺着 await 传播进被 await 的 task——那会把这个共享的
+        # 查询 task 也取消掉，连累其他仍在等待同一个结果、客户端根本没断开的
+        # 调用者（它们的 await task 会跟着抛 CancelledError，而不是拿到正确
+        # 结果）。asyncio.shield(task) 隔离了这一点：外层取消只会取消 shield()
+        # 返回的这一层 wrapper（下面这个 await 抛 CancelledError），不会把 task
+        # 本身取消掉——task 会继续在后台跑完、正常写入 _cache，其它调用者不受
+        # 影响。
+        result = await asyncio.shield(task)
     finally:
+        # 推演 shield 语义下这个清理条件是否依然正确：
+        # 外层被取消时，上面的 await 在 task 还没跑完的情况下抛 CancelledError，
+        # 直接进入这个 finally——此时 task 仍在后台运行（没有被 shield 取消），
+        # task.done() 几乎总是 False，所以下面的条件不成立、不会把它从 _inflight
+        # 摘掉。这正是我们想要的：这个 task 仍然"在飞"，其它并发调用者、乃至
+        # 后续新来的请求都应该继续找到它、等它，而不能误以为它已经结束。只有
+        # 真正观察到 task.done()（正常完成，或者 task 自己内部异常/被直接
+        # cancel）的那次 await 才会执行清理；`_inflight.get(channel.id) is task`
+        # 这个身份比较保证了即使清理发生得晚，也不会误删一个后来者刚为同一个
+        # channel_id 创建的、对象不同的新 task。
         async with _cache_lock:
             if _inflight.get(channel.id) is task and task.done():
                 _inflight.pop(channel.id, None)
@@ -415,29 +586,11 @@ async def quotas(force: bool = False, ids: str | None = None):
             if res:
                 result_channels.append(res)
             continue
-        
-        # 核心逻辑：若单个渠道内部查到了多套 Plan（如火山 Agent Plan 与 Coding Plan）
-        # 将它们在 Backend /api/quotas 返回层拆分为 2 个独立的 Channel/卡片对象！
-        windows = res.get("windows") or []
-        agent_wins = [w for w in windows if (w.get("key") or "").startswith("agent_")]
-        coding_wins = [w for w in windows if (w.get("key") or "").startswith("coding_")]
 
-        if agent_wins and coding_wins:
-            # 1) Agent Plan 独立卡片
-            agent_res = dict(res)
-            agent_res["id"] = f"{c.id}_agent"
-            agent_res["plan_name"] = "Agent Plan"
-            agent_res["windows"] = agent_wins
-            result_channels.append(agent_res)
-
-            # 2) Coding Plan 独立卡片
-            coding_res = dict(res)
-            coding_res["id"] = f"{c.id}_coding"
-            coding_res["plan_name"] = "Coding Plan"
-            coding_res["windows"] = coding_wins
-            result_channels.append(coding_res)
-        else:
-            result_channels.append(res)
+        # 火山方舟同一账号可能同时查到 Agent Plan + Coding Plan，拆成两张独立卡片。
+        # 这段拆分逻辑抽成了 split_multi_plan_result，CLI 的 _fetch_quotas 也复用
+        # 同一个函数，保证 `quotaboard quota --json` 与 `GET /api/quotas` 结构一致。
+        result_channels.extend(split_multi_plan_result(c, res))
 
     return {"cached": bool(enabled) and all_from_cache, "channels": result_channels}
 
@@ -487,9 +640,13 @@ async def import_config(payload: dict, mode: Literal["merge", "replace"] = "merg
         result = await asyncio.to_thread(config_store.import_config, payload, mode)
     except config_store.ImportConfigError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    # 导入后全量失效缓存（渠道可能新增/替换/删除，逐个失效不如清一次干净）
+    # 导入后全量失效缓存（渠道可能新增/替换/删除，逐个失效不如清一次干净）。
+    # 同样摘除 _inflight 里已完成的残留 task（逻辑同 _invalidate_cache），避免导入
+    # 后复用旧 task 返回渠道编辑前的结果。仍在运行的 task 不动，避免孤立后台查询。
     async with _cache_lock:
         _cache.clear()
+        for cid in [cid for cid, t in _inflight.items() if t.done()]:
+            _inflight.pop(cid, None)
     return result
 
 
@@ -502,9 +659,15 @@ async def history(days: int = 30, ids: str | None = None):
 
     days：返回最近 N 天（1-365，默认 30）。
     ids：逗号分隔的渠道 id 列表，只返回这些渠道；不传则返回全部已配置渠道。
+
+    与 create_or_update_channel / get_channel_secret / quotas 三处一样，这里也
+    要用 _canonical_channel_id 归一 _agent/_coding 后缀——这四个端点都会接到
+    "渠道 id"，必须是同一套归一逻辑，不能三个做归一、剩这一个不做（目前前端
+    历史趋势下拉用的是不带后缀的配置 id，这个不一致还没被触发暴露，但如果哪天
+    前端改成传火山子卡的带后缀 id，不归一就会查不到对应渠道的历史）。
     """
     days = min(max(days, 1), 365)
-    wanted = {x.strip() for x in ids.split(",") if x.strip()} if ids else None
+    wanted = {_canonical_channel_id(x.strip()) for x in ids.split(",") if x.strip()} if ids else None
     return await asyncio.to_thread(history_store.get_history, wanted, days)
 
 

@@ -5,7 +5,12 @@ Gemini 的 camelCase/snake_case 兼容 helper。不发起任何真实网络请�
 
 from __future__ import annotations
 
+import asyncio
+
+from app.config import Channel
+from app.models import window as make_window
 from app.providers import coding_plans, volcengine
+from app.providers._common import _require
 from app.providers.subscriptions import (
     _classify_gemini_model,
     _merge_copilot_usage,
@@ -43,6 +48,7 @@ def test_parse_zhipu_data_success_with_five_hour_and_weekly():
                     "percentage": 40.0,
                     "nextResetTime": "2026-08-10T00:00:00Z",
                 },
+                # TIME_LIMIT（MCP 每月调用次数）已不再展示，这里故意带上确保它被忽略
                 {
                     "type": "TIME_LIMIT",
                     "remaining": 80,
@@ -56,7 +62,8 @@ def test_parse_zhipu_data_success_with_five_hour_and_weekly():
     assert result.status == "ok"
     assert result.plan_name == "GLM Coding Plan"
     keys = {w.key for w in result.windows}
-    assert {"five_hour", "weekly", "custom"} <= keys
+    assert {"five_hour", "weekly"} <= keys
+    assert "custom" not in keys  # MCP 每月不再产生 custom 窗口
     five_hour = next(w for w in result.windows if w.key == "five_hour")
     assert five_hour.used_percent == 12.5
     assert five_hour.remaining_percent == 87.5
@@ -117,7 +124,27 @@ def test_parse_coding_plan_tiers_basic():
     }
     windows = volcengine._parse_coding_plan_tiers(result)
     keys = {w.key for w in windows}
-    assert keys == {"five_hour", "weekly", "monthly"}  # 未识别的桶被跳过
+    # 三个标准档位照常解析；未识别的桶（如火山未来新增的 daily 档位）不再静默丢弃，
+    # 而是保留为 custom 让数据可见、可排查（而不是 UI 上悄悄消失）。
+    assert {"five_hour", "weekly", "monthly"} <= keys
+    custom = [w for w in windows if w.key == "custom"]
+    assert len(custom) == 1
+    assert custom[0].used_percent == 99.0
+
+
+def test_parse_coding_plan_tiers_zero_percent_not_treated_as_missing():
+    # 回归：Percent == 0（完全没用过配额）是合法值。旧代码用 `or` 短路，
+    # `0 or UsedPercent` 会跳过 0 误取下一个 key（与 MiniMax 已修的同源 bug）。
+    result = {
+        "QuotaUsage": [
+            {"Level": "session_5h", "Percent": 0, "UsedPercent": 37.0},  # 0 必须被采用，不能取 37
+        ]
+    }
+    windows = volcengine._parse_coding_plan_tiers(result)
+    assert len(windows) == 1
+    assert windows[0].key == "five_hour"
+    assert windows[0].used_percent == 0.0      # 不能被篡改成 37.0
+    assert windows[0].remaining_percent == 100.0
 
 
 def test_parse_coding_plan_tiers_not_a_list_returns_empty():
@@ -170,6 +197,10 @@ def test_query_volcengine_merges_agent_and_coding(monkeypatch):
     assert "火山 Agent Plan small" in result.plan_name
     assert "火山 Coding Plan" in result.plan_name
     assert result.message is None
+    # 任务 3 回归：main.py 拆卡时需要这两个结构化字段各自还原真实套餐名（含
+    # PlanType 档位），不能只依赖拼接后的 plan_name 反过来解析。
+    assert result.extra["agent_plan_name"] == "火山 Agent Plan small"
+    assert result.extra["coding_plan_name"] == "火山 Coding Plan"
 
 
 def test_query_volcengine_agent_only(monkeypatch):
@@ -181,6 +212,7 @@ def test_query_volcengine_agent_only(monkeypatch):
     assert {w.label for w in result.windows} == {"Agent 每 5 小时", "Agent 每周额度"}
     assert result.plan_name == "火山 Agent Plan small"
     assert "Coding Plan" not in result.plan_name
+    assert result.extra == {"agent_plan_name": "火山 Agent Plan small"}
 
 
 def test_query_volcengine_coding_only(monkeypatch):
@@ -191,6 +223,37 @@ def test_query_volcengine_coding_only(monkeypatch):
     assert result.status == "ok"
     assert {w.label for w in result.windows} == {"Coding 每周额度"}
     assert result.plan_name == "火山 Coding Plan"
+    assert result.extra == {"coding_plan_name": "火山 Coding Plan"}
+
+
+# ── 火山 _merge_plans：直接单测结构化的 plan_names 返回值 ───────
+
+
+def test_merge_plans_returns_structured_plan_names_for_both():
+    agent_windows = [make_window("five_hour", "每 5 小时", used_percent=10, remaining_percent=90)]
+    coding_windows = [make_window("weekly", "每周额度", used_percent=20, remaining_percent=80)]
+    windows, plan_name, plan_names = volcengine._merge_plans(agent_windows, coding_windows, "small")
+    assert plan_name == "火山 Agent Plan small · 火山 Coding Plan"
+    assert plan_names == {
+        "agent_plan_name": "火山 Agent Plan small",
+        "coding_plan_name": "火山 Coding Plan",
+    }
+    assert len(windows) == 2
+
+
+def test_merge_plans_agent_only_omits_coding_key():
+    agent_windows = [make_window("five_hour", "每 5 小时", used_percent=10, remaining_percent=90)]
+    _windows, plan_name, plan_names = volcengine._merge_plans(agent_windows, [], None)
+    assert plan_name == "火山 Agent Plan"  # 没有 PlanType 时不带档位后缀
+    assert plan_names == {"agent_plan_name": "火山 Agent Plan"}
+    assert "coding_plan_name" not in plan_names
+
+
+def test_merge_plans_neither_plan_returns_empty_names():
+    windows, plan_name, plan_names = volcengine._merge_plans([], [], None)
+    assert windows == []
+    assert plan_name == ""
+    assert plan_names == {}
 
 
 def test_query_volcengine_one_plan_error_keeps_other(monkeypatch):
@@ -445,6 +508,32 @@ def test_query_minimax_missing_weekly_percent_skips_weekly(monkeypatch):
     assert {w.key for w in result.windows} == {"five_hour"}
 
 
+def test_query_minimax_exhausted_quota_shows_zero_not_full(monkeypatch):
+    # 回归：remaining_percent == 0（配额用尽）是有效值。旧代码用 `or 100` 兜底，
+    # `0 or 100` → 100，把"已耗尽"误报成"完全没用过"。
+    resp = {
+        "base_resp": {"status_code": 0},
+        "model_remains": [
+            {
+                "model_name": "general",
+                "current_interval_remaining_percent": 0,   # 5 小时窗口已耗尽
+                "current_weekly_total_count": 10,
+                "current_weekly_remaining_percent": 0,      # 周窗口已耗尽
+                "end_time": 1785844800000,
+                "weekly_end_time": 1786291200000,
+            }
+        ],
+    }
+    result = _run_minimax(monkeypatch, resp)
+    assert result.status == "ok"
+    five_hour = next(w for w in result.windows if w.key == "five_hour")
+    assert five_hour.remaining_percent == 0.0   # 不能被篡改成 100.0
+    assert five_hour.used_percent == 100.0
+    weekly = next(w for w in result.windows if w.key == "weekly")
+    assert weekly.remaining_percent == 0.0      # 不能被篡改成 100.0
+    assert weekly.used_percent == 100.0
+
+
 # ── query_channel 兜底：底层网络异常翻译成中文 ──────────────────
 #
 # 回归背景：DNS 解析失败时 httpx 抛的 "[Errno 8] nodename nor servname provided,
@@ -495,3 +584,79 @@ def test_fail_from_error_translates_ssl_handshake_failure(monkeypatch):
     assert "TLS" in result.message
     assert "代理" in result.message
     assert "网络或超时" not in result.message
+
+
+# ── providers/_common._require：三个 provider 模块共用的必填字段校验 ────
+
+
+def _base(**overrides):
+    d = {"id": "ch_r", "type": "t", "name": "N", "category": "coding_plan"}
+    d.update(overrides)
+    return d
+
+
+def test_require_returns_none_when_value_present():
+    assert _require("sk-x", "API Key", _base()) is None
+
+
+def test_require_returns_default_message_when_missing():
+    result = _require(None, "API Key", _base())
+    assert result.status == "error"
+    assert result.message == "未配置 API Key"
+    assert result.id == "ch_r"  # base 里的字段被透传
+
+
+def test_require_treats_empty_string_as_missing():
+    assert _require("", "API Key", _base()) is not None
+
+
+def test_require_custom_message_overrides_default_template():
+    result = _require(None, "Cookie", _base(), message="自定义提示文案")
+    assert result.message == "自定义提示文案"
+
+
+# ── 任务 4 回归：coding_plans.py 缺必填字段返回友好 error 而不是抛异常 ────
+#
+# 回归背景：query_zenmux 直接把 channel.base_url 传给 request_json 当 URL，
+# 为 None 时会把 httpx 的内部异常当错误文案抛给用户；query_kimi_coding /
+# query_minimax / query_zhipu / query_zhipu_team 都直接用 channel.api_key 拼
+# Authorization 头，为空时会发出裸的 "Bearer None"。这里逐个覆盖缺字段场景，
+# 确认现在都能返回带中文标签的友好 error。
+
+
+def test_query_zenmux_missing_base_url_is_reported_clearly():
+    channel = Channel(id="ch_z", type="zenmux", name="ZenMux", api_key="sk-x")  # 没填 base_url
+    result = asyncio.run(coding_plans.query_zenmux(channel))
+    assert result.status == "error"
+    assert "Base URL" in result.message
+
+
+def test_query_zenmux_missing_api_key_is_reported_clearly():
+    channel = Channel(id="ch_z", type="zenmux", name="ZenMux", base_url="https://zenmux.example/api/usage")
+    result = asyncio.run(coding_plans.query_zenmux(channel))
+    assert result.status == "error"
+    assert "API Key" in result.message
+
+
+def test_query_kimi_coding_missing_api_key_is_reported_clearly():
+    result = asyncio.run(coding_plans.query_kimi_coding(Channel(id="ch_k", type="kimi_coding", name="Kimi")))
+    assert result.status == "error"
+    assert "API Key" in result.message
+
+
+def test_query_minimax_missing_api_key_is_reported_clearly():
+    result = asyncio.run(coding_plans.query_minimax(Channel(id="ch_mm", type="minimax", name="MM")))
+    assert result.status == "error"
+    assert "API Key" in result.message
+
+
+def test_query_zhipu_missing_api_key_is_reported_clearly():
+    result = asyncio.run(coding_plans.query_zhipu(Channel(id="ch_zh", type="zhipu_coding", name="GLM")))
+    assert result.status == "error"
+    assert "API Key" in result.message
+
+
+def test_query_zhipu_team_missing_api_key_is_reported_clearly():
+    result = asyncio.run(coding_plans.query_zhipu_team(Channel(id="ch_zt", type="zhipu_team", name="GLM 团队")))
+    assert result.status == "error"
+    assert "API Key" in result.message

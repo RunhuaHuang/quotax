@@ -364,6 +364,13 @@ def read_copilot_credentials() -> Credential:
     """来源：~/.config/github-copilot/hosts.json（VS Code / Copilot CLI 通用）。
 
     格式：{"github.com": {"oauth_token": "ghu_...", "user": "..."}}
+
+    候选路径有两个（不同安装方式/平台落盘位置不同）。之前的实现里，只要第一个
+    候选文件存在就 break 掉，不管里面有没有真的找到 oauth_token——如果这个文件
+    存在但是空 {}、或者没有 oauth_token 字段（比如只装了 CLI 但还没登录，文件
+    已经被创建出来），第二个候选路径即便真的有 token 也永远不会被尝试，被误判
+    成"未登录"。正确逻辑应该是"这个候选文件存在但没找到可用 token，继续试下一个
+    候选"，只有全部候选都试完仍找不到才返回 not_found。
     """
     candidates = [
         Path.home() / ".config" / "github-copilot" / "hosts.json",
@@ -376,13 +383,18 @@ def read_copilot_credentials() -> Credential:
             parsed = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as e:
             return Credential("", CRED_PARSE_ERROR, str(path), f"凭据 JSON 解析失败: {e}")
-        for key, entry in parsed.items() if isinstance(parsed, dict) else []:
+        # entry 是 hosts.json 里每个 host（如 "github.com"）对应的值，key 本身
+        # 用不到，只需要遍历 values（旧代码写的 `for key, entry in ...` 里 key
+        # 从未被使用）。
+        for entry in parsed.values() if isinstance(parsed, dict) else []:
             if isinstance(entry, dict) and entry.get("oauth_token"):
                 extra = {}
                 if entry.get("user"):
                     extra["user"] = entry["user"]
                 return Credential(entry["oauth_token"], CRED_OK, str(path), extra=extra)
-        break
+        # 这个候选文件存在，但没有找到可用 token——继续尝试下一个候选路径，
+        # 不能在这里 break（旧 bug 正是在这里提前退出，漏掉了后面真正有 token
+        # 的候选文件）。
     return Credential(
         "",
         CRED_NOT_FOUND,

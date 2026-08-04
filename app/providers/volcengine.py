@@ -191,31 +191,57 @@ async def query_volcengine(channel: Channel) -> ChannelResult:
     except (ResponseError, ParseError) as e:
         soft_errors.append(f"Coding Plan: {e}")
 
-    windows, plan_name = _merge_plans(agent_windows, coding_windows, agent_plan_type)
+    windows, plan_name, plan_names = _merge_plans(agent_windows, coding_windows, agent_plan_type)
     if not windows:
         if soft_errors:
             return fail("error", "；".join(soft_errors), **base)
         return fail("error", "未检测到火山 Agent Plan 或 Coding Plan 订阅", **base)
 
-    return ok(plan_name=plan_name, windows=windows, message="；".join(soft_errors) or None, **base)
+    return ok(
+        plan_name=plan_name,
+        windows=windows,
+        message="；".join(soft_errors) or None,
+        extra=plan_names,
+        **base,
+    )
 
 
-def _merge_plans(agent_windows: list, coding_windows: list, agent_plan_type: str | None) -> tuple[list, str]:
-    """合并 Agent Plan 与 Coding Plan 的窗口。
+def _merge_plans(
+    agent_windows: list, coding_windows: list, agent_plan_type: str | None
+) -> tuple[list, str, dict[str, str]]:
+    """合并 Agent Plan 与 Coding Plan 的窗口，并带出每个套餐各自的真实名称。
 
     两个 plan 的窗口 key 相同（five_hour/weekly/monthly）、label 也相同（如
     「每 5 小时」），合并后必须加来源前缀区分——key 加 plan 维度
     （agent_*/coding_*）让趋势图按 key 分线、前端按 key 分组渲染，label 加
-    「Agent 」/「Coding 」前缀让展示可读。返回 (windows, plan_name)。
+    「Agent 」/「Coding 」前缀让展示可读。
+
+    返回 (windows, plan_name, plan_names)：
+    - plan_name：两个套餐名用 " · " 拼接的完整串（如 "火山 Agent Plan small ·
+      火山 Coding Plan"），渠道没有被拆卡展示时直接当整体 plan_name 用；
+    - plan_names：{"agent_plan_name": ..., "coding_plan_name": ...}（只在对应
+      套餐确实查到数据时才有这个 key）。app/main.py 把火山渠道拆成 Agent/Coding
+      两张独立卡片时，需要每张卡各自的真实套餐名——尤其 Agent Plan 的名字里带
+      PlanType 档位（如 "火山 Agent Plan small"），不能像最初实现那样把两张卡的
+      plan_name 硬编码成通用的 "Agent Plan"/"Coding Plan" 丢掉档位信息，也不能
+      把这里拼接出的完整串塞给两张卡（那样两张卡会显示同一串、还各自带着对方
+      套餐的名字，串味）。让 provider 层把结构化的单套餐名称通过这个返回值带
+      出去，main.py 直接取用对应的 key，不用再从拼接串里反着解析——那样解析
+      本身就是脆弱的（万一某个套餐名字里也出现" · "就解析错位了）。
     """
     windows = [dataclasses.replace(w, key=f"agent_{w.key}", label=f"Agent {w.label}") for w in agent_windows]
     windows += [dataclasses.replace(w, key=f"coding_{w.key}", label=f"Coding {w.label}") for w in coding_windows]
+    plan_names: dict[str, str] = {}
     names = []
     if agent_windows:
-        names.append(f"火山 Agent Plan {agent_plan_type}" if agent_plan_type else "火山 Agent Plan")
+        agent_name = f"火山 Agent Plan {agent_plan_type}" if agent_plan_type else "火山 Agent Plan"
+        plan_names["agent_plan_name"] = agent_name
+        names.append(agent_name)
     if coding_windows:
-        names.append("火山 Coding Plan")
-    return windows, " · ".join(names)
+        coding_name = "火山 Coding Plan"
+        plan_names["coding_plan_name"] = coding_name
+        names.append(coding_name)
+    return windows, " · ".join(names), plan_names
 
 
 def _parse_afp_tiers(result: dict) -> list:
@@ -267,8 +293,19 @@ def _parse_coding_plan_tiers(result: dict) -> list:
         elif "month" in label:
             tier, tier_label = "monthly", "每月额度"
         else:
-            continue
-        used = float(item.get("Percent") or item.get("UsedPercent") or item.get("UsagePercent") or 0)
+            # 火山 API 字段命名在不同版本间不稳定（本函数已为 QuotaUsage/Usages/
+            # Details 三种字段名做兼容），未来若新增 daily 等档位，直接 continue 会
+            # 静默丢弃，用户在 UI 上看不到这一项、也无任何提示。保留为 custom，
+            # 用上游返回的原始 label 展示，至少让数据可见、可排查。
+            tier, tier_label = "custom", label or "其他档位"
+        # 已用百分比候选字段（火山不同版本字段名不统一）。用 is not None 而非 or 短路：
+        # "完全没用过配额"时 Percent == 0 是合法值，`0 or UsedPercent` 会跳过 0 误取
+        # 下一个 key（与 coding_plans.py 里 MiniMax 已修的同源 bug）。
+        raw = next(
+            (item.get(k) for k in ("Percent", "UsedPercent", "UsagePercent") if item.get(k) is not None),
+            None,
+        )
+        used = float(raw) if raw is not None else 0.0
         windows.append(
             window(
                 tier,
