@@ -821,7 +821,17 @@ async function onToggleEnabled(el) {
   const id = el.dataset.id;
   const type = el.dataset.type;
   const nextEnabled = el.checked;
-  el.disabled = true;
+  // 火山渠道在前端拆成 <id>_agent / <id>_coding 两张卡，但底层共享同一个 config
+  // 渠道（同一个 enabled 开关）。用户在一张子卡上点开关，网络往返期间（loadChannels
+  // + refreshQuotas 重绘前）另一张兄弟卡的开关还是旧状态——如果此时去点它，会基于
+  // 错误的 UI 状态发起请求，产生语义混乱的 toggle 序列。这里把同源（归一后同一
+  // config id）所有兄弟卡的开关一起锁住，直到全量重绘带回正确状态。
+  const baseId = canonicalChannelId(id);
+  const peerSwitches = document.querySelectorAll(
+    `.card[data-id] [data-action="toggle-enabled"]`
+  );
+  const peers = [...peerSwitches].filter((s) => canonicalChannelId(s.dataset.id) === baseId);
+  for (const s of peers) s.disabled = true;
   try {
     const res = await fetch("/api/channels", {
       method: "POST",
@@ -836,8 +846,11 @@ async function onToggleEnabled(el) {
     await loadChannels();
     await refreshQuotas(true);
   } catch (err) {
-    el.checked = !nextEnabled;
-    el.disabled = false;
+    // 失败回滚：把同源所有兄弟卡的勾选态翻回（它们在用户眼里是同一个开关）。
+    for (const s of peers) {
+      s.checked = !nextEnabled;
+      s.disabled = false;
+    }
     toast("操作失败: " + err.message, "err");
   }
 }

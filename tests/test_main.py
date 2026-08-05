@@ -598,6 +598,125 @@ async def test_get_channel_result_shield_protects_other_waiters_from_cancellatio
     assert "ch_shield" not in app_main._inflight
 
 
+# ── 配置代际：import 后在飞的旧查询结果不污染缓存 ──────────────────
+#
+# 回归背景：merge 导入覆盖某渠道密钥的瞬间，该渠道恰好有一次 in-flight 查询。
+# 编辑渠道走 _invalidate_cache 会摘掉已完成的 task，但仍在运行的 task 被
+# asyncio.shield 保护、无法摘除。这条用旧密钥发起的 task 跑完后原本会把旧密钥
+# 结果写回 _cache，TTL 内展示旧额度。代际（_generation）校验让它在写缓存时
+# 发现自己已"过时"，优雅丢弃结果。
+
+
+async def test_import_invalidates_inflight_stale_result(isolated_config, monkeypatch):
+    """导入配置后，导入前已在飞的旧查询完成时不应把结果写入缓存。"""
+    monkeypatch.setattr(config_store, "HISTORY_DIR", isolated_config.parent / "history")
+    app_main._cache.clear()
+    app_main._inflight.clear()
+    app_main._generation = 0
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_query(channel):
+        started.set()
+        await release.wait()
+        # 用旧密钥查到的（模拟）结果
+        return ok(
+            id=channel.id,
+            type=channel.type,
+            name=channel.name,
+            category="balance",
+            windows=[window("balance", "余额", remaining_percent=99.0)],
+        )
+
+    monkeypatch.setattr(app_main, "query_channel", slow_query)
+    # 先建一个渠道，再发起查询（此时 slow_query 会卡在 release.wait()）
+    config_store.upsert_channel({"id": "ch_imp", "type": "deepseek", "name": "X", "api_key": "sk-old"})
+    channel = config_store.get_channel("ch_imp")
+    query_task = asyncio.create_task(app_main._get_channel_result(channel, False))
+    await started.wait()  # 确保查询已经真正发起、卡在 in-flight
+
+    # 查询在飞期间：走真实 import 端点 merge 覆盖这个渠道的密钥（端点内 bump 代际）
+    await app_main.import_config(
+        {"version": 1, "channels": [{"id": "ch_imp", "type": "deepseek", "api_key": "sk-new", "name": "X"}]},
+        "merge",
+    )
+    assert app_main._generation > 0  # 代际已推进
+
+    # 放行旧查询：它跑完写缓存时会发现代际已变，必须丢弃结果
+    release.set()
+    stale_result, _ = await query_task
+    assert stale_result["windows"][0]["remaining_percent"] == 99.0  # 返回值本身仍是旧结果（调用者拿到的）
+    # 关键断言：旧结果不应进入缓存（否则 TTL 内会展示旧密钥的额度）
+    assert "ch_imp" not in app_main._cache
+
+
+async def test_edit_channel_bumps_generation_and_invalidates_inflight(isolated_config, monkeypatch):
+    """编辑渠道（POST /api/channels）同样 bump 代际，在飞的旧查询结果被丢弃。"""
+    monkeypatch.setattr(config_store, "HISTORY_DIR", isolated_config.parent / "history")
+    app_main._cache.clear()
+    app_main._inflight.clear()
+    app_main._generation = 0
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_query(channel):
+        started.set()
+        await release.wait()
+        return ok(
+            id=channel.id,
+            type=channel.type,
+            name=channel.name,
+            category="balance",
+            windows=[window("balance", "余额", remaining_percent=10.0)],
+        )
+
+    monkeypatch.setattr(app_main, "query_channel", slow_query)
+    config_store.upsert_channel({"id": "ch_edit", "type": "deepseek", "name": "X", "api_key": "sk-old"})
+    channel = config_store.get_channel("ch_edit")
+    query_task = asyncio.create_task(app_main._get_channel_result(channel, False))
+    await started.wait()
+
+    # 查询在飞期间：编辑渠道（_invalidate_cache 会 bump 代际）
+    await app_main._invalidate_cache("ch_edit")
+    assert app_main._generation > 0
+
+    release.set()
+    await query_task
+    assert "ch_edit" not in app_main._cache  # 旧结果被代际校验挡掉
+
+
+async def test_fresh_query_after_generation_bump_is_cached(isolated_config, monkeypatch):
+    """代际推进后发起的新查询（捕获新代际）结果正常写入缓存——代际校验不能误伤。"""
+    monkeypatch.setattr(config_store, "HISTORY_DIR", isolated_config.parent / "history")
+    app_main._cache.clear()
+    app_main._inflight.clear()
+    app_main._generation = 0
+
+    async def fast_query(channel):
+        return ok(
+            id=channel.id,
+            type=channel.type,
+            name=channel.name,
+            category="balance",
+            windows=[window("balance", "余额", remaining_percent=50.0)],
+        )
+
+    monkeypatch.setattr(app_main, "query_channel", fast_query)
+    config_store.upsert_channel({"id": "ch_fresh", "type": "deepseek", "name": "X", "api_key": "sk-x"})
+    channel = config_store.get_channel("ch_fresh")
+
+    # 先 bump 一次代际（模拟一次 import），再发起查询——查询捕获的是 bump 之后的代际
+    await app_main._invalidate_cache("ch_fresh")
+    gen_after_bump = app_main._generation
+    await app_main._get_channel_result(channel, False)
+
+    # 新代际下的查询结果应该正常进缓存
+    assert "ch_fresh" in app_main._cache
+    assert app_main._generation == gen_after_bump  # 期间没有再变动
+
+
 # ── 任务 8：DNS rebinding 防护（Host 头白名单）──────────────────────
 
 

@@ -81,6 +81,19 @@ _cache: dict[str, tuple[float, dict]] = {}
 _inflight: dict[str, asyncio.Task] = {}
 _cache_lock = asyncio.Lock()
 
+# 配置代际：每次配置变动（编辑渠道 / 导入配置）时单调递增。查询 task 在发起时
+# 记录当时的代际，完成后写缓存前核对——如果代际已变（期间发生过 import_config
+# 这类批量配置替换/覆盖），说明这个在飞期间发起的结果已过期（可能是旧密钥查到
+# 的），丢弃它而不写入缓存，让下一次请求触发用新配置重新查询。
+#
+# 专门针对 import_config 的一个微妙竞态：导入覆盖某渠道密钥的瞬间，该渠道恰好有
+# 一次 in-flight 查询。编辑渠道走 _invalidate_cache 会摘掉已完成的 task，但仍在
+# 运行的 task 被 asyncio.shield 保护、无法摘除（摘了会孤立正在等它的其它调用者）。
+# 这条用旧密钥发起的 task 跑完后原本会把旧密钥结果写回 _cache，TTL 60s 内展示
+# 旧额度。代际校验让它在写缓存时发现自己已经"过时"，优雅地丢弃结果——既不取消
+# 正在运行的 task（不影响其它 awaiter），也不会用旧结果污染缓存。
+_generation = 0
+
 # 后台趋势记录任务的强引用集合。asyncio.create_task 返回的 Task 若不持有强引用，
 # 可能在完成前被事件循环 GC 掉（CPython 官方文档明确警告）；app shutdown 时这些
 # 未完成的任务也会被取消。这里集中持有，add_done_callback 完成后自动移除。
@@ -395,7 +408,9 @@ async def upload_codex_credentials(channel_id: str, payload: CodexCredentialPayl
 
 
 async def _invalidate_cache(channel_id: str) -> None:
+    global _generation
     async with _cache_lock:
+        _generation += 1
         _cache.pop(channel_id, None)
         # 编辑渠道（如换密钥）后应真正重新查询，而不是复用一个还在 _inflight 里、
         # 早已完成的旧 task 的旧结果。只摘除已完成的：仍在运行的 task 不能动（否则
@@ -452,7 +467,7 @@ def split_multi_plan_result(channel: config_store.Channel, res: dict) -> list[di
     return [agent_res, coding_res]
 
 
-async def _query_and_cache(channel: config_store.Channel) -> dict:
+async def _query_and_cache(channel: config_store.Channel, gen: int) -> dict:
     try:
         result = await query_channel(channel)
         payload = result.to_dict()
@@ -466,11 +481,18 @@ async def _query_and_cache(channel: config_store.Channel) -> dict:
             category=channel_category(channel.type),
         ).to_dict()
     async with _cache_lock:
-        _cache[channel.id] = (time.time() * 1000, payload)
+        # 代际校验：task 发起到完成期间若发生过配置变动（import_config 覆盖密钥、
+        # 编辑渠道等），_generation 已被 bump，此时这条结果（可能用旧密钥查到）
+        # 已过期，丢弃它不写缓存——下一次请求缓存未命中会触发新查询。代际仍一致
+        # 才写入，保证缓存的永远是当前配置下的结果。
+        if gen == _generation:
+            _cache[channel.id] = (time.time() * 1000, payload)
     # 只把成功结果追加进历史趋势。用后台任务 fire-and-forget——磁盘 I/O 不应
     # 阻塞 API 响应（趋势记录是附加价值，写慢了也不该让额度查询变慢）。
     # record_result 内部已 catch 所有异常，后台任务不会抛未捕获错误。
     # 通过 _spawn_background 持有强引用，避免 Task 被 GC（裸 create_task 有此风险）。
+    # 注意：代际过期的结果仍然记历史——它确实是某个时刻真实查到的数据点，只是
+    # 不该占用"当前配置下最新结果"的缓存槽位。
     _spawn_background(asyncio.to_thread(history_store.record_result, channel.id, payload))
     return payload
 
@@ -500,7 +522,10 @@ async def _get_channel_result(channel: config_store.Channel, force: bool) -> tup
         # 检查让已完成的残留 task 被当成"没有在飞"对待，从而新建一个真正的新查询。
         task = _inflight.get(channel.id)
         if task is None or task.done():
-            task = asyncio.ensure_future(_query_and_cache(channel))
+            # 捕获发起时的配置代际：task 完成写缓存前用它核对，期间若发生过
+            # import_config / 编辑渠道（_generation 被 bump），这条结果视为已过期
+            # 而丢弃，不污染缓存（见 _query_and_cache 的代际校验）。
+            task = asyncio.ensure_future(_query_and_cache(channel, _generation))
             _inflight[channel.id] = task
 
     try:
@@ -641,9 +666,14 @@ async def import_config(payload: dict, mode: Literal["merge", "replace"] = "merg
     except config_store.ImportConfigError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     # 导入后全量失效缓存（渠道可能新增/替换/删除，逐个失效不如清一次干净）。
-    # 同样摘除 _inflight 里已完成的残留 task（逻辑同 _invalidate_cache），避免导入
-    # 后复用旧 task 返回渠道编辑前的结果。仍在运行的 task 不动，避免孤立后台查询。
+    # bump _generation：导入前已在飞的查询 task（用旧配置/旧密钥发起）完成后会
+    # 发现代际已变，丢弃结果不写缓存——否则这些旧 task 跑完会把旧密钥查到的额度
+    # 写回 _cache，TTL 60s 内展示的是导入前的旧数据。仍在运行的 task 这里仍然不
+    # 取消（取消会孤立正在 await 它的其它调用者），靠代际校验让它的结果自然失效。
+    # 同时摘除 _inflight 里已完成的残留 task，避免导入后复用旧 task。
+    global _generation
     async with _cache_lock:
+        _generation += 1
         _cache.clear()
         for cid in [cid for cid, t in _inflight.items() if t.done()]:
             _inflight.pop(cid, None)
