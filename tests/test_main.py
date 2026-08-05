@@ -583,8 +583,8 @@ async def test_get_channel_result_shield_protects_other_waiters_from_cancellatio
 
     # task_a 被取消后，共享查询 task 必须还活着（还没跑完），_inflight 的登记
     # 也不该被 task_a 的 finally 提前摘掉——这正是 task.done() 判断要守住的。
-    shared_task = app_main._inflight.get("ch_shield")
-    assert shared_task is not None
+    # _inflight 的值是 (task, 代际) 元组，取 task 本体来判断。
+    shared_task, _shared_gen = app_main._inflight.get("ch_shield")
     assert not shared_task.done()
 
     release.set()  # 放行真正的查询逻辑
@@ -715,6 +715,71 @@ async def test_fresh_query_after_generation_bump_is_cached(isolated_config, monk
     # 新代际下的查询结果应该正常进缓存
     assert "ch_fresh" in app_main._cache
     assert app_main._generation == gen_after_bump  # 期间没有再变动
+
+
+async def test_import_then_query_does_not_reuse_stale_inflight_task(isolated_config, monkeypatch):
+    """import 后的新请求不能复用旧代际的 in-flight task——否则会拿到旧密钥结果。
+
+    这是代际机制的第二道防线（复用判断），与写缓存校验（第一道防线）互补：
+    写缓存校验只挡住"旧结果不进缓存"，但如果新请求直接复用了旧代际 task，
+    await 它拿到的返回值本身仍是旧结果（哪怕不进缓存，本次响应也是错的）。
+    复用判断在 _get_channel_result 里比对 task 的发起代际，代际不一致就新建查询。
+    """
+    monkeypatch.setattr(config_store, "HISTORY_DIR", isolated_config.parent / "history")
+    app_main._cache.clear()
+    app_main._inflight.clear()
+    app_main._generation = 0
+
+    # 用 started 事件精确同步：第 1 次调用（旧代际）卡住等 release_old，第 2 次
+    # （新代际）卡住等 release_new。两次都 set started 让测试能确认它们各被发起。
+    started = asyncio.Event()
+    release_old = asyncio.Event()
+    release_new = asyncio.Event()
+    call_count = {"n": 0}
+
+    async def query(channel):
+        call_count["n"] += 1
+        n = call_count["n"]
+        started.set()
+        pct = 99.0 if n == 1 else 11.0  # 旧查询返回 99%、新查询返回 11%，便于区分
+        await (release_old if n == 1 else release_new).wait()
+        return ok(
+            id=channel.id, type=channel.type, name=channel.name, category="balance",
+            windows=[window("balance", "余额", remaining_percent=pct)],
+        )
+
+    monkeypatch.setattr(app_main, "query_channel", query)
+    config_store.upsert_channel({"id": "ch_reuse", "type": "deepseek", "name": "X", "api_key": "sk-old"})
+    channel = config_store.get_channel("ch_reuse")
+
+    # 1) 旧代际发起查询，卡在 in-flight（task 仍 running）。started.wait() 确保它
+    #    已经真正进入 query_channel 并登记进 _inflight，而不是停留在事件循环队列里。
+    old_task = asyncio.create_task(app_main._get_channel_result(channel, False))
+    await started.wait()
+    assert call_count["n"] == 1
+    started.clear()
+
+    # 2) import 覆盖密钥 → 代际 bump。旧 task 仍 running、登记的代际为旧值。
+    await app_main.import_config(
+        {"version": 1, "channels": [{"id": "ch_reuse", "type": "deepseek", "api_key": "sk-new", "name": "X"}]},
+        "merge",
+    )
+    assert app_main._generation > 0
+
+    # 3) 新请求到来：复用判断应发现旧 task 代际不一致，新建查询（而非复用旧 task）。
+    #    started 再次被 set 证明 query_channel 被调用了第 2 次——若复用了旧 task，
+    #    call_count 仍是 1、started 不会被再次 set（测试会卡到超时失败）。
+    new_task = asyncio.create_task(app_main._get_channel_result(channel, False))
+    await started.wait()
+    assert call_count["n"] == 2
+
+    # 4) 放行两条查询，断言新请求拿到的是新代际的结果（11%），不是旧代际的（99%）
+    release_old.set()
+    release_new.set()
+    old_result, _ = await old_task
+    new_result, _ = await new_task
+    assert old_result["windows"][0]["remaining_percent"] == 99.0  # 旧 task 返回旧结果
+    assert new_result["windows"][0]["remaining_percent"] == 11.0  # 新请求拿到新结果，没有复用旧 task
 
 
 # ── 任务 8：DNS rebinding 防护（Host 头白名单）──────────────────────
