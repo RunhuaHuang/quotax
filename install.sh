@@ -196,9 +196,20 @@ if ! echo ":$PATH:" | grep -q ":$LOCAL_BIN:"; then
   echo ""
 fi
 
-# --- 同步依赖（uv 优先复用本机已有的 Python 3.11+，没有才下载）---
-echo "安装依赖（优先复用本机 Python 3.11+，无则自动下载，请稍候）..."
+# --- 确保 Python 运行时：优先复用本机已有的 3.11+，没有才装 3.13 ---
+# 这样已有 Python（3.11/3.12/3.13/3.14）的用户不会被强制再下一个；只有本机
+# 完全没有满足条件的 Python 时，才显式装 3.13（与你系统一致，uv 官方维护）。
 cd "$PERM_DIR"
+if uv python find ">=3.11" >/dev/null 2>&1; then
+  PY_VER=$(uv python find ">=3.11" --show-version 2>/dev/null | tail -1)
+  echo "检测到本机已有 Python ${PY_VER:-（3.11+）}，直接复用。"
+else
+  echo "本机没有满足条件的 Python（需要 3.11+），正在安装 Python 3.13..."
+  uv python install 3.13
+fi
+
+# --- 同步依赖（uv sync 按 uv.lock 精确安装，复用上一步确定的 Python）---
+echo "安装依赖（首次需下载 FastAPI / httpx 等，请稍候）..."
 uv sync --quiet 2>&1 | grep -v "^$" || true
 
 # --- 启动服务 ---

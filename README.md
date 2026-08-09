@@ -40,7 +40,7 @@ curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.sh 
 irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
 ```
 
-> - 首次安装会自动装依赖：**优先复用本机已有的 Python 3.11+**（没有才自动下载），无需用户预装 Python。请耐心等待 1–2 分钟。
+> - 首次安装会自动准备运行时：**优先复用本机已有的 Python 3.11+**；本机完全没有时才自动安装 Python 3.13。无需用户预装 Python。请耐心等待 1–2 分钟。
 > - 默认安装到 `~/QuotaX`（Windows 为 `%USERPROFILE%\QuotaX`），服务监听 `127.0.0.1:8900`。
 > - **安装后自动探测**：本机已登录的 Claude / Codex / Gemini / Grok / Copilot CLI 会被自动识别并创建对应渠道，无需手动添加。
 > - **网络不通 / GitHub 被墙？** 脚本内置多源镜像自动 fallback；也可手动指定镜像：

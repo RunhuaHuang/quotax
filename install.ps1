@@ -186,10 +186,23 @@ try {
     Write-Host "已将 $LocalBin 加入用户 PATH（重开终端后生效）"
   }
 
-  # --- 同步依赖（uv 优先复用本机已有的 Python 3.11+，没有才下载）---
-  Write-Host "安装依赖（优先复用本机 Python 3.11+，无则自动下载，请稍候）..."
+  # --- 确保 Python 运行时：优先复用本机已有的 3.11+，没有才装 3.13 ---
+  # 这样已有 Python（3.11/3.12/3.13/3.14）的用户不会被强制再下一个；只有本机
+  # 完全没有满足条件的 Python 时，才显式装 3.13（与 macOS 系统一致，uv 官方维护）。
   Push-Location $PermDir
-  try { & uv sync --quiet 2>&1 | Out-Null } catch {}
+  try {
+    $FoundPy = & uv python find ">=3.11" 2>$null
+    if ($FoundPy) {
+      $PyVer = & uv python find ">=3.11" --show-version 2>$null | Select-Object -Last 1
+      Write-Host "检测到本机已有 Python $($PyVer.Trim())（$FoundPy），直接复用。"
+    } else {
+      Write-Host "本机没有满足条件的 Python（需要 3.11+），正在安装 Python 3.13..."
+      & uv python install 3.13
+    }
+    # --- 同步依赖（uv sync 按 uv.lock 精确安装，复用上一步确定的 Python）---
+    Write-Host "安装依赖（首次需下载 FastAPI / httpx 等，请稍候）..."
+    & uv sync --quiet 2>&1 | Out-Null
+  } catch {}
   Pop-Location
 
   # --- 启动服务 ---
