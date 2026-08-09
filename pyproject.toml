@@ -3,7 +3,9 @@ name = "quota-board"
 version = "0.1.0"
 description = "统一查看各 AI 渠道余额、订阅用量与 Coding Plan 额度的本地 WebUI"
 readme = "README.md"
-requires-python = ">=3.13"
+# 代码实际下限是 3.11（用了 datetime.UTC，3.11+ 才有）。放宽版本要求让 uv 优先
+# 复用本机已装的 3.11 / 3.12 / 3.13，避免给已有 Python 的用户强制再下一个 3.13。
+requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
@@ -32,7 +34,7 @@ dev = [
 ]
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py311"
 line-length = 120
 
 [tool.ruff.lint]

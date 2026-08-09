@@ -196,8 +196,8 @@ if ! echo ":$PATH:" | grep -q ":$LOCAL_BIN:"; then
   echo ""
 fi
 
-# --- 同步依赖（uv sync 会按 uv.lock 精确安装，含 Python 3.13）---
-echo "安装依赖（首次可能需要下载 Python 3.13，请稍候）..."
+# --- 同步依赖（uv 优先复用本机已有的 Python 3.11+，没有才下载）---
+echo "安装依赖（优先复用本机 Python 3.11+，无则自动下载，请稍候）..."
 cd "$PERM_DIR"
 uv sync --quiet 2>&1 | grep -v "^$" || true
 
