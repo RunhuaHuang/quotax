@@ -136,6 +136,15 @@ async def lifespan(_app: FastAPI):
         await asyncio.to_thread(_auto_detect_subscription_channels)
     except Exception:
         pass
+    # 启动时自动采集一次用量统计——读取本机各 CLI（Claude Code / Codex /
+    # Gemini / Grok / OpenCode）的日志文件，增量入库。这样全新安装后第一次
+    # 打开「用量统计」Tab 就能看到数据，不用用户手动点「采集」。采集是幂等的
+    # （INSERT OR IGNORE 去重），单个 parser 异常不影响其它源。后台线程跑，
+    # 不阻塞服务启动。
+    try:
+        await asyncio.to_thread(usage_collect.collect_all)
+    except Exception:
+        pass
     yield
     await aclose()
 

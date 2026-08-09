@@ -63,6 +63,19 @@ async function loadAll() {
     loadLog(),
     loadFilters(),
   ]);
+  // 首次加载如果发现没数据，自动触发一次采集（可能服务刚启动、采集还在后台
+  // 跑，或本机 CLI 日志还没被扫过）。采集是幂等的，重复跑不会产生重复记录。
+  const ov = usageState.overview;
+  if (ov && !ov.total_tokens && !ov.requests) {
+    await collectNow();
+    await Promise.all([
+      loadOverview(),
+      loadTrend(),
+      loadModels(),
+      loadLog(),
+      loadFilters(),
+    ]);
+  }
   usageState.loaded = true;
   renderUsage();
 }
