@@ -5,6 +5,8 @@
 // 本文件是独立 ES module（与 app.js 作用域隔离），自带 $ / esc / fmtTime 等工具，
 // 不依赖 app.js 暴露全局变量——避免加载顺序耦合。
 
+import { t, getLang } from "./i18n.js?v=6";
+
 const $ = (sel) => document.querySelector(sel);
 const USAGE_DAYS_KEY = "quotaboard_prefs.usage_days";
 let usageState = {
@@ -47,6 +49,11 @@ document.addEventListener("quotax:view-change", (e) => {
   }
 });
 
+// 语言切换时重绘用量视图（由 app.js 的 applyLang 统一派发，避免重复监听）
+window.addEventListener("quotax:usage-lang-change", () => {
+  if (usageState.loaded) renderUsage();
+});
+
 async function loadAll() {
   renderUsageSkeleton();
   await Promise.all([
@@ -66,6 +73,7 @@ async function loadOverview() {
     if (usageState.source) p.set("source", usageState.source);
     if (usageState.model) p.set("model", usageState.model);
     const res = await fetch(`/api/usage/overview?${p}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     usageState.overview = await res.json();
   } catch (e) { usageState.overview = null; }
 }
@@ -76,6 +84,7 @@ async function loadTrend() {
     if (usageState.source) p.set("source", usageState.source);
     if (usageState.model) p.set("model", usageState.model);
     const res = await fetch(`/api/usage/trend?${p}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     usageState.trend = await res.json();
   } catch { usageState.trend = []; }
 }
@@ -85,6 +94,7 @@ async function loadModels() {
     const p = new URLSearchParams({ days: usageState.days, metric: usageState.metric });
     if (usageState.source) p.set("source", usageState.source);
     const res = await fetch(`/api/usage/models?${p}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     usageState.models = await res.json();
   } catch { usageState.models = []; }
 }
@@ -95,6 +105,7 @@ async function loadLog() {
     if (usageState.source) p.set("source", usageState.source);
     if (usageState.model) p.set("model", usageState.model);
     const res = await fetch(`/api/usage/log?${p}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     usageState.log = await res.json();
   } catch { usageState.log = { rows: [] }; }
 }
@@ -102,6 +113,7 @@ async function loadLog() {
 async function loadFilters() {
   try {
     const res = await fetch(`/api/usage/filters?days=${usageState.days}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     usageState.filters = await res.json();
   } catch { usageState.filters = { sources: [], models: [] }; }
 }
@@ -110,16 +122,17 @@ async function collectNow() {
   if (usageState.collecting) return;
   usageState.collecting = true;
   const btn = $("#usageCollectBtn");
-  if (btn) { btn.disabled = true; btn.textContent = "采集中…"; }
+  if (btn) { btn.disabled = true; btn.textContent = t("usage.collecting"); }
   try {
-    await fetch("/api/usage/collect", { method: "POST" });
+    const res = await fetch("/api/usage/collect", { method: "POST" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     await Promise.all([loadOverview(), loadTrend(), loadModels(), loadLog(), loadFilters()]);
     renderUsage();
   } catch (e) {
-    toast("采集失败: " + e.message, "err");
+    toast(t("usage.collectFailed", { msg: e.message }), "err");
   } finally {
     usageState.collecting = false;
-    if (btn) { btn.disabled = false; btn.textContent = "采集"; }
+    if (btn) { btn.disabled = false; btn.textContent = t("usage.collect"); }
   }
 }
 
@@ -150,7 +163,7 @@ function fmtPct(n) {
 function fmtTime(ms) {
   if (typeof window.fmtTime === "function") return window.fmtTime(ms);
   const d = new Date(Number(ms));
-  return d.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleString(getLang() === "zh-CN" ? "zh-CN" : "en-US", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 function esc(s) {
   if (typeof window.esc === "function") return window.esc(s);
@@ -169,7 +182,7 @@ function sourceLabel(s) { return SOURCE_LABELS[s] || s; }
 function renderUsageSkeleton() {
   const v = $("#usageView");
   if (!v) return;
-  v.innerHTML = `<div class="usage-loading">加载中…</div>`;
+  v.innerHTML = `<div class="usage-loading">${t("usage.loading")}</div>`;
 }
 
 function renderUsage() {
@@ -190,22 +203,28 @@ function renderUsage() {
 
 function renderControls() {
   const daysOpts = [7, 14, 30, 90].map(
-    (d) => `<option value="${d}" ${d === usageState.days ? "selected" : ""}>最近 ${d} 天</option>`
+    (d) => `<option value="${d}" ${d === usageState.days ? "selected" : ""}>${t("history.days" + d)}</option>`
   ).join("");
-  const srcOpts = ['<option value="">全部数据源</option>']
+  const srcOpts = [`<option value="">${t("usage.allSources")}</option>`]
     .concat((usageState.filters.sources || []).map(
       (s) => `<option value="${esc(s.source)}" ${s.source === usageState.source ? "selected" : ""}>${esc(sourceLabel(s.source))} (${s.records})</option>`
     )).join("");
-  const modelOpts = ['<option value="">全部模型</option>']
-    .concat((usageState.filters.models || []).slice(0, 50).map(
-      (m) => `<option value="${esc(m)}" ${m === usageState.model ? "selected" : ""}>${esc(m)}</option>`
+  const allModels = usageState.filters.models || [];
+  const selectedModel = usageState.model;
+  const modelList = allModels.slice(0, 50);
+  if (selectedModel && !modelList.includes(selectedModel) && allModels.includes(selectedModel)) {
+    modelList.push(selectedModel);
+  }
+  const modelOpts = [`<option value="">${t("usage.allModels")}</option>`]
+    .concat(modelList.map(
+      (m) => `<option value="${esc(m)}" ${m === selectedModel ? "selected" : ""}>${esc(m)}</option>`
     )).join("");
   return `
     <div class="usage-controls">
-      <label>时间 <select id="usageDays">${daysOpts}</select></label>
-      <label>数据源 <select id="usageSource">${srcOpts}</select></label>
-      <label>模型 <select id="usageModel">${modelOpts}</select></label>
-      <button class="btn btn-primary usage-collect-btn" id="usageCollectBtn">采集</button>
+      <label>${t("usage.time")} <select id="usageDays">${daysOpts}</select></label>
+      <label>${t("usage.source")} <select id="usageSource">${srcOpts}</select></label>
+      <label>${t("usage.model")} <select id="usageModel">${modelOpts}</select></label>
+      <button class="btn btn-primary usage-collect-btn" id="usageCollectBtn">${t("usage.collect")}</button>
     </div>`;
 }
 
@@ -223,25 +242,25 @@ function renderOverviewCards(o) {
   return `
     <div class="usage-overview">
       <div class="usage-kpi">
-        <div class="usage-kpi-label">总 Token</div>
+        <div class="usage-kpi-label">${t("usage.totalTokens")}</div>
         <div class="usage-kpi-value">${fmtTokens(total)}</div>
-        <div class="usage-kpi-sub">${o.requests || 0} 次请求 · ${o.sessions || 0} 个会话</div>
+        <div class="usage-kpi-sub">${o.requests || 0} ${t("usage.requests")} · ${o.sessions || 0} ${t("usage.sessions")}</div>
       </div>
       <div class="usage-kpi">
-        <div class="usage-kpi-label">缓存命中率</div>
+        <div class="usage-kpi-label">${t("usage.cacheHitRate")}</div>
         <div class="usage-kpi-value ${o.cache_hit_rate >= 0.5 ? "kpi-good" : ""}">${fmtPct(o.cache_hit_rate)}</div>
-        <div class="usage-kpi-sub">缓存读 / (输入+缓存写+缓存读)</div>
+        <div class="usage-kpi-sub">${t("usage.cacheHitFormula")}</div>
       </div>
       <div class="usage-kpi">
-        <div class="usage-kpi-label">估算成本</div>
+        <div class="usage-kpi-label">${t("usage.estimatedCost")}</div>
         <div class="usage-kpi-value">${o.has_cost ? fmtCost(o.cost) : "—"}</div>
-        <div class="usage-kpi-sub">${o.has_cost ? "按单价表估算" : "未配置单价"}</div>
+        <div class="usage-kpi-sub">${o.has_cost ? t("usage.pricingEstimated") : t("usage.noPricing")}</div>
       </div>
       <div class="usage-token-bars">
-        ${bar("输入", inp, "var(--accent)")}
-        ${bar("输出", outp, "#10b981")}
-        ${bar("缓存读", cr, "#8b5cf6")}
-        ${bar("缓存写", cc, "#f59e0b")}
+        ${bar(t("usage.input"), inp, "var(--accent)")}
+        ${bar(t("usage.output"), outp, "#10b981")}
+        ${bar(t("usage.cacheRead"), cr, "#8b5cf6")}
+        ${bar(t("usage.cacheWrite"), cc, "#f59e0b")}
       </div>
     </div>`;
 }
@@ -249,7 +268,7 @@ function renderOverviewCards(o) {
 // ── 趋势图（纯 SVG，按天 4 桶折线，参考 VaultOne Usage Trend Chart）──
 function renderTrendChart() {
   const data = usageState.trend || [];
-  if (!data.length) return `<div class="usage-section"><h3>趋势</h3><div class="usage-empty">暂无数据</div></div>`;
+  if (!data.length) return `<div class="usage-section"><h3>${t("usage.trendTitle")}</h3><div class="usage-empty">${t("usage.noData")}</div></div>`;
   const W = 760, H = 200, PAD = { l: 50, r: 16, t: 16, b: 28 };
   const iw = W - PAD.l - PAD.r, ih = H - PAD.t - PAD.b;
   const maxV = Math.max(1, ...data.flatMap((d) => [d.input, d.output, d.cache_creation, d.cache_read]));
@@ -257,10 +276,10 @@ function renderTrendChart() {
   const y = (v) => PAD.t + ih - (v / maxV) * ih;
 
   const series = [
-    { key: "input", color: "var(--accent)", label: "输入" },
-    { key: "output", color: "#10b981", label: "输出" },
-    { key: "cache_read", color: "#8b5cf6", label: "缓存读" },
-    { key: "cache_creation", color: "#f59e0b", label: "缓存写" },
+    { key: "input", color: "var(--accent)", label: t("usage.input") },
+    { key: "output", color: "#10b981", label: t("usage.output") },
+    { key: "cache_read", color: "#8b5cf6", label: t("usage.cacheRead") },
+    { key: "cache_creation", color: "#f59e0b", label: t("usage.cacheWrite") },
   ];
   const lines = series.map((s) => {
     const pts = data.map((d, i) => `${x(i)},${y(d[s.key] || 0)}`).join(" ");
@@ -281,7 +300,7 @@ function renderTrendChart() {
   ).join("");
   return `
     <div class="usage-section">
-      <h3>Token 趋势 <span class="usage-legend">${legend}</span></h3>
+      <h3>${t("usage.trendTitle")} <span class="usage-legend">${legend}</span></h3>
       <div class="usage-chart-wrap">
         <svg viewBox="0 0 ${W} ${H}" class="usage-chart" preserveAspectRatio="xMidYMid meet">
           ${ylabels}${xlabels}${lines}
@@ -293,17 +312,21 @@ function renderTrendChart() {
 // ── 模型分布（Top 8 + 其他，支持 token / cost 切换）──
 function renderModelBreakdown() {
   const data = usageState.models || [];
-  if (!data.length) return `<div class="usage-section"><h3>模型分布</h3><div class="usage-empty">暂无数据</div></div>`;
-  const metricLabel = usageState.metric === "cost" ? "成本" : "Token";
+  if (!data.length) return `<div class="usage-section"><h3>${t("usage.modelDistribution")}</h3><div class="usage-empty">${t("usage.noData")}</div></div>`;
+  const metricLabel = usageState.metric === "cost" ? t("usage.metricCost") : t("usage.metricToken");
   const total = data.reduce((a, m) => a + (usageState.metric === "cost" ? m.cost : m.tokens), 0);
   const maxVal = Math.max(1, ...data.map((m) => (usageState.metric === "cost" ? m.cost : m.tokens)));
   const rows = data.map((m) => {
     const val = usageState.metric === "cost" ? m.cost : m.tokens;
     const pct = total > 0 ? (val / total * 100) : 0;
     const valStr = usageState.metric === "cost" ? fmtCost(m.cost) : fmtTokens(m.tokens);
+    // is_other 行：展示文案按当前语言本地化（"其他 (N)" / "Other (N)"），
+    // data-model 用空串使其不可被点击筛选——聚合行没有对应真实模型 key。
+    const name = m.is_other ? t("usage.otherLabel", { count: m.other_count ?? 0 }) : esc(m.model);
+    const selectable = m.is_other ? "" : `data-model="${esc(m.model)}"`;
     return `
-      <div class="usage-model-row ${m.model === usageState.model ? "active" : ""}" data-model="${esc(m.model)}">
-        <span class="usage-model-name">${esc(m.model)}</span>
+      <div class="usage-model-row ${m.model === usageState.model ? "active" : ""}${m.is_other ? " is-other" : ""}" ${selectable}>
+        <span class="usage-model-name">${name}</span>
         <div class="usage-model-bar"><div style="width:${(val / maxVal * 100)}%"></div></div>
         <span class="usage-model-val">${valStr}</span>
         <span class="usage-model-pct">${pct.toFixed(1)}%</span>
@@ -311,21 +334,21 @@ function renderModelBreakdown() {
   }).join("");
   return `
     <div class="usage-section">
-      <h3>模型分布
+      <h3>${t("usage.modelDistribution")}
         <span class="usage-metric-toggle">
-          <button class="${usageState.metric === "tokens" ? "active" : ""}" data-metric="tokens">Token</button>
-          <button class="${usageState.metric === "cost" ? "active" : ""}" data-metric="cost">成本</button>
+          <button class="${usageState.metric === "tokens" ? "active" : ""}" data-metric="tokens">${t("usage.metricToken")}</button>
+          <button class="${usageState.metric === "cost" ? "active" : ""}" data-metric="cost">${t("usage.metricCost")}</button>
         </span>
       </h3>
       <div class="usage-model-list">${rows}</div>
-      <div class="usage-hint">点击模型名可按该模型筛选（再点取消）· 当前按 ${metricLabel} 排序</div>
+      <div class="usage-hint">${t("usage.filterHint", { metric: metricLabel })}</div>
     </div>`;
 }
 
 // ── 逐请求日志表 ──
 function renderRequestLog() {
   const rows = (usageState.log && usageState.log.rows) || [];
-  if (!rows.length) return `<div class="usage-section"><h3>请求日志</h3><div class="usage-empty">暂无数据</div></div>`;
+  if (!rows.length) return `<div class="usage-section"><h3>${t("usage.requestLog")}</h3><div class="usage-empty">${t("usage.noData")}</div></div>`;
   const stopClass = (r) => {
     if (!r) return "";
     if (["end_turn", "stop"].includes(r)) return "stop-ok";
@@ -349,13 +372,13 @@ function renderRequestLog() {
     </tr>`).join("");
   return `
     <div class="usage-section">
-      <h3>请求日志 <span class="usage-hint">最近 ${rows.length} 条（按时间倒序）</span></h3>
+      <h3>${t("usage.requestLog")} <span class="usage-hint">${t("usage.recentRows", { count: rows.length })}</span></h3>
       <div class="usage-table-wrap">
         <table class="usage-table">
           <thead><tr>
-            <th>时间</th><th>来源</th><th>模型</th>
-            <th>输入</th><th>输出</th><th>缓存写</th><th>缓存读</th>
-            <th>合计</th><th>成本</th><th>停止原因</th>
+            <th>${t("usage.timeCol")}</th><th>${t("usage.sourceCol")}</th><th>${t("usage.modelCol")}</th>
+            <th>${t("usage.inputCol")}</th><th>${t("usage.outputCol")}</th><th>${t("usage.cacheWriteCol")}</th><th>${t("usage.cacheReadCol")}</th>
+            <th>${t("usage.totalCol")}</th><th>${t("usage.costCol")}</th><th>${t("usage.stopReasonCol")}</th>
           </tr></thead>
           <tbody>${body}</tbody>
         </table>
@@ -366,12 +389,12 @@ function renderRequestLog() {
 function renderPricingNote() {
   return `
     <div class="usage-section usage-pricing-section">
-      <h3>单价与成本</h3>
+      <h3>${t("usage.pricingAndCost")}</h3>
       <div class="usage-pricing-actions">
-        <button class="btn btn-ghost" id="usageLitellmBtn">从 LiteLLM 更新单价</button>
-        <button class="btn btn-ghost" id="usageRebillBtn">补算 0 成本记录</button>
-        <button class="btn btn-ghost" id="usagePricingBtn">查看 / 编辑单价表</button>
-        <span class="usage-hint">成本为按单价表的估算值，非真实账单</span>
+        <button class="btn btn-ghost" id="usageLitellmBtn">${t("usage.updateLitellm")}</button>
+        <button class="btn btn-ghost" id="usageRebillBtn">${t("usage.rebill")}</button>
+        <button class="btn btn-ghost" id="usagePricingBtn">${t("usage.viewPricing")}</button>
+        <span class="usage-hint">${t("usage.costDisclaimer")}</span>
       </div>
       <div id="usagePricingPanel" class="hidden"></div>
     </div>`;
@@ -399,11 +422,11 @@ function bindUsageEvents() {
   const collect = $("#usageCollectBtn");
   if (collect) collect.addEventListener("click", collectNow);
 
-  // 模型分布：点击行按模型筛选
+  // 模型分布：点击行按模型筛选（聚合行无 data-model，不响应点击）
   document.querySelectorAll(".usage-model-row").forEach((row) => {
     row.addEventListener("click", () => {
       const m = row.dataset.model;
-      if (m && m.startsWith("其他")) return;
+      if (!m) return;
       usageState.model = (usageState.model === m) ? "" : m;
       reloadAll();
     });
@@ -431,29 +454,29 @@ async function reloadAll() {
 
 async function updateLitellm() {
   const btn = $("#usageLitellmBtn");
-  if (btn) { btn.disabled = true; btn.textContent = "更新中…"; }
+  if (btn) { btn.disabled = true; btn.textContent = t("usage.updating"); }
   try {
     const res = await fetch("/api/usage/pricing/litellm", { method: "POST" });
     const data = await res.json();
-    if (data.error) toast("更新失败: " + data.error);
+    if (data.error) toast(t("usage.updateLitellmFailed", { msg: data.error }));
     else {
-      toast(`已更新 ${data.updated} 个模型单价`);
+      toast(t("usage.updateLitellmSuccess", { count: data.updated }));
       await doRebill(true); // 用新单价补算
     }
-  } catch (e) { toast("更新失败: " + e.message); }
-  finally { if (btn) { btn.disabled = false; btn.textContent = "从 LiteLLM 更新单价"; } }
+  } catch (e) { toast(t("usage.updateLitellmFailed", { msg: e.message })); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = t("usage.updateLitellm"); } }
 }
 
 async function doRebill(silent) {
   const btn = $("#usageRebillBtn");
-  if (btn) { btn.disabled = true; btn.textContent = "补算中…"; }
+  if (btn) { btn.disabled = true; btn.textContent = t("usage.rebilling"); }
   try {
     const res = await fetch("/api/usage/pricing/rebill", { method: "POST" });
     const data = await res.json();
-    if (!silent) toast(`补算 ${data.recounted} 条（仍有 ${data.still_zero} 条无价）`);
+    if (!silent) toast(t("usage.rebillResult", { count: data.recounted, zero: data.still_zero }));
     await reloadAll();
-  } catch (e) { if (!silent) toast("补算失败: " + e.message); }
-  finally { if (btn) { btn.disabled = false; btn.textContent = "补算 0 成本记录"; } }
+  } catch (e) { if (!silent) toast(t("usage.rebillFailed", { msg: e.message })); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = t("usage.rebill"); } }
 }
 
 async function togglePricingPanel() {
@@ -465,49 +488,49 @@ async function togglePricingPanel() {
     return;
   }
   panel.classList.remove("hidden");
-  panel.innerHTML = `<div class="usage-loading">加载单价表…</div>`;
+  panel.innerHTML = `<div class="usage-loading">${t("usage.pricingLoading")}</div>`;
   try {
     const res = await fetch("/api/usage/pricing");
     const data = await res.json();
     renderPricingTable(panel, data.entries || []);
   } catch (e) {
-    panel.innerHTML = `<div class="usage-empty">加载失败: ${esc(e.message)}</div>`;
+    panel.innerHTML = `<div class="usage-empty">${t("usage.pricingLoadFailed", { msg: e.message })}</div>`;
   }
 }
 
 function renderPricingTable(container, entries) {
   if (!entries.length) {
-    container.innerHTML = `<div class="usage-empty">单价表为空</div>`;
+    container.innerHTML = `<div class="usage-empty">${t("usage.pricingEmpty")}</div>`;
     return;
   }
   const rows = entries.map((e) => `
     <tr data-key="${esc(e.model_key)}">
-      <td class="model">${esc(e.model_key)}${e.is_builtin ? '<span class="pricing-tag">内置</span>' : ""}</td>
+      <td class="model">${esc(e.model_key)}${e.is_builtin ? `<span class="pricing-tag">${t("usage.pricingBuiltin")}</span>` : ""}</td>
       <td class="num">${e.input_per_million}</td>
       <td class="num">${e.output_per_million}</td>
       <td class="num">${e.cache_read_per_million}</td>
       <td class="num">${e.cache_creation_per_million}</td>
-      <td>${e.is_builtin ? "" : `<button class="btn btn-ghost btn-sm" data-del="${esc(e.model_key)}">删</button>`}</td>
+      <td>${e.is_builtin ? "" : `<button class="btn btn-ghost btn-sm" data-del="${esc(e.model_key)}">${t("usage.pricingDelete")}</button>`}</td>
     </tr>`).join("");
   container.innerHTML = `
     <div class="usage-table-wrap">
       <table class="usage-table pricing-table">
         <thead><tr>
-          <th>模型</th><th>输入 $/1M</th><th>输出 $/1M</th>
-          <th>缓存读 $/1M</th><th>缓存写 $/1M</th><th></th>
+          <th>${t("usage.pricingModel")}</th><th>${t("usage.pricingInput")}</th><th>${t("usage.pricingOutput")}</th>
+          <th>${t("usage.pricingCacheRead")}</th><th>${t("usage.pricingCacheWrite")}</th><th></th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
     <details class="pricing-add">
-      <summary>添加 / 覆盖模型单价</summary>
+      <summary>${t("usage.pricingAdd")}</summary>
       <div class="pricing-add-form">
-        <input id="pk" placeholder="模型 key（如 claude-sonnet-5）">
-        <input id="pin" type="number" step="0.01" placeholder="输入 $/1M">
-        <input id="pout" type="number" step="0.01" placeholder="输出 $/1M">
-        <input id="pcr" type="number" step="0.01" placeholder="缓存读 $/1M">
-        <input id="pcc" type="number" step="0.01" placeholder="缓存写 $/1M">
-        <button class="btn btn-primary btn-sm" id="pSave">保存</button>
+        <input id="pk" placeholder="${t("usage.pricingModelKeyPlaceholder")}">
+        <input id="pin" type="number" step="0.01" placeholder="${t("usage.pricingInputPlaceholder")}">
+        <input id="pout" type="number" step="0.01" placeholder="${t("usage.pricingOutputPlaceholder")}">
+        <input id="pcr" type="number" step="0.01" placeholder="${t("usage.pricingCacheReadPlaceholder")}">
+        <input id="pcc" type="number" step="0.01" placeholder="${t("usage.pricingCacheWritePlaceholder")}">
+        <button class="btn btn-primary btn-sm" id="pSave">${t("usage.pricingSave")}</button>
       </div>
     </details>`;
   // 删除
@@ -528,14 +551,14 @@ function renderPricingTable(container, entries) {
       cache_read_per_million: Number(container.querySelector("#pcr").value || 0),
       cache_creation_per_million: Number(container.querySelector("#pcc").value || 0),
     };
-    if (!payload.model_key) { toast("请填模型 key"); return; }
+    if (!payload.model_key) { toast(t("usage.pricingModelKeyRequired")); return; }
     const res = await fetch("/api/usage/pricing", {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
     if (res.ok) {
-      toast("已保存");
+      toast(t("usage.pricingSaved"));
       await doRebill(true);
       togglePricingPanel(); togglePricingPanel();
-    } else { toast("保存失败"); }
+    } else { toast(t("usage.pricingSaveFailed")); }
   });
 }

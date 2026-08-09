@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from urllib.error import URLError
@@ -180,6 +181,8 @@ class PricingBook:
     def __init__(self) -> None:
         # key: normalized model key → (input, output, cache_read, cache_creation, is_builtin)
         self._by_key: dict[str, tuple[Decimal, Decimal, Decimal, Decimal, bool]] = {}
+        # 单价表会在多个 to_thread 中被并发读写，用 RLock 保护内部 dict
+        self._lock = threading.RLock()
         self._load_builtin()
 
     def _load_builtin(self) -> None:
@@ -194,11 +197,12 @@ class PricingBook:
 
     def resolve(self, model: str) -> ResolvedRate:
         """按归一化 + fallback 查找模型单价。未命中返回全 None。"""
-        for cand in fallback_candidates(model):
-            entry = self._by_key.get(cand)
-            if entry is not None:
-                return ResolvedRate(entry[0], entry[1], entry[2], entry[3])
-        return ResolvedRate(None, None, None, None)
+        with self._lock:
+            for cand in fallback_candidates(model):
+                entry = self._by_key.get(cand)
+                if entry is not None:
+                    return ResolvedRate(entry[0], entry[1], entry[2], entry[3])
+            return ResolvedRate(None, None, None, None)
 
     def has(self, model: str) -> bool:
         return not self.resolve(model).is_unknown()
@@ -220,36 +224,40 @@ class PricingBook:
         key = normalize_key(model_key)
         if not key:
             return
-        self._by_key[key] = (
-            _to_decimal(input_ or 0),
-            _to_decimal(output or 0),
-            _to_decimal(cache_read or 0),
-            _to_decimal(cache_creation or 0),
-            is_builtin,
-        )
+        with self._lock:
+            self._by_key[key] = (
+                _to_decimal(input_ or 0),
+                _to_decimal(output or 0),
+                _to_decimal(cache_read or 0),
+                _to_decimal(cache_creation or 0),
+                is_builtin,
+            )
 
     def remove(self, model_key: str) -> bool:
-        return self._by_key.pop(normalize_key(model_key), None) is not None
+        with self._lock:
+            return self._by_key.pop(normalize_key(model_key), None) is not None
 
     def entries(self) -> list[dict]:
         """导出全部单价项（按 key 排序），供前端定价表展示 / 编辑。"""
-        out: list[dict] = []
-        for key in sorted(self._by_key):
-            inp, outp, cr, cc, builtin = self._by_key[key]
-            out.append(
-                {
-                    "model_key": key,
-                    "input_per_million": float(inp),
-                    "output_per_million": float(outp),
-                    "cache_read_per_million": float(cr),
-                    "cache_creation_per_million": float(cc),
-                    "is_builtin": builtin,
-                }
-            )
-        return out
+        with self._lock:
+            out: list[dict] = []
+            for key in sorted(self._by_key):
+                inp, outp, cr, cc, builtin = self._by_key[key]
+                out.append(
+                    {
+                        "model_key": key,
+                        "input_per_million": float(inp),
+                        "output_per_million": float(outp),
+                        "cache_read_per_million": float(cr),
+                        "cache_creation_per_million": float(cc),
+                        "is_builtin": builtin,
+                    }
+                )
+            return out
 
     def __len__(self) -> int:
-        return len(self._by_key)
+        with self._lock:
+            return len(self._by_key)
 
 
 def calc_cost(

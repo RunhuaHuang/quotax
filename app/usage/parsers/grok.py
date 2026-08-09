@@ -97,6 +97,7 @@ class GrokParser(BaseParser):
         # 先从 summary.json 取当前模型名（若存在）
         model = self._read_model(file_path.parent)
         records: list[NormalizedRecord] = []
+        truncated = False
 
         with file_path.open("r", encoding="utf-8", errors="replace") as f:
             if offset > 0:
@@ -109,6 +110,7 @@ class GrokParser(BaseParser):
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     result.lines_skipped += 1
+                    truncated = True
                     break
                 if not isinstance(entry, dict):
                     continue
@@ -144,7 +146,7 @@ class GrokParser(BaseParser):
                         cache_read=cached,
                     )
                 )
-            new_offset = f.tell()
+            new_offset = offset if truncated else f.tell()
 
         store.set_cursor(
             self.source, str(file_path), last_modified_ns=mtime_ns, last_line_offset=new_offset

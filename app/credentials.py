@@ -372,13 +372,20 @@ def read_copilot_credentials() -> Credential:
         Path.home() / ".config" / "github-copilot" / "hosts.json",
         Path.home() / "Library" / "Application Support" / "github-copilot" / "hosts.json",
     ]
+    last_error: Exception | None = None
+    last_error_path: str | None = None
     for path in candidates:
         if not path.exists():
             continue
         try:
             parsed = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as e:
-            return Credential("", CRED_PARSE_ERROR, str(path), f"凭据 JSON 解析失败: {e}")
+            # 这个候选文件损坏/读不出，但后面可能还有正常文件——继续尝试，
+            # 只在全部候选都失败时才报解析错误。记录出错的实际路径，避免
+            # 循环结束后 `path` 被后面不存在的候选覆盖。
+            last_error = e
+            last_error_path = str(path)
+            continue
         # entry 是 hosts.json 里每个 host（如 "github.com"）对应的值，key 本身
         # 用不到，只需要遍历 values（旧代码写的 `for key, entry in ...` 里 key
         # 从未被使用）。
@@ -391,6 +398,8 @@ def read_copilot_credentials() -> Credential:
         # 这个候选文件存在，但没有找到可用 token——继续尝试下一个候选路径，
         # 不能在这里 break（旧 bug 正是在这里提前退出，漏掉了后面真正有 token
         # 的候选文件）。
+    if last_error is not None:
+        return Credential("", CRED_PARSE_ERROR, last_error_path or "", f"凭据 JSON 解析失败: {last_error}")
     return Credential(
         "",
         CRED_NOT_FOUND,

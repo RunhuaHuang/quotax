@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN" class="dark">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,22 +7,24 @@
 <meta name="description" content="统一查看各 AI 渠道余额 · 订阅用量 · Coding Plan 额度">
 <title>QuotaX</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><linearGradient id='bg' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='%234285f4'/><stop offset='1' stop-color='%236366f1'/></linearGradient><linearGradient id='x' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='%23ffffff'/><stop offset='1' stop-color='%23c7d8ff'/></linearGradient></defs><rect x='6' y='6' width='88' height='88' rx='24' fill='url(%23bg)'/><rect x='6' y='6' width='88' height='88' rx='24' fill='%23ffffff' fill-opacity='0.12'/><path d='M32 30 L68 70' stroke='url(%23x)' stroke-width='9' stroke-linecap='round'/><path d='M68 30 L32 70' stroke='url(%23x)' stroke-width='9' stroke-linecap='round'/><circle cx='50' cy='50' r='7' fill='%23ffffff'/><circle cx='50' cy='50' r='3.5' fill='%234285f4'/></svg>">
-<!-- 主题初始化：首屏绘制前根据 localStorage 设定 dark class，防 FOUC -->
+<!-- 主题与语言初始化：首屏绘制前根据 localStorage 设定，防 FOUC -->
 <script>
 (function () {
   var root = document.documentElement;
-  var stored;
-  try { stored = (JSON.parse(localStorage.getItem('quotaboard_prefs') || '{}') || {}).theme; } catch (e) {}
-  var dark;
-  if (stored === 'light') dark = false;
-  else if (stored === 'dark') dark = true;
-  else dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  var prefs = {};
+  try { prefs = JSON.parse(localStorage.getItem('quotaboard_prefs') || '{}') || {}; } catch (e) {}
+  // 默认浅色
+  var storedTheme = prefs.theme || 'light';
+  var dark = storedTheme === 'dark' || (storedTheme === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
   root.classList.toggle('dark', dark);
+  // 默认简体中文
+  var storedLang = prefs.lang || 'zh-CN';
+  root.lang = storedLang === 'zh-CN' ? 'zh-CN' : 'en';
 })();
 </script>
 <!-- 自托管字体（DM Sans + JetBrains Mono，零外网依赖） -->
 <link rel="stylesheet" href="/static/fonts/fonts.css">
-<link rel="stylesheet" href="/static/styles.css?v=5">
+<link rel="stylesheet" href="/static/styles.css?v=6">
 </head>
 <body>
 
@@ -55,31 +57,32 @@
     </div>
     <div class="brand-text">
       <h1>QuotaX</h1>
-      <p>统一查看各 AI 渠道余额 · 订阅用量 · Coding Plan 额度</p>
+      <p data-i18n="app.subtitle">统一查看各 AI 渠道余额 · 订阅用量 · Coding Plan 额度</p>
     </div>
   </div>
 
   <div class="topbar-actions">
     <div class="summary-chips" id="summaryChips"></div>
-    <label class="switch" title="自动刷新（间隔可在设置里调，页面隐藏时暂停）">
+    <label class="switch" title="自动刷新（间隔可在设置里调，页面隐藏时暂停）" data-i18n-title="app.autoRefreshHint">
       <input type="checkbox" id="autoRefresh" checked>
       <span class="switch-track"><span class="switch-thumb"></span></span>
-      <span class="switch-label">自动刷新</span>
+      <span class="switch-label" data-i18n="app.autoRefresh">自动刷新</span>
     </label>
-    <button class="btn btn-ghost" id="btnRefresh" title="强制刷新全部渠道（绕过后端缓存，立即真查）">
+    <button class="btn btn-ghost" id="btnRefresh" title="强制刷新全部渠道（绕过后端缓存，立即真查）" data-i18n-title="app.refreshHint">
       <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path fill="currentColor" d="M17.65 6.35A8 8 0 1 0 19.73 14h-2.08a6 6 0 1 1-1.42-5.93L13 11h7V4l-2.35 2.35z"/></svg>
-      <span class="label">刷新</span>
+      <span class="label" data-i18n="app.refresh">刷新</span>
     </button>
-    <button class="btn btn-ghost" id="btnHistory" title="历史趋势">
+    <button class="btn btn-ghost" id="btnHistory" title="历史趋势" data-i18n-title="app.trendHint">
       <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path fill="currentColor" d="M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z"/></svg>
-      <span class="label">趋势</span>
+      <span class="label" data-i18n="app.trend">趋势</span>
     </button>
-    <button class="btn btn-ghost btn-icon-only" id="btnSettings" title="设置" aria-label="设置">
+    <button class="btn btn-ghost btn-icon-only" id="btnSettings" title="设置" aria-label="设置" data-i18n-title="app.settingsHint" data-i18n-aria="app.settings">
       <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94a7.07 7.07 0 0 0 .06-1 7 7 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.04 7.04 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54a7.04 7.04 0 0 0-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.74 8.87a.5.5 0 0 0 .12.64l2.03 1.58a7 7 0 0 0-.06.94c0 .32.02.63.06.94L2.87 14.55a.5.5 0 0 0-.12.64l1.92 3.32c.14.23.43.31.66.22l2.39-.96c.5.38 1.05.7 1.62.94l.36 2.54c.04.24.24.42.5.42h3.84c.26 0 .46-.18.5-.42l.36-2.54a7.04 7.04 0 0 0 1.62-.94l2.39.96c.23.09.52.01.66-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg>
     </button>
+    <button class="btn btn-ghost" id="btnLang" title="切换到 English" data-i18n-title="app.langSwitchHint" data-i18n="app.langSwitch">English</button>
     <button class="btn btn-primary" id="btnConfig">
       <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path fill="currentColor" d="M19.14 12.94a7.07 7.07 0 0 0 .06-1 7 7 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.04 7.04 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54a7.04 7.04 0 0 0-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.74 8.87a.5.5 0 0 0 .12.64l2.03 1.58a7 7 0 0 0-.06.94c0 .32.02.63.06.94L2.87 14.55a.5.5 0 0 0-.12.64l1.92 3.32c.14.23.43.31.66.22l2.39-.96c.5.38 1.05.7 1.62.94l.36 2.54c.04.24.24.42.5.42h3.84c.26 0 .46-.18.5-.42l.36-2.54a7.04 7.04 0 0 0 1.62-.94l2.39.96c.23.09.52.01.66-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg>
-      <span class="label">配置渠道</span>
+      <span class="label" data-i18n="app.configChannels">配置渠道</span>
     </button>
   </div>
 </header>
@@ -87,8 +90,8 @@
 <main>
   <!-- 视图切换 Tab：额度（现有 dashboard）/ 用量统计（深度分析看板） -->
   <nav class="view-tabs" id="viewTabs" role="tablist">
-    <button class="view-tab active" data-view="quota" role="tab" aria-selected="true">额度</button>
-    <button class="view-tab" data-view="usage" role="tab" aria-selected="false">用量统计</button>
+    <button class="view-tab active" data-view="quota" role="tab" aria-selected="true" data-i18n="tab.quota">额度</button>
+    <button class="view-tab" data-view="usage" role="tab" aria-selected="false" data-i18n="tab.usage">用量统计</button>
   </nav>
 
   <!-- 视图：额度（原有内容） -->
@@ -108,17 +111,17 @@
 </main>
 
 <footer class="footer">
-  <span>所有订阅类渠道只读本机 CLI 凭据（不刷新、不写入），绝不打扰你的 agent 登录状态。</span>
+  <span data-i18n="footer.cliReadonly">所有订阅类渠道只读本机 CLI 凭据（不刷新、不写入），绝不打扰你的 agent 登录状态。</span>
   <span class="footer-sep">·</span>
-  <span>配置保存在本地 config.json（权限 600）</span>
+  <span data-i18n="footer.configStorage">配置保存在本地 config.json（权限 600）</span>
 </footer>
 
 <!-- 配置弹窗 -->
 <div class="modal-overlay hidden" id="configModal">
   <div class="modal">
     <div class="modal-head">
-      <h2>渠道配置</h2>
-      <button class="btn-icon" id="btnCloseModal" title="关闭" aria-label="关闭对话框">
+      <h2 data-i18n="config.title">渠道配置</h2>
+      <button class="btn-icon" id="btnCloseModal" title="关闭" aria-label="关闭对话框" data-i18n-title="config.closeHint" data-i18n-aria="config.closeAria">
         <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path fill="currentColor" d="M18.3 5.71 12 12l6.3 6.29a1 1 0 1 1-1.42 1.42L10.59 13.4l-6.29 6.3a1 1 0 0 1-1.42-1.42L9.17 12l-6.3-6.29A1 1 0 1 1 4.29 4.3l6.3 6.29 6.29-6.3a1 1 0 1 1 1.42 1.42z"/></svg>
       </button>
     </div>
@@ -127,12 +130,12 @@
       <form id="channelForm" class="channel-form">
         <div class="form-row">
           <div class="form-field">
-            <label for="fType">渠道类型</label>
+            <label for="fType" data-i18n="config.type">渠道类型</label>
             <select id="fType" required></select>
           </div>
           <div class="form-field">
-            <label for="fName">显示名称</label>
-            <input type="text" id="fName" placeholder="例如：DeepSeek 主账号">
+            <label for="fName" data-i18n="config.name">显示名称</label>
+            <input type="text" id="fName" placeholder="例如：DeepSeek 主账号" data-i18n-placeholder="config.namePlaceholder">
           </div>
         </div>
         <div id="dynamicFields" class="form-dynamic"></div>
@@ -140,25 +143,25 @@
           <label class="switch form-switch">
             <input type="checkbox" id="fEnabled" checked>
             <span class="switch-track"><span class="switch-thumb"></span></span>
-            <span class="switch-label">启用</span>
+            <span class="switch-label" data-i18n="config.enabled">启用</span>
           </label>
           <div class="form-actions">
-            <button type="button" class="btn btn-ghost" id="btnFormReset">取消</button>
-            <button type="submit" class="btn btn-primary" id="btnFormSave">保存渠道</button>
+            <button type="button" class="btn btn-ghost" id="btnFormReset" data-i18n="config.cancel">取消</button>
+            <button type="submit" class="btn btn-primary" id="btnFormSave" data-i18n="config.save">保存渠道</button>
           </div>
         </div>
       </form>
 
       <div class="channels-list-head">
-        <span>已配置渠道（<span id="channelCount">0</span>）</span>
-        <span class="channels-note">订阅类渠道无需填 Key，自动读本机 CLI 登录</span>
+        <span id="channelsCountLabel"></span>
+        <span class="channels-note" data-i18n="config.channelsNote">订阅类渠道无需填 Key，自动读本机 CLI 登录</span>
       </div>
       <div id="channelsList" class="channels-list"></div>
 
       <div class="config-io">
-        <button type="button" class="btn btn-ghost" id="btnExportSecret" title="导出含密钥的完整配置（个人备份/换机）">导出配置（含密钥）</button>
-        <button type="button" class="btn btn-ghost" id="btnExportSafe" title="导出不含密钥的渠道结构（可安全分享）">导出（脱敏）</button>
-        <button type="button" class="btn btn-ghost" id="btnImportTrigger">导入配置</button>
+        <button type="button" class="btn btn-ghost" id="btnExportSecret" title="导出含密钥的完整配置（个人备份/换机）" data-i18n="config.exportSecret" data-i18n-title="config.exportSecretHint">导出配置（含密钥）</button>
+        <button type="button" class="btn btn-ghost" id="btnExportSafe" title="导出不含密钥的渠道结构（可安全分享）" data-i18n="config.exportSafe" data-i18n-title="config.exportSafeHint">导出（脱敏）</button>
+        <button type="button" class="btn btn-ghost" id="btnImportTrigger" data-i18n="config.import">导入配置</button>
         <input type="file" id="importFileInput" accept="application/json,.json" hidden>
       </div>
     </div>
@@ -169,24 +172,24 @@
 <div class="modal-overlay hidden" id="settingsModal">
   <div class="modal modal-sm">
     <div class="modal-head">
-      <h2>设置</h2>
-      <button class="btn-icon" id="btnCloseSettings" title="关闭" aria-label="关闭对话框">
+      <h2 data-i18n="settings.title">设置</h2>
+      <button class="btn-icon" id="btnCloseSettings" title="关闭" aria-label="关闭对话框" data-i18n-title="config.closeHint" data-i18n-aria="config.closeAria">
         <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path fill="currentColor" d="M18.3 5.71 12 12l6.3 6.29a1 1 0 1 1-1.42 1.42L10.59 13.4l-6.29 6.3a1 1 0 0 1-1.42-1.42L9.17 12l-6.3-6.29A1 1 0 1 1 4.29 4.3l6.3 6.29 6.29-6.3a1 1 0 1 1 1.42 1.42z"/></svg>
       </button>
     </div>
     <div class="modal-body">
       <div class="setting-row">
-        <div class="setting-label">主题</div>
+        <div class="setting-label" data-i18n="settings.theme">主题</div>
         <div class="setting-control" id="themeOptions"></div>
       </div>
       <div class="setting-row">
-        <div class="setting-label">自动刷新频率</div>
+        <div class="setting-label" data-i18n="settings.refreshInterval">自动刷新频率</div>
         <div class="setting-control" id="refreshOptions"></div>
       </div>
       <div class="setting-row setting-row-stretch">
         <div class="setting-label">
-          低余额阈值告警
-          <span class="setting-desc">为各渠道设置余额/剩余额度百分比阈值，低于阈值时卡片标橙、汇总栏计数告警。阈值仅保存在浏览器本地。</span>
+          <span data-i18n="settings.threshold">低余额阈值告警</span>
+          <span class="setting-desc" data-i18n="settings.thresholdDesc">为各渠道设置余额/剩余额度百分比阈值，低于阈值时卡片标橙、汇总栏计数告警。阈值仅保存在浏览器本地。</span>
         </div>
       </div>
       <div id="thresholdList" class="threshold-list"></div>
@@ -198,24 +201,24 @@
 <div class="modal-overlay hidden" id="historyModal">
   <div class="modal modal-lg">
     <div class="modal-head">
-      <h2>历史趋势</h2>
-      <button class="btn-icon" id="btnCloseHistory" title="关闭" aria-label="关闭对话框">
+      <h2 data-i18n="history.title">历史趋势</h2>
+      <button class="btn-icon" id="btnCloseHistory" title="关闭" aria-label="关闭对话框" data-i18n-title="config.closeHint" data-i18n-aria="config.closeAria">
         <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path fill="currentColor" d="M18.3 5.71 12 12l6.3 6.29a1 1 0 1 1-1.42 1.42L10.59 13.4l-6.29 6.3a1 1 0 0 1-1.42-1.42L9.17 12l-6.3-6.29A1 1 0 1 1 4.29 4.3l6.3 6.29 6.29-6.3a1 1 0 1 1 1.42 1.42z"/></svg>
       </button>
     </div>
     <div class="modal-body">
       <div class="history-controls">
-        <label>时间范围
+        <label><span data-i18n="history.range">时间范围</span>
           <select id="historyDays">
-            <option value="7">最近 7 天</option>
-            <option value="14">最近 14 天</option>
-            <option value="30" selected>最近 30 天</option>
-            <option value="90">最近 90 天</option>
-            <option value="180">最近半年</option>
+            <option value="7" data-i18n="history.days7">最近 7 天</option>
+            <option value="14" data-i18n="history.days14">最近 14 天</option>
+            <option value="30" selected data-i18n="history.days30">最近 30 天</option>
+            <option value="90" data-i18n="history.days90">最近 90 天</option>
+            <option value="180" data-i18n="history.days180">最近半年</option>
           </select>
         </label>
-        <label>渠道
-          <select id="historyChannel"><option value="">全部</option></select>
+        <label><span data-i18n="history.channel">渠道</span>
+          <select id="historyChannel"><option value="" data-i18n="history.allChannels">全部</option></select>
         </label>
       </div>
       <div id="historyContent" class="history-content"></div>
@@ -225,7 +228,7 @@
 
 <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 
-<script type="module" src="/static/app.js?v=5"></script>
-<script type="module" src="/static/usage.js?v=5"></script>
+<script type="module" src="/static/app.js?v=6"></script>
+<script type="module" src="/static/usage.js?v=6"></script>
 </body>
 </html>

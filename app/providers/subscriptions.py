@@ -421,7 +421,7 @@ async def query_grok(channel: Channel) -> ChannelResult:
     tier = data.get("subscriptionTier") or config.get("plan")
     if not windows:
         return fail("error", "Grok 未返回用量数据（可能未订阅）", source=cred.source, **base)
-    plan_name = f"Grok {tier.capitalize()}" if tier else "Grok 订阅"
+    plan_name = f"Grok {tier.capitalize()}" if isinstance(tier, str) and tier else "Grok 订阅"
     return ok(plan_name=plan_name, windows=windows, source=cred.source, **base)
 
 
@@ -564,8 +564,9 @@ async def query_copilot(channel: Channel) -> ChannelResult:
     message = "；".join(notes) if notes else None
     if not windows:
         return fail("error", message or "Copilot 未返回用量数据", source=cred.source, **base)
+    plan_name = f"Copilot {plan.capitalize()}" if isinstance(plan, str) and plan else "GitHub Copilot"
     return ok(
-        plan_name=f"Copilot {plan}" if plan else "GitHub Copilot",
+        plan_name=plan_name,
         windows=windows,
         message=message,
         source=cred.source,

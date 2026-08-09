@@ -42,6 +42,7 @@ DB_PATH: Path = (
 # 在同一个连接生命周期内串行，避免 cursor 交叉。
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
+_conn_lock = threading.Lock()
 
 
 def _connect() -> sqlite3.Connection:
@@ -56,11 +57,13 @@ def get_conn() -> sqlite3.Connection:
     """获取全局单例连接（惰性建表）。所有读写都走这个连接 + _lock 串行。"""
     global _conn
     if _conn is None:
-        with _lock:
+        # 用独立锁创建连接，避免与业务锁 _lock 重入死锁
+        with _conn_lock:
             if _conn is None:
                 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-                _conn = _connect()
-                _init_schema(_conn)
+                conn = _connect()
+                _init_schema(conn)
+                _conn = conn
     return _conn
 
 
@@ -516,16 +519,22 @@ def query_model_breakdown(
         )
     rest = rows[8:]
     if rest:
+        rest_tokens = sum(int(r["tot_tokens"]) for r in rest)
+        rest_cost = sum(float(r["tot_cost"]) for r in rest)
+        # 聚合行：展示文案由前端按当前语言本地化（见 i18n 的 usage.otherLabel，
+        # count 取 other_count）；is_other=True 标记该行是聚合行，前端据此跳过
+        # 点击筛选，不依赖展示字符串做逻辑判断（避免 i18n 误判）。model 字段对
+        # 聚合行无实际语义，用 "_other" 占位即可（前端不读取它）。
         out.append(
             {
-                "model": f"其他 ({len(rest)})",
-                "tokens": sum(int(r["tot_tokens"]) for r in rest),
-                "cost": round(sum(float(r["tot_cost"]) for r in rest), 6),
+                "model": "_other",
+                "is_other": True,
+                "other_count": len(rest),
+                "tokens": rest_tokens,
+                "cost": round(rest_cost, 6),
                 "requests": sum(int(r["reqs"]) for r in rest),
-                "pct_tokens": round(sum(int(r["tot_tokens"]) for r in rest) / total_tokens * 100, 1)
-                if total_tokens > 0
-                else 0.0,
-                "pct_cost": 0.0,
+                "pct_tokens": round(rest_tokens / total_tokens * 100, 1) if total_tokens > 0 else 0.0,
+                "pct_cost": round(rest_cost / total_cost * 100, 1) if total_cost > 0 else 0.0,
             }
         )
     return out

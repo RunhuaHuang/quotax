@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 from . import store
 from .parsers import all_parsers
@@ -21,17 +22,21 @@ logger = logging.getLogger(__name__)
 
 # 模块级单例 book：内置价 + 持久化价。LiteLLM 更新 / 手动编辑后调 save_pricing 落盘。
 _book: PricingBook | None = None
+_book_lock = threading.Lock()
 
 
 def get_book() -> PricingBook:
     """获取 / 惰性初始化全局 PricingBook（内置价 + 持久化价合并）。"""
     global _book
     if _book is None:
-        _book = PricingBook()
-        try:
-            store.load_pricing(_book)
-        except Exception as e:  # 加载失败不阻塞——用内置价也能跑
-            logger.debug("加载持久化单价失败（用内置价）: %s", e)
+        with _book_lock:
+            if _book is None:
+                book = PricingBook()
+                try:
+                    store.load_pricing(book)
+                except Exception as e:  # 加载失败不阻塞——用内置价也能跑
+                    logger.debug("加载持久化单价失败（用内置价）: %s", e)
+                _book = book
     return _book
 
 

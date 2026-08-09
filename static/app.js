@@ -2,9 +2,42 @@
 
 // 不依赖 DOM/localStorage 的纯函数抽到 view-utils.js（可被 node:test 直接
 // import 测试），这里只 import 使用，避免同一份逻辑两处维护。
-import { normalizeThreeWindows, canonicalChannelId, channelBreachesThreshold, noPercentData, fmtReset } from "./view-utils.js";
+import { normalizeThreeWindows, canonicalChannelId, channelBreachesThreshold, noPercentData, fmtReset } from "./view-utils.js?v=6";
+import { t, thas, toggleLang, getLang } from "./i18n.js?v=6";
 
 const $ = (sel) => document.querySelector(sel);
+
+/* 翻译 HTML 中的静态节点（data-i18n / data-i18n-title / data-i18n-placeholder / data-i18n-aria） */
+function applyStaticI18n(root = document) {
+  root.querySelectorAll("[data-i18n]").forEach((el) => {
+    el.textContent = t(el.dataset.i18n);
+  });
+  root.querySelectorAll("[data-i18n-title]").forEach((el) => {
+    el.title = t(el.dataset.i18nTitle);
+  });
+  root.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+    el.placeholder = t(el.dataset.i18nPlaceholder);
+  });
+  root.querySelectorAll("[data-i18n-aria]").forEach((el) => {
+    el.setAttribute("aria-label", t(el.dataset.i18nAria));
+  });
+}
+
+/* 取 provider / category 的翻译标签，兜底后端返回的原始值。
+   必须用 thas() 判断翻译是否存在——t() 在 key 缺失时返回 key 本身（非空），
+   直接 `t() || fallback` 的 fallback 永远不会触发。 */
+function providerLabel(type) {
+  const key = `provider.${type}`;
+  return thas(key) ? t(key) : (providersCatalog[type]?.label || type);
+}
+function providerDefaultName(type) {
+  const key = `providerDefault.${type}`;
+  return thas(key) ? t(key) : (providersCatalog[type]?.default_name || type);
+}
+function categoryLabel(cat) {
+  const key = `category.${cat}`;
+  return thas(key) ? t(key) : (categories[cat] || cat);
+}
 
 const CATEGORY_ORDER = ["coding_plan", "subscription", "balance", "local"];
 
@@ -51,9 +84,10 @@ function iconTile(meta, cls = "", styleExtra = "") {
   return `<div class="icon-tile${clsStr}" style="${style}">${esc(meta.icon)}</div>`;
 }
 
-const STATUS_TEXT = {
-  ok: "正常", info: "仅提示", expired: "已过期", error: "错误", not_found: "未登录", disabled: "已停用",
-};
+function statusText(status) {
+  const key = `status.${status}`;
+  return thas(key) ? t(key) : status;
+}
 const STATUS_TAG_CLASS = {
   ok: "ok", info: "info", expired: "expired", error: "error", not_found: "not_found", disabled: "disabled",
 };
@@ -77,24 +111,24 @@ const PREFS_KEY = "quotaboard_prefs";
    间隔大于等于缓存 TTL 时定时刷新才能拿到新数据；间隔小于 TTL 时刷新会命中缓存
    （节省上游请求），点「刷新」按钮可强制绕过。用户可在设置里调整频率。 */
 const REFRESH_INTERVALS = [
-  { value: 0, label: "关闭" },
-  { value: 30_000, label: "30 秒" },
-  { value: 60_000, label: "1 分钟" },
-  { value: 90_000, label: "90 秒" },
-  { value: 180_000, label: "3 分钟" },
-  { value: 300_000, label: "5 分钟" },
-  { value: 900_000, label: "15 分钟" },
-  { value: 1_800_000, label: "30 分钟" },
-  { value: 3_600_000, label: "1 小时" },
-  { value: 10_800_000, label: "3 小时" },
+  { value: 0, labelKey: "refresh.off" },
+  { value: 30_000, labelKey: "refresh.30s" },
+  { value: 60_000, labelKey: "refresh.1m" },
+  { value: 90_000, labelKey: "refresh.90s" },
+  { value: 180_000, labelKey: "refresh.3m" },
+  { value: 300_000, labelKey: "refresh.5m" },
+  { value: 900_000, labelKey: "refresh.15m" },
+  { value: 1_800_000, labelKey: "refresh.30m" },
+  { value: 3_600_000, labelKey: "refresh.1h" },
+  { value: 10_800_000, labelKey: "refresh.3h" },
 ];
 const DEFAULT_REFRESH_INTERVAL = 300_000;
 
 /* 主题：auto = 跟随系统；light / dark 手动覆盖 */
 const THEME_OPTIONS = [
-  { value: "auto", label: "跟随系统" },
-  { value: "light", label: "浅色" },
-  { value: "dark", label: "深色" },
+  { value: "auto", labelKey: "settings.themeAuto" },
+  { value: "light", labelKey: "settings.themeLight" },
+  { value: "dark", labelKey: "settings.themeDark" },
 ];
 
 function loadPrefs() {
@@ -119,6 +153,7 @@ function savePrefs(patch) {
 async function init() {
   bindEvents();
   applyStoredTheme(); // 尽早应用主题，避免首屏闪烁
+  applyStaticI18n();  // 翻译 HTML 中的静态节点
   // 会话快照：整页刷新/重新打开时**同步**恢复上次画面（脚本一执行就渲染，
   // 不闪骨架屏、不等网络），新数据在后台到达后无缝替换。只有完全没有快照的
   // 首次打开才显示骨架屏。
@@ -128,7 +163,7 @@ async function init() {
     await loadProviders();
   } catch (e) {
     console.error(e);
-    renderFatalError(`加载渠道类型失败（/api/providers）：${e.message}。请确认后端服务已启动，然后重试。`);
+    renderFatalError(t("empty.initFailedTitle") + `: ${t("empty.quotaLoadFailedDesc")} (${e.message})`);
     return;
   }
   // 快照恢复时 providersCatalog 可能还没就绪（类型标签用 fallback），这里重绘修正
@@ -137,6 +172,7 @@ async function init() {
   setupAutoRefresh();
   setupVisibilityAutoRefresh();
   setupThemeReactivity();
+  setupLangReactivity();
 }
 
 function bindEvents() {
@@ -180,6 +216,11 @@ function bindEvents() {
   $("#autoRefresh").addEventListener("change", (e) => {
     if (e.target.checked) setupAutoRefresh();
     else clearInterval(autoRefreshTimer);
+  });
+
+  // 语言切换
+  $("#btnLang").addEventListener("click", () => {
+    toggleLang();
   });
 
   // 设置弹窗
@@ -306,9 +347,9 @@ async function loadChannels() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     channels = await res.json();
     renderChannelsList();
-    $("#channelCount").textContent = channels.length;
+    renderChannelCount();
   } catch (e) {
-    toast("加载渠道列表失败: " + e.message, "err");
+    toast(t("toast.loadChannelsFailed", { msg: e.message }), "err");
   }
 }
 
@@ -323,11 +364,11 @@ async function refreshQuotas(force = false) {
     dashboardLoadedOnce = true;
     renderDashboard();
     const now = new Date();
-    const ts = now.toLocaleTimeString("zh-CN", { hour12: false });
-    $("#lastUpdated").textContent = `上次刷新 ${ts}${data.cached ? " · 命中缓存" : ""}`;
+    const ts = now.toLocaleTimeString(getLang() === "zh-CN" ? "zh-CN" : "en-US", { hour12: false });
+    $("#lastUpdated").textContent = t("card.lastUpdated", { time: ts, cached: data.cached ? t("card.cachedSuffix") : "" });
     saveSnapshot({ channels: data.channels, lastUpdated: ts });
   } catch (e) {
-    toast("刷新额度失败" + (dashboardLoadedOnce ? "，已保留上次数据" : "") + ": " + e.message, "err");
+    toast(t("toast.refreshFailed", { ctx: dashboardLoadedOnce ? t("toast.refreshCtxKept") : "", msg: e.message }), "err");
     if (!dashboardLoadedOnce) {
       // 从未成功加载过：给出明确的错误态，不能伪装成"还没配置渠道"的空状态
       renderFatalDashboardError(e.message);
@@ -364,7 +405,7 @@ async function loadLocalUsage() {
     localUsage = null;
     $("#localUsage").classList.add("hidden");
     $("#localUsage").innerHTML = "";
-    toast("本地用量统计加载失败: " + e.message, "err");
+    toast(t("toast.localUsageFailed", { msg: e.message }), "err");
   }
 }
 
@@ -403,7 +444,7 @@ function setupThemeReactivity() {
   const mq = window.matchMedia("(prefers-color-scheme: dark)");
   mq.addEventListener("change", () => {
     // auto 模式下系统主题变化要同步更新 <html> dark class，否则光重绘取色不对
-    if ((loadPrefs().theme || "auto") === "auto") applyStoredTheme();
+    if ((loadPrefs().theme || "light") === "auto") applyStoredTheme();
     renderDashboard();
     renderLocalUsage();
   });
@@ -431,7 +472,7 @@ function restoreSnapshot() {
       dashboardLoadedOnce = true;
       renderDashboard();
       if (snap.lastUpdated) {
-        $("#lastUpdated").textContent = `上次刷新 ${snap.lastUpdated}（缓存画面，正在更新…）`;
+        $("#lastUpdated").textContent = t("card.lastUpdated", { time: snap.lastUpdated, cached: t("card.restoringSnapshot") });
       }
       restored = true;
     }
@@ -469,9 +510,9 @@ function renderFatalError(message) {
   $("#dashboard").innerHTML = `
     <div class="empty-state error-state">
       <div class="empty-icon">⚠️</div>
-      <h3>页面初始化失败</h3>
+      <h3>${t("empty.initFailedTitle")}</h3>
       <p>${esc(message)}</p>
-      <button type="button" class="btn btn-primary" data-action="retry-init">重新加载页面</button>
+      <button type="button" class="btn btn-primary" data-action="retry-init">${t("empty.retryReload")}</button>
     </div>`;
 }
 
@@ -479,9 +520,9 @@ function renderFatalDashboardError(message) {
   $("#dashboard").innerHTML = `
     <div class="empty-state error-state">
       <div class="empty-icon">⚠️</div>
-      <h3>额度数据加载失败</h3>
-      <p>${esc(message || "请检查后端服务是否正常运行。")}</p>
-      <button type="button" class="btn btn-primary" data-action="retry-refresh">重试</button>
+      <h3>${t("empty.quotaLoadFailedTitle")}</h3>
+      <p>${esc(message || t("empty.quotaLoadFailedDesc"))}</p>
+      <button type="button" class="btn btn-primary" data-action="retry-refresh">${t("empty.retryRefresh")}</button>
     </div>`;
 }
 
@@ -498,9 +539,9 @@ function renderDashboard() {
     container.innerHTML = `
       <div class="empty-state">
         <div class="empty-icon">📊</div>
-        <h3>还没有配置任何渠道</h3>
-        <p>点击右上角「配置渠道」添加你的余额与订阅渠道。订阅类渠道（Claude / Gemini / Grok / Codex / Copilot）无需填写任何密钥，自动读取本机 CLI 的登录状态。</p>
-        <button type="button" class="btn btn-primary" data-action="open-config">＋ 添加第一个渠道</button>
+        <h3>${t("empty.noChannelsTitle")}</h3>
+        <p>${t("empty.noChannelsDesc")}</p>
+        <button type="button" class="btn btn-primary" data-action="open-config">${t("empty.addFirstChannel")}</button>
       </div>`;
     return;
   }
@@ -535,8 +576,8 @@ function renderDashboard() {
       return `
         <section class="section">
           <div class="section-head">
-            <h2><span class="section-dot ${esc(cat)}"></span>${esc(categories[cat] || cat)}</h2>
-            <span class="section-note">${groups[cat].length} 个渠道</span>
+            <h2><span class="section-dot ${esc(cat)}"></span>${esc(categoryLabel(cat))}</h2>
+            <span class="section-note">${t("section.channelsCount", { count: groups[cat].length })}</span>
           </div>
           <div class="grid">${items}</div>
         </section>`;
@@ -553,14 +594,14 @@ function renderSummaryChips(list) {
   // channelBreachesThreshold 现在接受 thresholds 表作为参数（纯函数、可测试），
   // 不能直接当 Array.filter 的回调传——filter 会把 (index, array) 当成第二、
   // 三个参数塞给它，必须包一层箭头函数显式传 getThresholds()。
-  const low = list.filter((q) => channelBreachesThreshold(q, getThresholds())).length; // 低余额阈值告警
+  const low = list.filter((q) => channelBreachesThreshold(q, getThresholds(), channels)).length;
   $("#summaryChips").innerHTML = `
-    <span class="chip ok"><span class="chip-dot"></span>正常 <b>${ok}</b></span>
-    ${low ? `<span class="chip low"><span class="chip-dot"></span>低额度 <b>${low}</b></span>` : ""}
-    ${info ? `<span class="chip info"><span class="chip-dot"></span>提示 <b>${info}</b></span>` : ""}
-    ${warn ? `<span class="chip warn"><span class="chip-dot"></span>异常 <b>${warn}</b></span>` : ""}
-    ${bad ? `<span class="chip bad"><span class="chip-dot"></span>过期 <b>${bad}</b></span>` : ""}
-    ${off ? `<span class="chip off"><span class="chip-dot"></span>停用 <b>${off}</b></span>` : ""}`;
+    <span class="chip ok"><span class="chip-dot"></span>${t("chip.ok")} <b>${ok}</b></span>
+    ${low ? `<span class="chip low"><span class="chip-dot"></span>${t("chip.low")} <b>${low}</b></span>` : ""}
+    ${info ? `<span class="chip info"><span class="chip-dot"></span>${t("chip.info")} <b>${info}</b></span>` : ""}
+    ${warn ? `<span class="chip warn"><span class="chip-dot"></span>${t("chip.warn")} <b>${warn}</b></span>` : ""}
+    ${bad ? `<span class="chip bad"><span class="chip-dot"></span>${t("chip.bad")} <b>${bad}</b></span>` : ""}
+    ${off ? `<span class="chip off"><span class="chip-dot"></span>${t("chip.off")} <b>${off}</b></span>` : ""}`;
 }
 
 /* 余额类渠道的金额展示：余额没有百分比概念，不画圆环——大号金额 + 说明文字。
@@ -573,18 +614,18 @@ function renderBalanceHero(amountObj) {
   return `
     <div class="balance-hero">
       <div class="balance-value"><span class="balance-symbol">${esc(symbol)}</span><span class="balance-number">${esc(number)}</span></div>
-      <div class="balance-label">账户余额</div>
+      <div class="balance-label">${t("card.balanceLabel")}</div>
     </div>`;
 }
 
 function renderCard(q) {
   const meta = PROVIDER_META[q.type] || FALLBACK_META;
   const statusCls = STATUS_TAG_CLASS[q.status] || "not_found";
-  const statusText = STATUS_TEXT[q.status] || q.status;
+  const stText = statusText(q.status);
   const isDisabled = q.status === "disabled";
   const isAbnormal = !(q.status === "ok" || q.status === "info");
-  const isLowAlert = channelBreachesThreshold(q, getThresholds()); // 低余额阈值告警
-  const typeLabel = esc(providersCatalog[q.type]?.label || q.type);
+  const isLowAlert = channelBreachesThreshold(q, getThresholds(), channels);
+  const typeLabel = esc(providerLabel(q.type));
   const manageUrl = safeUrl(
     providersCatalog[q.type]?.manage_url || channels.find((c) => c.id === q.id)?.base_url || ""
   );
@@ -604,15 +645,15 @@ function renderCard(q) {
       parts.push(renderWindows(normalizedWindows));
     }
     if (!parts.length) {
-      parts.push(`<div class="card-amount"><span class="value placeholder">暂无数据</span></div>`);
+      parts.push(`<div class="card-amount"><span class="value placeholder">${t("card.noData")}</span></div>`);
     }
     body = `<div class="card-body">${parts.join("")}</div>`;
   } else if (q.status === "info") {
-    body = `<div class="card-body"><div class="card-info-msg">${esc(q.message || "该渠道当前没有可查询的额度数据。")}</div></div>`;
+    body = `<div class="card-body"><div class="card-info-msg">${esc(q.message || t("card.noData"))}</div></div>`;
   } else if (isDisabled) {
-    body = `<div class="card-body"><div class="card-amount"><span class="value placeholder">已停用，不参与查询</span></div></div>`;
+    body = `<div class="card-body"><div class="card-amount"><span class="value placeholder">${t("card.disabled")}</span></div></div>`;
   } else {
-    body = `<div class="card-body"><div class="card-amount"><span class="value placeholder">暂无数据</span></div></div>`;
+    body = `<div class="card-body"><div class="card-amount"><span class="value placeholder">${t("card.noData")}</span></div></div>`;
   }
 
   // 底部：正常/提示状态优先展示凭据来源；异常状态展示错误信息。两者都有时互为提示 title。
@@ -622,8 +663,8 @@ function renderCard(q) {
     footTitle = q.source && q.message ? `${q.source}\n${q.message}` : footText;
     footCls = "src";
   } else {
-    footText = q.message || statusText;
-    footTitle = q.source ? `${footText}\n来源：${q.source}` : footText;
+    footText = q.message || stText;
+    footTitle = q.source ? `${footText}\n${t("card.source")}: ${q.source}` : footText;
     footCls = "msg";
   }
   const time = q.updated_at ? fmtTime(q.updated_at) : "";
@@ -632,13 +673,13 @@ function renderCard(q) {
   const actions = `
     <div class="card-actions">
       ${showRefresh ? `
-      <button type="button" class="btn-icon card-action" data-action="refresh-one" data-id="${esc(q.id)}" title="刷新此渠道">
+      <button type="button" class="btn-icon card-action" data-action="refresh-one" data-id="${esc(q.id)}" title="${t("card.refreshHint")}">
         <svg viewBox="0 0 24 24" class="icon"><path fill="currentColor" d="M17.65 6.35A8 8 0 1 0 19.73 14h-2.08a6 6 0 1 1-1.42-5.93L13 11h7V4l-2.35 2.35z"/></svg>
       </button>` : ""}
-      <button type="button" class="btn-icon card-action" data-action="edit-card" data-id="${esc(q.id)}" title="编辑此渠道">
+      <button type="button" class="btn-icon card-action" data-action="edit-card" data-id="${esc(q.id)}" title="${t("card.editHint")}">
         <svg viewBox="0 0 24 24" class="icon"><path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
       </button>
-      <label class="switch switch-sm" title="${isDisabled ? "启用此渠道" : "停用此渠道"}">
+      <label class="switch switch-sm" title="${isDisabled ? t("card.enableHint") : t("card.disableHint")}">
         <input type="checkbox" data-action="toggle-enabled" data-id="${esc(q.id)}" data-type="${esc(q.type)}" ${isDisabled ? "" : "checked"}>
         <span class="switch-track"><span class="switch-thumb"></span></span>
       </label>
@@ -649,7 +690,7 @@ function renderCard(q) {
   if (body.startsWith('<div class="card-body">')) {
     body = body.replace(
       '<div class="card-body">',
-      `<div class="card-body"><span class="status-dot ${statusCls}" title="${esc(footTitle || statusText)}"></span>`
+      `<div class="card-body"><span class="status-dot ${statusCls}" title="${esc(footTitle || stText)}"></span>`
     );
   }
 
@@ -661,9 +702,9 @@ function renderCard(q) {
           <div class="name">${esc(q.name)}</div>
           <div class="plan">${q.plan_name ? esc(q.plan_name) : typeLabel}</div>
         </div>
-        <span class="status-tag ${statusCls}">${esc(statusText)}</span>
-        ${manageUrl ? `<a class="card-ext-link" href="${esc(manageUrl)}" target="_blank" rel="noopener" title="打开平台管理页（查余额/充值）" aria-label="打开平台管理页"><svg viewBox="0 0 24 24" class="icon"><path fill="currentColor" d="M14 3h7v7h-2V6.41l-9.29 9.3-1.42-1.42L17.59 5H14V3zM5 5h6v2H5v12h12v-6h2v8H3V5h2z"/></svg></a>` : ""}
-        <span class="card-drag-handle" draggable="true" title="拖动调整顺序" aria-label="拖动调整顺序">⠿</span>
+        <span class="status-tag ${statusCls}">${esc(stText)}</span>
+        ${manageUrl ? `<a class="card-ext-link" href="${esc(manageUrl)}" target="_blank" rel="noopener" title="${t("card.managePageHint")}" aria-label="${t("card.managePageHint")}"><svg viewBox="0 0 24 24" class="icon"><path fill="currentColor" d="M14 3h7v7h-2V6.41l-9.29 9.3-1.42-1.42L17.59 5H14V3zM5 5h6v2H5v12h12v-6h2v8H3V5h2z"/></svg></a>` : ""}
+        <span class="card-drag-handle" draggable="true" title="${t("card.dragHint")}" aria-label="${t("card.dragHint")}">⠿</span>
       </div>
       ${body}
       <div class="card-foot">
@@ -741,24 +782,39 @@ function ringColor(remainingPct) {
   return themeColorCache.red;
 }
 
+/* 窗口标签的本地化：
+   优先用 labelKey（normalizeThreeWindows 生成的占位窗口）；否则按 window.key
+   识别标准档位（five_hour/weekly/monthly 及其 agent_/coding_ 前缀变体）走翻译表；
+   其余自定义窗口（如 "Gemini 2.5 Pro"、"已用比例"）是后端数据标签，保持原样。 */
+function windowLabel(w) {
+  if (w.labelKey) return t(w.labelKey);
+  const key = w.key || "";
+  const m = key.match(/^(agent|coding)_(five_hour|weekly|monthly)$/);
+  if (m) return t(`tier.${m[1]}.${m[2]}`);
+  if (["five_hour", "weekly", "monthly"].includes(key)) return t(`tier.${key}`);
+  return w.label || key;
+}
+
 function renderBar(w) {
   if (noPercentData(w)) return renderBarFlat(w);
   const used = w.used_percent ?? (100 - w.remaining_percent);
   const remainingPct = Math.max(0, Math.min(100, w.remaining_percent ?? (100 - used)));
   const color = ringColor(remainingPct);
 
+  const label = windowLabel(w);
+  const maxLabel = w.maxLabelKey ? t(w.maxLabelKey) : w.max_label;
   // 展示格式：剩余 80% · 限额 10,000 APF · 重置 5 小时后
-  const remainTxt = `剩余 ${remainingPct.toFixed(0)}%`;
-  const maxTxt = w.max_label ? `限额 ${w.max_label}` : "";
-  const usedTxt = w.used_label ? `已用 ${w.used_label}` : "";
-  const resetTxt = w.reset_at ? `重置 ${fmtReset(w.reset_at)}` : "";
+  const remainTxt = `${t("window.remaining")} ${remainingPct.toFixed(0)}%`;
+  const maxTxt = maxLabel ? `${t("window.quota")} ${maxLabel}` : "";
+  const usedTxt = w.used_label ? `${t("window.used")} ${w.used_label}` : "";
+  const resetTxt = w.reset_at ? `${t("window.reset")} ${fmtResetText(fmtReset(w.reset_at))}` : "";
   const extra = [remainTxt, maxTxt, usedTxt, resetTxt].filter(Boolean).join(" · ");
 
   return `
     <div class="window-bar">
       <div class="bar-head">
-        <span>${esc(w.label)}</span>
-        <span class="bar-pct" style="color:${color}">剩余 ${remainingPct.toFixed(0)}%</span>
+        <span>${esc(label)}</span>
+        <span class="bar-pct" style="color:${color}">${t("window.remaining")} ${remainingPct.toFixed(0)}%</span>
       </div>
       <div class="bar-track">
         <div class="bar-fill" style="--bar-c:${color};--bar-c2:${color};width:${remainingPct}%"></div>
@@ -769,16 +825,24 @@ function renderBar(w) {
 
 /* 没有百分比概念的窗口条目（列表形式）：不画进度条，只展示文本 */
 function renderBarFlat(w) {
-  const mainText = w.max_label || w.used_label || "";
-  const resetText = w.reset_at ? `重置 ${fmtReset(w.reset_at)}` : "";
+  const label = windowLabel(w);
+  const maxLabel = w.maxLabelKey ? t(w.maxLabelKey) : w.max_label;
+  const mainText = maxLabel || w.used_label || "";
+  const resetText = w.reset_at ? `${t("window.reset")} ${fmtResetText(fmtReset(w.reset_at))}` : "";
   return `
     <div class="window-bar bar-flat">
       <div class="bar-head">
-        <span>${esc(w.label)}</span>
+        <span>${esc(label)}</span>
         ${mainText ? `<span class="bar-flat-value">${esc(mainText)}</span>` : ""}
       </div>
       ${resetText ? `<div class="bar-extra">${esc(resetText)}</div>` : ""}
     </div>`;
+}
+
+/* 把 fmtReset 返回的 {key,value} 渲染成可读字符串 */
+function fmtResetText(r) {
+  if (r.key === "reset.now") return t("reset.now");
+  return t(r.key, { n: r.value });
 }
 
 /* ── 单渠道操作：刷新 / 启停 ────────────────────────────── */
@@ -817,7 +881,7 @@ async function onRefreshOneCard(btn) {
     }
     renderSummaryChips(quotas);
   } catch (e) {
-    toast("刷新该渠道失败: " + e.message, "err");
+    toast(t("toast.refreshOneFailed", { msg: e.message }), "err");
   } finally {
     btn.disabled = false;
     btn.classList.remove("spinning");
@@ -831,10 +895,10 @@ async function onRefreshOneCard(btn) {
 /* 卡片上的编辑按钮：打开配置弹窗并直接进入该渠道的编辑模式。
    火山子渠道 id 带 _agent/_coding 后缀，需归一到真实 config id 再匹配 channels。 */
 function onEditCard(cardId) {
-  const baseId = canonicalChannelId(cardId);
+  const baseId = canonicalChannelId(cardId, channels);
   const ch = channels.find((c) => c.id === baseId);
   if (!ch) {
-    toast("未找到该渠道的配置信息", "err");
+    toast(t("toast.channelNotFound"), "err");
     return;
   }
   openConfigModal();
@@ -850,11 +914,11 @@ async function onToggleEnabled(el) {
   // + refreshQuotas 重绘前）另一张兄弟卡的开关还是旧状态——如果此时去点它，会基于
   // 错误的 UI 状态发起请求，产生语义混乱的 toggle 序列。这里把同源（归一后同一
   // config id）所有兄弟卡的开关一起锁住，直到全量重绘带回正确状态。
-  const baseId = canonicalChannelId(id);
+  const baseId = canonicalChannelId(id, channels);
   const peerSwitches = document.querySelectorAll(
     `.card[data-id] [data-action="toggle-enabled"]`
   );
-  const peers = [...peerSwitches].filter((s) => canonicalChannelId(s.dataset.id) === baseId);
+  const peers = [...peerSwitches].filter((s) => canonicalChannelId(s.dataset.id, channels) === baseId);
   for (const s of peers) s.disabled = true;
   try {
     const res = await fetch("/api/channels", {
@@ -866,7 +930,7 @@ async function onToggleEnabled(el) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.detail || `HTTP ${res.status}`);
     }
-    toast(nextEnabled ? "渠道已启用" : "渠道已停用", "ok");
+    toast(nextEnabled ? t("toast.channelEnabled") : t("toast.channelDisabled"), "ok");
     await loadChannels();
     await refreshQuotas(true);
   } catch (err) {
@@ -875,7 +939,7 @@ async function onToggleEnabled(el) {
       s.checked = !nextEnabled;
       s.disabled = false;
     }
-    toast("操作失败: " + err.message, "err");
+    toast(t("toast.toggleFailed", { msg: err.message }), "err");
   }
 }
 
@@ -899,23 +963,25 @@ function renderLocalUsage() {
 }
 
 function renderLocalSource(source, days) {
-  const t = source.totals || {};
+  const totals = source.totals || {};
   const fmtTokens = (n) => (n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "K" : String(n ?? 0));
   const modelStats = source.model_stats || [];
   const hasSessions = modelStats.some((m) => m.sessions !== undefined);
-  const countLabel = hasSessions ? "会话" : "assistant 消息";
+  const counts = [];
+  const countTypeLabel = hasSessions ? t("local.sessions") : t("local.messages");
+  const countLabel = t(hasSessions ? "local.daysSessions" : "local.daysMessages", { days: days ?? "-" });
 
   const stats = `
     <div class="local-stats">
-      <div class="local-stat"><div class="label">近 ${days ?? "-"} 天${countLabel}</div><div class="value">${hasSessions ? t.sessions ?? "-" : t.messages ?? "-"}</div></div>
-      <div class="local-stat"><div class="label">输入 tokens</div><div class="value">${fmtTokens(t.input ?? 0)}</div></div>
-      <div class="local-stat"><div class="label">输出 tokens</div><div class="value">${fmtTokens(t.output ?? 0)}</div></div>
-      <div class="local-stat"><div class="label">缓存读 tokens</div><div class="value">${fmtTokens(t.cache_read ?? 0)}</div></div>
-      <div class="local-stat"><div class="label">缓存写 tokens</div><div class="value">${fmtTokens(t.cache_write ?? 0)}</div></div>
-      ${t.has_cost ? `<div class="local-stat"><div class="label">估算费用</div><div class="value">$${(t.cost ?? 0).toFixed(2)}</div></div>` : ""}
+      <div class="local-stat"><div class="label">${countLabel}</div><div class="value">${hasSessions ? totals.sessions ?? "-" : totals.messages ?? "-"}</div></div>
+      <div class="local-stat"><div class="label">${t("local.inputTokens")}</div><div class="value">${fmtTokens(totals.input ?? 0)}</div></div>
+      <div class="local-stat"><div class="label">${t("local.outputTokens")}</div><div class="value">${fmtTokens(totals.output ?? 0)}</div></div>
+      <div class="local-stat"><div class="label">${t("local.cacheReadTokens")}</div><div class="value">${fmtTokens(totals.cache_read ?? 0)}</div></div>
+      <div class="local-stat"><div class="label">${t("local.cacheWriteTokens")}</div><div class="value">${fmtTokens(totals.cache_write ?? 0)}</div></div>
+      ${totals.has_cost ? `<div class="local-stat"><div class="label">${t("local.estimatedCost")}</div><div class="value">$${(totals.cost ?? 0).toFixed(2)}</div></div>` : ""}
     </div>`;
 
-  let table = `<div class="local-empty">暂无已完成的会话记录。</div>`;
+  let table = `<div class="local-empty">${t("local.noSessions")}</div>`;
   if (modelStats.length) {
     const rows = modelStats
       .map((m) => `
@@ -924,13 +990,13 @@ function renderLocalSource(source, days) {
           <td>${hasSessions ? m.sessions ?? 0 : m.messages ?? 0}</td>
           <td>${fmtTokens(m.input ?? 0)}</td>
           <td>${fmtTokens(m.output ?? 0)}</td>
-          ${t.has_cost ? `<td>$${(m.cost ?? 0).toFixed(2)}</td>` : ""}
+          ${totals.has_cost ? `<td>$${(m.cost ?? 0).toFixed(2)}</td>` : ""}
         </tr>`)
       .join("");
     table = `
       <div class="local-table-wrap">
         <table class="local-table">
-          <thead><tr><th>模型</th><th>${countLabel}</th><th>输入</th><th>输出</th>${t.has_cost ? "<th>费用</th>" : ""}</tr></thead>
+          <thead><tr><th>${t("local.model")}</th><th>${esc(countTypeLabel)}</th><th>${t("local.input")}</th><th>${t("local.output")}</th>${totals.has_cost ? `<th>${t("local.estimatedCost")}</th>` : ""}</tr></thead>
           <tbody>${rows}</tbody>
         </table>
       </div>`;
@@ -940,7 +1006,7 @@ function renderLocalSource(source, days) {
   return `
     <section class="local-section">
       <div class="section-head">
-        <h2><span class="section-dot local"></span>${esc(source.label || source.key || "本地统计")}</h2>
+        <h2><span class="section-dot local"></span>${esc(source.label || source.key || categoryLabel("local"))}</h2>
         <span class="section-note" title="${esc(note)}">${esc(note)}</span>
       </div>
       <div class="local-body">${stats}${table}</div>
@@ -954,7 +1020,12 @@ function openConfigModal() {
   renderTypeSelect();
   resetForm();
   renderChannelsList();
-  $("#channelCount").textContent = channels.length;
+  renderChannelCount();
+}
+
+function renderChannelCount() {
+  const el = $("#channelsCountLabel");
+  if (el) el.textContent = t("config.channelsCount", { count: channels.length });
 }
 
 function closeConfigModal() {
@@ -968,9 +1039,9 @@ function renderTypeSelect() {
       const opts = Object.entries(providersCatalog).filter(([, meta]) => meta.category === cat);
       if (!opts.length) return ""; // 该分类下没有任何 provider（如 local），不渲染空 optgroup
       const optsHtml = opts
-        .map(([id, meta]) => `<option value="${esc(id)}">${esc(meta.label)}</option>`)
+        .map(([id]) => `<option value="${esc(id)}">${esc(providerLabel(id))}</option>`)
         .join("");
-      return `<optgroup label="${esc(categories[cat] || cat)}">${optsHtml}</optgroup>`;
+      return `<optgroup label="${esc(categoryLabel(cat))}">${optsHtml}</optgroup>`;
     })
     .join("");
 }
@@ -987,11 +1058,11 @@ function renderDynamicFields(existing = null) {
     const maskedVal = existing && isSecret ? existing[key] : null;
     const placeholder = maskedVal || placeholderDefault;
     const hint = existing && isSecret
-      ? `<div class="field-hint">留空表示不修改${maskedVal ? "" : "（当前未设置）"}</div>`
+      ? `<div class="field-hint">${t("hint.secretKeep")}${maskedVal ? "" : t("hint.secretNotSet")}</div>`
       : "";
     // 密钥字段加一个显示/隐藏切换按钮（小眼睛），方便用户核对输入的长 API Key
     const toggle = isSecret
-      ? `<button type="button" class="pw-toggle" data-toggle="${key}" title="显示/隐藏" aria-label="显示或隐藏 ${esc(label)}" tabindex="-1">
+      ? `<button type="button" class="pw-toggle" data-toggle="${key}" title="${t("hint.showHide")}" aria-label="${t("hint.showHideAria", { label })}" tabindex="-1">
            <svg viewBox="0 0 24 24" class="icon"><path fill="currentColor" d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
          </button>`
       : "";
@@ -1019,33 +1090,33 @@ function renderDynamicFields(existing = null) {
   for (const f of meta.fields) {
     if (f === "api_key") {
       if (isMimo) {
-        fields += field("api_key", "Cookie", "登录 platform.xiaomimimo.com 后从浏览器复制完整 Cookie", true, "text");
+        fields += field("api_key", t("field.cookie"), t("field.mimoCookiePlaceholder"), true, "text");
       } else if (isOpenCode) {
-        fields += field("api_key", "Cookie", "登录 opencode.ai 后从浏览器复制完整 Cookie", true, "text");
+        fields += field("api_key", t("field.cookie"), t("field.opencodeCookiePlaceholder"), true, "text");
       } else {
-        fields += field("api_key", "API Key", "sk-...");
+        fields += field("api_key", t("field.apiKey"), t("field.apiKeyPlaceholder"));
       }
     }
-    else if (f === "workspace_id") fields += field("workspace_id", "工作区 ID", "wrk_xxx（opencode.ai 地址栏取）", false, "text");
-    else if (f === "base_url") fields += field("base_url", "Base URL", "https://...", true, "text");
-    else if (f === "ak") fields += field("ak", "AccessKey ID", "在火山 IAM 控制台创建（见下方提示）", false, "text");
-    else if (f === "sk") fields += field("sk", "Secret AccessKey", "在火山 IAM 控制台创建（见下方提示）");
-    else if (f === "region") fields += field("region", "Region（默认 cn-beijing）", "cn-beijing", false, "text");
-    else if (f === "organization") fields += field("organization", "组织 ID（可选）", "", false, "text");
-    else if (f === "project") fields += field("project", "项目 ID（可选）", "", false, "text");
+    else if (f === "workspace_id") fields += field("workspace_id", t("field.workspaceId"), t("field.workspaceIdPlaceholder"), false, "text");
+    else if (f === "base_url") fields += field("base_url", t("field.baseUrl"), t("field.baseUrlPlaceholder"), true, "text");
+    else if (f === "ak") fields += field("ak", t("field.ak"), t("field.akPlaceholder"), false, "text");
+    else if (f === "sk") fields += field("sk", t("field.sk"), t("field.skPlaceholder"));
+    else if (f === "region") fields += field("region", t("field.region"), t("field.regionPlaceholder"), false, "text");
+    else if (f === "organization") fields += field("organization", t("field.organization"), "", false, "text");
+    else if (f === "project") fields += field("project", t("field.project"), "", false, "text");
   }
 
   const hint = isMimo
-    ? "MiMo 用量查询需要小米账号登录后的 Cookie（不是 API Key）。请登录 platform.xiaomimimo.com，从浏览器开发者工具复制完整 Cookie 填入。Cookie 只保存在本地 config.json（权限 600），仅用于只读查询。"
+    ? t("hint.mimo")
     : isOpenCode
-      ? "OpenCode 官网没有 JSON API，额度数据内嵌在登录后的网页里。只需登录 opencode.ai 后从浏览器复制完整 Cookie 填入即可——工作区 ID 会自动探测。Cookie 只保存在本地 config.json（权限 600），仅用于只读查询。"
+      ? t("hint.opencode")
       : isVolcengine
-        ? "Access Key 请在火山引擎控制台创建：https://console.volcengine.com/iam/keymanage（AK/SK 只保存在本地 config.json（权限 600），仅用于只读查询）。"
+        ? t("hint.volcengine")
         : meta.category === "subscription"
-          ? "订阅类渠道无需填写密钥：自动读取本机 CLI 的登录凭据（只读，不刷新不写入）。"
+          ? t("hint.subscription")
           : meta.category === "local"
-            ? "本地统计无需任何密钥，直接读取本地数据库。"
-            : "密钥只保存在本地 config.json（权限 600），仅用于查询余额。";
+            ? t("hint.local")
+            : t("hint.balance");
 
   // Codex 渠道：OAuth 在线登录（推荐）+ 可选上传 auth.json（多账号）。
   // OAuth 按钮：点一下打开 ChatGPT 登录页，授权后自动建/关联渠道，最省事。
@@ -1053,28 +1124,28 @@ function renderDynamicFields(existing = null) {
   let codexAuth = "";
   if (type === "codex_subscription") {
     const cur = existing?.extra?.codex_auth_file
-      ? `当前使用已上传凭据（${esc(existing.extra.codex_auth_file)}）`
-      : "当前使用本机 Codex CLI 登录（~/.codex/auth.json）";
+      ? t("codex.currentUploaded", { file: existing.extra.codex_auth_file })
+      : t("codex.currentLocal");
     codexAuth = `
       <div class="field-full oauth-section">
-        <label>ChatGPT 登录（OAuth）</label>
+        <label>${t("codex.oauthLogin")}</label>
         <button type="button" class="btn btn-oauth" id="btnCodexOauth">
           <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12c0 4.42 2.87 8.17 6.84 9.5.5.08.66-.23.66-.5v-1.69c-2.77.6-3.36-1.34-3.36-1.34-.46-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.87 1.52 2.34 1.07 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.92 0-1.11.38-2 1.03-2.71-.1-.25-.45-1.29.1-2.64 0 0 .84-.27 2.75 1.02.79-.22 1.65-.33 2.5-.33.85 0 1.71.11 2.5.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.35.2 2.39.1 2.64.65.71 1.03 1.6 1.03 2.71 0 3.82-2.34 4.66-4.57 4.91.36.31.69.92.69 1.85V21c0 .27.16.59.67.5C19.14 20.16 22 16.42 22 12A10 10 0 0 0 12 2z"/></svg>
-          <span>通过 ChatGPT 登录</span>
+          <span>${t("codex.oauthBtn")}</span>
         </button>
-        <div class="field-hint">点此在新窗口用 ChatGPT 账号授权，授权完成后自动创建/关联 Codex 渠道（OAuth token 仅存本地，权限 600）。</div>
+        <div class="field-hint">${t("codex.oauthHint")}</div>
       </div>
       <div class="field-full">
-        <label for="fCodexAuth">auth.json（可选，多账号）</label>
+        <label for="fCodexAuth">${t("codex.authJson")}</label>
         <div class="file-upload">
           <input type="file" id="fCodexAuth" accept=".json,application/json">
           <button type="button" class="file-upload-btn">
             <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
-            <span>选择文件</span>
+            <span>${t("codex.chooseFile")}</span>
           </button>
-          <span class="file-upload-name" id="fCodexAuthName">未选择文件</span>
+          <span class="file-upload-name" id="fCodexAuthName">${t("codex.noFile")}</span>
         </div>
-        <div class="field-hint">${cur}。选择一个 auth.json 后保存渠道即上传并关联（可添加多个 Codex 渠道各配一份凭据）；留空则不变。</div>
+        <div class="field-hint">${t("codex.authJsonHint", { current: cur })}</div>
       </div>`;
   }
 
@@ -1086,7 +1157,7 @@ function renderDynamicFields(existing = null) {
     codexInput.addEventListener("change", () => {
       const nameEl = $("#fCodexAuthName");
       if (nameEl) {
-        nameEl.textContent = codexInput.files?.[0]?.name || "未选择文件";
+        nameEl.textContent = codexInput.files?.[0]?.name || t("codex.noFile");
         nameEl.classList.toggle("is-set", !!codexInput.files?.[0]);
       }
     });
@@ -1106,7 +1177,7 @@ function resetForm() {
   renderTypeSelect();
   $("#fType").value = "deepseek";
   renderDynamicFields();
-  $("#btnFormSave").textContent = "保存渠道";
+  $("#btnFormSave").textContent = t("config.save");
   $("#btnFormReset").classList.add("hidden");
 }
 
@@ -1118,7 +1189,7 @@ function resetForm() {
 async function startCodexOAuth(btn) {
   const originalHtml = btn.innerHTML;
   btn.disabled = true;
-  btn.innerHTML = `<span class="oauth-spinner"></span><span>正在准备授权…</span>`;
+  btn.innerHTML = `<span class="oauth-spinner"></span><span>${t("codex.oauthPreparing")}</span>`;
   try {
     const res = await fetch("/api/auth/codex/start", { method: "POST" });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
@@ -1128,14 +1199,14 @@ async function startCodexOAuth(btn) {
     const popup = window.open(authorize_url, "codex_oauth", "width=560,height=720");
     if (!popup) {
       // 浏览器拦截了弹窗——降级为当前页跳转，并在新标签完成
-      toast("弹窗被拦截，已在新标签打开授权页", "err");
+      toast(t("codex.popupBlocked"), "err");
       window.location.href = authorize_url;
       btn.disabled = false;
       btn.innerHTML = originalHtml;
       return;
     }
 
-    btn.innerHTML = `<span class="oauth-spinner"></span><span>等待授权完成…</span>`;
+    btn.innerHTML = `<span class="oauth-spinner"></span><span>${t("codex.oauthWaiting")}</span>`;
     // 轮询结果（最长 5 分钟，每 2 秒一次）
     const deadline = Date.now() + 5 * 60 * 1000;
     let result = null;
@@ -1151,19 +1222,19 @@ async function startCodexOAuth(btn) {
     }
 
     if (!result) {
-      toast("授权超时（5 分钟内未完成），请重试", "err");
+      toast(t("codex.oauthTimeout"), "err");
     } else if (result.status === "ok") {
       const email = result.email ? `（${result.email}）` : "";
-      toast(`ChatGPT 授权成功，已添加 Codex 渠道${email}`, "ok");
+      toast(t("codex.oauthSuccess", { email }), "ok");
       try { popup.close(); } catch { /* 窗口可能已关 */ }
       resetForm();
       await loadChannels();
       await refreshQuotas(true);
     } else {
-      toast("授权失败: " + (result.message || "未知错误"), "err");
+      toast(t("codex.oauthFailed") + ": " + (result.message || t("card.noData")), "err");
     }
   } catch (err) {
-    toast("发起授权失败: " + err.message, "err");
+    toast(t("toast.saveFailed", { msg: err.message }), "err");
   } finally {
     btn.disabled = false;
     btn.innerHTML = originalHtml;
@@ -1184,7 +1255,7 @@ function fillForm(ch) {
   set("organization", ch.organization || "");
   set("project", ch.project || "");
   set("workspace_id", ch.workspace_id || "");
-  $("#btnFormSave").textContent = "更新渠道";
+  $("#btnFormSave").textContent = t("config.update");
   $("#btnFormReset").classList.remove("hidden");
   // modal 本身是覆盖层（可滚动），滚 window 没有意义；把表单滚动到可见区域顶部
   $("#channelForm").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1206,20 +1277,27 @@ async function onSaveChannel(e) {
     payload[f] = read(f);
   }
 
-  const fieldLabel = (r) => (r === "api_key" ? (isOpenCode ? "Cookie" : "API Key") : r === "ak" ? "AccessKey ID" : r === "sk" ? "Secret" : r === "base_url" ? "Base URL" : r === "workspace_id" ? "工作区 ID" : r);
+  const fieldLabel = (r) => {
+    if (r === "api_key") return isOpenCode ? t("field.cookie") : t("field.apiKey");
+    if (r === "ak") return t("field.ak");
+    if (r === "sk") return t("field.sk");
+    if (r === "base_url") return t("field.baseUrl");
+    if (r === "workspace_id") return t("field.workspaceId");
+    return r;
+  };
 
   // base_url 始终必填；密钥类字段（api_key/ak/sk）只在"新建"时必填。
   // workspace_id 已改为自动探测，不再是必填字段。
   for (const r of ["base_url"]) {
     if (meta.fields.includes(r) && !payload[r]) {
-      toast(`请填写 ${fieldLabel(r)}`, "err");
+      toast(t("toast.fillRequired", { field: fieldLabel(r) }), "err");
       return;
     }
   }
   if (!editingId) {
     for (const r of SECRET_FIELDS) {
       if (meta.fields.includes(r) && !payload[r]) {
-        toast(`请填写 ${fieldLabel(r)}`, "err");
+        toast(t("toast.fillRequired", { field: fieldLabel(r) }), "err");
         return;
       }
     }
@@ -1259,46 +1337,46 @@ async function onSaveChannel(e) {
           const err = await upRes.json().catch(() => ({}));
           throw new Error(err.detail || `HTTP ${upRes.status}`);
         }
-        toast("Codex 凭据已上传", "ok");
+        toast(t("codex.credentialsUploaded"), "ok");
       } catch (err) {
         uploadErr = err.message;
       }
     }
 
-    toast(editingId ? "渠道已更新" : "渠道已添加", "ok");
-    if (uploadErr) toast("渠道已保存，但凭据上传失败: " + uploadErr, "err");
+    toast(editingId ? t("toast.channelUpdated") : t("toast.channelSaved"), "ok");
+    if (uploadErr) toast(t("toast.uploadCredentialsFailed", { msg: uploadErr }), "err");
     resetForm();
     await loadChannels();
     await refreshQuotas(true);
   } catch (err) {
-    toast("保存失败: " + err.message, "err");
+    toast(t("toast.saveFailed", { msg: err.message }), "err");
   }
 }
 
 function renderChannelsList() {
   const container = $("#channelsList");
   if (!channels.length) {
-    container.innerHTML = `<div class="local-empty">尚未配置渠道，从上方表单添加。</div>`;
+    container.innerHTML = `<div class="local-empty">${t("config.noChannelsYet")}</div>`;
     return;
   }
   container.innerHTML = channels
     .map((ch) => {
       const meta = PROVIDER_META[ch.type] || FALLBACK_META;
       // Codex 渠道若上传过 auth.json，来源显示上传的凭据文件
-      const key = ch.api_key || ch.ak || (ch.type === "codex_subscription" && ch.extra?.codex_auth_file ? "已上传凭据" : "自动读取");
+      const key = ch.api_key || ch.ak || (ch.type === "codex_subscription" && ch.extra?.codex_auth_file ? t("config.uploadedCredentials") : t("config.autoRead"));
       return `
         <div class="channel-row">
           ${iconTile(meta, "sm")}
           <div class="row-name">
-            <div class="t">${esc(ch.name)} ${ch.enabled ? "" : '<span class="status-tag disabled">停用</span>'}</div>
-            <div class="ty">${esc(providersCatalog[ch.type]?.label || ch.type)}</div>
+            <div class="t">${esc(ch.name)} ${ch.enabled ? "" : `<span class="status-tag disabled">${t("status.disabled")}</span>`}</div>
+            <div class="ty">${esc(providerLabel(ch.type))}</div>
           </div>
           <span class="row-key">${esc(key)}</span>
           <div class="row-actions">
-            <button type="button" class="btn-icon" title="编辑" data-action="edit-channel" data-id="${esc(ch.id)}">
+            <button type="button" class="btn-icon" title="${t("config.editHint")}" data-action="edit-channel" data-id="${esc(ch.id)}">
               <svg viewBox="0 0 24 24" class="icon" style="width:15px;height:15px"><path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
             </button>
-            <button type="button" class="btn-icon" title="删除" data-action="delete-channel" data-id="${esc(ch.id)}" style="color:var(--red)">
+            <button type="button" class="btn-icon" title="${t("config.deleteHint")}" data-action="delete-channel" data-id="${esc(ch.id)}" style="color:var(--red)">
               <svg viewBox="0 0 24 24" class="icon" style="width:15px;height:15px"><path fill="currentColor" d="M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
             </button>
           </div>
@@ -1309,15 +1387,15 @@ function renderChannelsList() {
 
 async function deleteChannel(id) {
   const ch = channels.find((c) => c.id === id);
-  if (!confirm(`确定删除渠道「${ch?.name || id}」？`)) return;
+  if (!confirm(t("toast.deleteConfirm", { name: ch?.name || id }))) return;
   try {
     const res = await fetch(`/api/channels/${id}`, { method: "DELETE" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    toast("渠道已删除", "ok");
+    toast(t("toast.channelDeleted"), "ok");
     await loadChannels();
     await refreshQuotas(true);
   } catch (e) {
-    toast("删除失败: " + e.message, "err");
+    toast(t("toast.deleteFailed", { msg: e.message }), "err");
   }
 }
 
@@ -1327,9 +1405,9 @@ function fmtTime(ms) {
   const d = new Date(ms);
   const now = Date.now();
   const diff = now - ms;
-  if (diff < 60_000) return "刚刚";
-  if (diff < 3600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
-  return d.toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" });
+  if (diff < 60_000) return t("time.justNow");
+  if (diff < 3600_000) return t("time.minutesAgo", { n: Math.floor(diff / 60_000) });
+  return d.toLocaleTimeString(getLang() === "zh-CN" ? "zh-CN" : "en-US", { hour12: false, hour: "2-digit", minute: "2-digit" });
 }
 
 function esc(s) {
@@ -1362,12 +1440,47 @@ function toast(message, kind = "info") {
 /* ── 主题三选 ─────────────────────────────────────────── */
 
 function applyStoredTheme() {
-  const theme = loadPrefs().theme || "auto";
+  const theme = loadPrefs().theme || "light"; // 默认浅色
   let dark;
   if (theme === "light") dark = false;
   else if (theme === "dark") dark = true;
   else dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
   document.documentElement.classList.toggle("dark", dark);
+}
+
+/* ── 语言切换响应 ─────────────────────────────────────── */
+
+function setupLangReactivity() {
+  // 点击语言按钮只切换存储与 <html lang>，重绘由 applyLang 统一执行，
+  // 避免这里与 usage.js 分别派发同名事件造成重复监听（见下方注释）。
+  window.addEventListener("quotax:lang-change", () => applyLang());
+}
+
+function applyLang() {
+  document.documentElement.lang = getLang() === "zh-CN" ? "zh-CN" : "en";
+  applyStaticI18n();
+  // 重绘所有动态内容
+  renderSummaryChips(quotas);
+  if (dashboardLoadedOnce) renderDashboard();
+  renderLocalUsage();
+  // 打开的弹窗同步重绘
+  if (!$("#settingsModal").classList.contains("hidden")) openSettingsModal();
+  if (!$("#configModal").classList.contains("hidden")) {
+    renderTypeSelect();
+    renderChannelsList();
+    renderChannelCount();
+    // 正在编辑时动态字段需要按当前语言重绘
+    if (editingId) {
+      const ch = channels.find((c) => c.id === editingId);
+      if (ch) fillForm(ch);
+    }
+  }
+  if (!$("#historyModal").classList.contains("hidden")) {
+    openHistoryModal();
+    loadHistory();
+  }
+  // 通知用量视图重绘（usage.js 监听同一个 window 事件）
+  document.dispatchEvent(new CustomEvent("quotax:usage-lang-change"));
 }
 
 /* ── 设置弹窗 ─────────────────────────────────────────── */
@@ -1384,9 +1497,9 @@ function closeSettingsModal() {
 }
 
 function renderThemeOptions() {
-  const current = loadPrefs().theme || "auto";
+  const current = loadPrefs().theme || "light";
   $("#themeOptions").innerHTML = THEME_OPTIONS.map(
-    (o) => `<button type="button" class="seg-btn${o.value === current ? " active" : ""}" data-theme-val="${o.value}">${o.label}</button>`
+    (o) => `<button type="button" class="seg-btn${o.value === current ? " active" : ""}" data-theme-val="${o.value}">${t(o.labelKey)}</button>`
   ).join("");
   $("#themeOptions").querySelectorAll("[data-theme-val]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -1406,7 +1519,7 @@ function renderRefreshOptions() {
   const autoOn = $("#autoRefresh").checked;
   $("#refreshOptions").innerHTML =
     REFRESH_INTERVALS.map(
-      (o) => `<button type="button" class="seg-btn${o.value === current ? " active" : ""}${!autoOn && o.value > 0 ? " dim" : ""}" data-refresh-val="${o.value}">${o.label}</button>`
+      (o) => `<button type="button" class="seg-btn${o.value === current ? " active" : ""}${!autoOn && o.value > 0 ? " dim" : ""}" data-refresh-val="${o.value}">${t(o.labelKey)}</button>`
     ).join("");
   $("#refreshOptions").querySelectorAll("[data-refresh-val]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -1446,7 +1559,7 @@ function setThreshold(channelId, value) {
 function renderThresholdList() {
   const container = $("#thresholdList");
   if (!channels.length) {
-    container.innerHTML = `<div class="local-empty">尚未配置渠道。先添加渠道后再设置阈值。</div>`;
+    container.innerHTML = `<div class="local-empty">${t("settings.noChannelsForThreshold")}</div>`;
     return;
   }
   const thresholds = getThresholds();
@@ -1459,12 +1572,12 @@ function renderThresholdList() {
           ${iconTile(meta, "", "width:28px;height:28px;font-size:11px")}
           <div class="threshold-name">
             <div class="t">${esc(ch.name)}</div>
-            <div class="ty">${esc(providersCatalog[ch.type]?.label || ch.type)}</div>
+            <div class="ty">${esc(providerLabel(ch.type))}</div>
           </div>
           <div class="threshold-input-wrap">
-            <span class="threshold-suffix">剩余 &lt;</span>
+            <span class="threshold-suffix">${t("settings.thresholdSuffix")}</span>
             <input type="number" min="0" max="100" placeholder="${DEFAULT_THRESHOLD}" value="${val}" data-threshold-id="${esc(ch.id)}">
-            <span class="threshold-suffix">% 告警</span>
+            <span class="threshold-suffix">${t("settings.thresholdAlert")}</span>
           </div>
         </div>`;
     })
@@ -1498,9 +1611,9 @@ async function exportConfig(includeSecrets) {
     const tag = includeSecrets ? "full" : "safe";
     const date = new Date().toISOString().slice(0, 10);
     _downloadJSON(data, `quotax-${tag}-${date}.json`);
-    toast(includeSecrets ? "已导出含密钥的完整配置（请妥善保管）" : "已导出脱敏配置（不含密钥，可分享）", "ok");
+    toast(includeSecrets ? t("toast.exportFull") : t("toast.exportSafe"), "ok");
   } catch (e) {
-    toast("导出失败: " + e.message, "err");
+    toast(t("toast.exportFailed", { msg: e.message }), "err");
   }
 }
 
@@ -1512,19 +1625,19 @@ async function onImportFileSelected(e) {
   try {
     data = JSON.parse(await file.text());
   } catch (err) {
-    toast("文件不是合法的 JSON: " + err.message, "err");
+    toast(t("toast.importInvalidJson", { msg: err.message }), "err");
     return;
   }
   const mode = confirm(
-    "选择导入方式：\n\n" +
-      "• 确定 = 合并导入（追加到现有配置，同 id 覆盖）\n" +
-      "• 取消 = 替换导入（清空现有全部渠道后替换）\n\n" +
-      "合并模式更安全，推荐。"
+    t("toast.importModeTitle") + "\n\n" +
+      t("toast.importModeMerge") + "\n" +
+      t("toast.importModeReplace") + "\n\n" +
+      t("toast.importModeRecommend")
   )
     ? "merge"
     : "replace";
   if (mode === "replace") {
-    if (!confirm("替换模式会清空当前全部渠道，确定继续？")) return;
+    if (!confirm(t("toast.importReplaceConfirm"))) return;
   }
   try {
     const res = await fetch("/api/config/import?mode=" + mode, {
@@ -1537,12 +1650,12 @@ async function onImportFileSelected(e) {
       throw new Error(err.detail || `HTTP ${res.status}`);
     }
     const result = await res.json();
-    toast(`导入成功（${mode === "merge" ? "合并" : "替换"}），当前共 ${result.count} 个渠道`, "ok");
+    toast(t("toast.importSuccess", { mode: mode === "merge" ? t("toast.modeMerge") : t("toast.modeReplace"), count: result.count }), "ok");
     await loadChannels();
     await refreshQuotas(true);
     closeConfigModal();
   } catch (err) {
-    toast("导入失败: " + err.message, "err");
+    toast(t("toast.importFailed", { msg: err.message }), "err");
   }
 }
 
@@ -1555,7 +1668,7 @@ function openHistoryModal() {
   // 渠道下拉用当前已配置的渠道填充
   const sel = $("#historyChannel");
   const current = sel.value;
-  sel.innerHTML = `<option value="">全部渠道</option>` +
+  sel.innerHTML = `<option value="">${t("history.allChannels")}</option>` +
     channels
       .map((ch) => `<option value="${esc(ch.id)}">${esc(ch.name)}</option>`)
       .join("");
@@ -1571,7 +1684,7 @@ async function loadHistory() {
   const days = $("#historyDays").value;
   const cid = $("#historyChannel").value;
   const container = $("#historyContent");
-  container.innerHTML = `<div class="history-loading">加载中…</div>`;
+  container.innerHTML = `<div class="history-loading">${t("history.loading")}</div>`;
   try {
     const url = `/api/history?days=${days}${cid ? `&ids=${encodeURIComponent(cid)}` : ""}`;
     const res = await fetch(url);
@@ -1579,7 +1692,7 @@ async function loadHistory() {
     historyCache = await res.json();
     renderHistory(historyCache, Number(days));
   } catch (e) {
-    container.innerHTML = `<div class="empty-state error-state"><div class="empty-icon">⚠️</div><p>加载趋势失败: ${esc(e.message)}</p></div>`;
+    container.innerHTML = `<div class="empty-state error-state"><div class="empty-icon">⚠️</div><p>${t("history.loadFailed", { msg: e.message })}</p></div>`;
   }
 }
 
@@ -1590,8 +1703,8 @@ function renderHistory(data, days) {
     container.innerHTML = `
       <div class="empty-state">
         <div class="empty-icon">📈</div>
-        <h3>暂无趋势数据</h3>
-        <p>每次成功的额度查询会自动记录一条趋势点。继续使用一段时间后这里会出现折线图。</p>
+        <h3>${t("history.noDataTitle")}</h3>
+        <p>${t("history.noDataDesc")}</p>
       </div>`;
     return;
   }
@@ -1607,7 +1720,7 @@ function renderHistoryChart(channelId, records, days) {
   const meta = PROVIDER_META[ch?.type] || FALLBACK_META;
 
   if (!records.length) {
-    return `<div class="history-card empty"><div class="history-head">${iconTile(meta, "sm")}<span>${esc(name)}</span></div><div class="history-empty">该渠道在所选范围内无记录。</div></div>`;
+    return `<div class="history-card empty"><div class="history-head">${iconTile(meta, "sm")}<span>${esc(name)}</span></div><div class="history-empty">${t("history.noRecords")}</div></div>`;
   }
 
   // 提取所有窗口 key，每个 key 画一条折线（剩余百分比）
@@ -1623,7 +1736,7 @@ function renderHistoryChart(channelId, records, days) {
   const series = [];
   if (hasAmount) {
     series.push({
-      label: "余额",
+      label: t("history.amount"),
       points: records
         .filter((r) => r.amount && typeof r.amount.value === "number")
         .map((r) => [r.ts, r.amount.value]),
@@ -1643,7 +1756,7 @@ function renderHistoryChart(channelId, records, days) {
   }
 
   if (!series.length) {
-    return `<div class="history-card"><div class="history-head">${iconTile(meta, "sm")}<span>${esc(name)}</span></div><div class="history-empty">该渠道的趋势记录无可绘制的数值字段。</div></div>`;
+    return `<div class="history-card"><div class="history-head">${iconTile(meta, "sm")}<span>${esc(name)}</span></div><div class="history-empty">${t("history.noDrawable")}</div></div>`;
   }
 
   return `<div class="history-card">

@@ -83,6 +83,7 @@ class ClaudeParser(BaseParser):
 
         offset = cursor.get("last_line_offset", 0) if cursor else 0
         records: list[NormalizedRecord] = []
+        truncated = False
 
         with file_path.open("r", encoding="utf-8", errors="replace") as f:
             if offset > 0:
@@ -94,9 +95,10 @@ class ClaudeParser(BaseParser):
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
-                    # 末尾半行：文件正被 Claude Code 并发写入。游标回退到这行起点，
-                    # 下次重试。这里不 advance offset。
+                    # 末尾半行：文件正被 Claude Code 并发写入。保留旧游标，
+                    # 等下次 mtime 变化时从当前行起点重新读取完整行。
                     result.lines_skipped += 1
+                    truncated = True
                     break
                 if not isinstance(entry, dict) or entry.get("type") != "assistant":
                     continue
@@ -133,8 +135,8 @@ class ClaudeParser(BaseParser):
                         stop_reason=message.get("stop_reason"),
                     )
                 )
-            # 游标推进到文件末尾（已成功读完所有完整行）
-            new_offset = f.tell()
+            # 只有完整读完所有行才推进游标；遇到截断行时保留旧游标
+            new_offset = offset if truncated else f.tell()
 
         store.set_cursor(
             self.source,

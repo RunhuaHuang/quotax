@@ -60,7 +60,7 @@ describe("normalizeThreeWindows", () => {
     assert.strictEqual(result[0], windows[0]); // five_hour 原样
     assert.strictEqual(result[1], windows[1]); // 第一条 weekly（Opus）占据标准槽位
     assert.equal(result[2].key, "monthly");
-    assert.equal(result[2].max_label, "未提供"); // 月额度确实没有，补占位
+    assert.equal(result[2].maxLabelKey, "tier.not_provided"); // 月额度确实没有，补占位
     assert.strictEqual(result[3], windows[2]); // 第二条 weekly（Sonnet）之前被 find() 吃掉，现在追加保留
   });
 
@@ -75,7 +75,7 @@ describe("normalizeThreeWindows", () => {
     assert.strictEqual(result[0], windows[0]);
     assert.strictEqual(result[1], windows[1]);
     assert.equal(result[2].key, "monthly");
-    assert.equal(result[2].max_label, "未提供");
+    assert.equal(result[2].maxLabelKey, "tier.not_provided");
     assert.strictEqual(result[3], windows[2]);
   });
 
@@ -85,9 +85,9 @@ describe("normalizeThreeWindows", () => {
     assert.equal(result.length, 3);
     assert.strictEqual(result[0], windows[0]);
     assert.equal(result[1].key, "weekly");
-    assert.equal(result[1].max_label, "未提供");
+    assert.equal(result[1].maxLabelKey, "tier.not_provided");
     assert.equal(result[2].key, "monthly");
-    assert.equal(result[2].max_label, "未提供");
+    assert.equal(result[2].maxLabelKey, "tier.not_provided");
   });
 
   test("火山 agent_/coding_ 分组：每组各自补齐三档，组内额外窗口不丢", () => {
@@ -105,11 +105,11 @@ describe("normalizeThreeWindows", () => {
     assert.strictEqual(result[0], windows[0]); // agent_five_hour
     assert.strictEqual(result[1], windows[1]); // agent_weekly
     assert.equal(result[2].key, "agent_monthly");
-    assert.equal(result[2].max_label, "未提供");
+    assert.equal(result[2].maxLabelKey, "tier.not_provided");
     assert.strictEqual(result[3], windows[2]); // agent 组内额外窗口，不属于三档，追加不丢
     assert.strictEqual(result[4], windows[3]); // coding_five_hour
     assert.equal(result[5].key, "coding_weekly");
-    assert.equal(result[5].max_label, "未提供");
+    assert.equal(result[5].maxLabelKey, "tier.not_provided");
     assert.strictEqual(result[6], windows[4]); // coding_monthly
   });
 
@@ -125,9 +125,9 @@ describe("normalizeThreeWindows", () => {
     assert.strictEqual(result[0], windows[0]); // agent_custom_extra 原样，前面没有被硬塞 3 条占位
     assert.strictEqual(result[1], windows[1]); // coding_five_hour 真实数据
     assert.equal(result[2].key, "coding_weekly");
-    assert.equal(result[2].max_label, "未提供");
+    assert.equal(result[2].maxLabelKey, "tier.not_provided");
     assert.equal(result[3].key, "coding_monthly");
-    assert.equal(result[3].max_label, "未提供");
+    assert.equal(result[3].maxLabelKey, "tier.not_provided");
   });
 });
 
@@ -178,11 +178,11 @@ describe("noPercentData", () => {
 });
 
 describe("fmtReset", () => {
-  test("按不同时间跨度展示对应文案（传入固定 now，避免真实时钟流逝导致偶发抖动）", () => {
+  test("按不同时间跨度返回对应 i18n key 与值（传入固定 now，避免真实时钟流逝导致偶发抖动）", () => {
     const now = Date.parse("2026-08-04T00:00:00Z");
-    assert.equal(fmtReset(now - 1000, now), "已重置");
-    assert.equal(fmtReset(now + 30 * 60 * 1000, now), "30 分钟后");
-    assert.equal(fmtReset(now + 5 * 3600 * 1000, now), "5 小时后");
-    assert.equal(fmtReset(now + 3 * 86400 * 1000, now), "3 天后");
+    assert.deepEqual(fmtReset(now - 1000, now), { key: "reset.now" });
+    assert.deepEqual(fmtReset(now + 30 * 60 * 1000, now), { key: "reset.minutes", value: 30 });
+    assert.deepEqual(fmtReset(now + 5 * 3600 * 1000, now), { key: "reset.hours", value: 5 });
+    assert.deepEqual(fmtReset(now + 3 * 86400 * 1000, now), { key: "reset.days", value: 3 });
   });
 });

@@ -56,14 +56,16 @@ async def query_kimi_coding(channel: Channel) -> ChannelResult:
     windows = []
     usage = data.get("usage") or {}
     if isinstance(usage, dict):
-        remaining = float(usage.get("remaining") or 0)
-        used = float(usage.get("used") or (100 - remaining))
+        remaining_raw = usage.get("remaining")
+        remaining = float(remaining_raw) if remaining_raw is not None else 0.0
+        used_raw = usage.get("used")
+        used = float(used_raw) if used_raw is not None else max(0.0, 100 - remaining)
         windows.append(
             window(
                 "weekly",
                 "每周额度",
                 used_percent=used,
-                remaining_percent=100 - used,
+                remaining_percent=max(0.0, 100 - used),
                 reset_at=to_ts(usage.get("resetTime")),
             )
         )
@@ -72,8 +74,10 @@ async def query_kimi_coding(channel: Channel) -> ChannelResult:
         detail = item.get("detail") or {}
         if not isinstance(detail, dict):
             continue
-        remaining = float(detail.get("remaining") or 0)
-        used = float(detail.get("used") or (100 - remaining))
+        remaining_raw = detail.get("remaining")
+        remaining = float(remaining_raw) if remaining_raw is not None else 0.0
+        used_raw = detail.get("used")
+        used = float(used_raw) if used_raw is not None else max(0.0, 100 - remaining)
         if remaining <= 1 and used <= 1:
             # 兼容绝对额度（limit/remaining 是请求数而非百分比）
             limit = float(detail.get("limit") or 0)
@@ -329,12 +333,11 @@ async def query_zenmux(channel: Channel) -> ChannelResult:
         item = info.get(key)
         if not isinstance(item, dict):
             continue
-        # usage_percentage 形如 0.123（0-1 小数比例，见 ZenMux 文档示例）。
-        # 上游偶发返回 >1 的脏值（已观察到 1.0~100 的异常情况）——直接 ×100 会
-        # 把 50 这种"其实代表 50%"的值放大成 5000%，整张卡的 remaining 被算成负数。
-        # 这里用 _clamp 兜底：无论上游传 0-1、0-100 还是脏值，都归一到 0-100 的合法百分比。
-        raw_pct = float(item.get("usage_percentage") or 0) * 100
-        used_pct = _clamp(raw_pct)
+        # usage_percentage 可能传 0-1 小数比例，也可能直接传 0-100 的整数百分比。
+        # 上游偶发返回 >100 的脏值——这里用 _clamp 兜底归一；同时按 raw 值大小
+        # 判断口径：≤1 视为小数比例（×100），>1 视为直接百分比，避免把 50 当成 50%。
+        raw = float(item.get("usage_percentage") or 0)
+        used_pct = _clamp(raw * 100 if raw <= 1 else raw)
         used_usd = item.get("used_value_usd")
         max_usd = item.get("max_value_usd")
         windows.append(

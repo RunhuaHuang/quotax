@@ -9,9 +9,9 @@
    这个产品意图本身是对的，之前的 bug 出在补齐的同时把补不齐三档的真实数据
    也一起丢了（见下面 fillGroup 的注释）。 */
 const TIER_DEFS = [
-  { key: "five_hour", label: "每 5 小时" },
-  { key: "weekly", label: "每周额度" },
-  { key: "monthly", label: "每月额度" },
+  { key: "five_hour", labelKey: "tier.five_hour" },
+  { key: "weekly", labelKey: "tier.weekly" },
+  { key: "monthly", labelKey: "tier.monthly" },
 ];
 
 /* 补齐一组窗口的三个标准档位，缺的补 max_label:"未提供" 占位；三档消费不掉的
@@ -35,12 +35,13 @@ function fillGroup(groupWindows, prefix = "") {
       consumed.add(existing);
       return existing;
     }
+    const group = prefix === "agent_" ? "agent" : prefix === "coding_" ? "coding" : null;
     return {
       key: fullKey,
-      label: prefix ? `${prefix === "agent_" ? "Agent " : "Coding "}${def.label}` : def.label,
+      labelKey: group ? `tier.${group}.${def.key}` : def.labelKey,
       used_percent: null,
       remaining_percent: null,
-      max_label: "未提供",
+      maxLabelKey: "tier.not_provided",
     };
   });
 
@@ -94,9 +95,32 @@ export function normalizeThreeWindows(windows) {
    原始 config id 存取。凡是要拿"卡片 id"去查"配置 id 维度"数据的地方（编辑
    弹窗回填、低余额阈值查找）都必须先归一化，否则两边 key 永远对不上、功能
    悄悄失效却不报错。这是后端 app/main.py 里 _canonical_channel_id 的前端
-   镜像——前后端目前没有共享代码的机制，只能两边各维护一份同样的逻辑。 */
-export function canonicalChannelId(id) {
-  return String(id ?? "").replace(/_(agent|coding)$/, "");
+   镜像——前后端目前没有共享代码的机制，只能两边各维护一份同样的逻辑。
+
+   为了避免误伤真实 id 恰好以 _agent/_coding 结尾的非火山渠道，优先做精确匹配；
+   只有精确匹配不存在，且剥掉后缀后的渠道确实存在且类型为 volcengine 时，
+   才返回不带后缀的 base id。 */
+export function canonicalChannelId(id, channels = []) {
+  const raw = String(id ?? "");
+  // 没有 channels 时保持旧行为（供纯函数测试 / 无渠道上下文场景回退）
+  if (!channels.length) {
+    return raw.replace(/_(agent|coding)$/, "");
+  }
+  // 有 channels 时对齐后端 _canonical_channel_id：精确匹配优先，
+  // 仅当剥掉后缀后的 base 确实存在且类型为 volcengine 时才归一。
+  if (channels.some((c) => c.id === raw)) {
+    return raw;
+  }
+  for (const suffix of ["_agent", "_coding"]) {
+    if (raw.endsWith(suffix)) {
+      const base = raw.slice(0, -suffix.length);
+      const baseCh = channels.find((c) => c.id === base);
+      if (baseCh && baseCh.type === "volcengine") {
+        return base;
+      }
+    }
+  }
+  return raw;
 }
 
 /* 两个百分比字段都缺失：这个条目只是文本标签（如"充值余额""订阅计划"），没有百分比概念 */
@@ -113,22 +137,22 @@ export function noPercentData(w) {
    前必须先用 canonicalChannelId 归一 id——火山子卡片 id 带 _agent/_coding
    后缀，阈值却是按配置 id 存的，不归一就永远查不到对应阈值，告警也就永远
    不会触发（这正是之前的 P1 bug）。 */
-export function channelBreachesThreshold(q, thresholds) {
+export function channelBreachesThreshold(q, thresholds, channels = []) {
   if (q.status !== "ok" || !q.windows) return false;
-  const threshold = thresholds[canonicalChannelId(q.id)];
+  const threshold = thresholds[canonicalChannelId(q.id, channels)];
   if (threshold === undefined) return false;
   return q.windows.some(
     (w) => w.remaining_percent !== null && w.remaining_percent !== undefined && w.remaining_percent < threshold
   );
 }
 
-/* 计算"重置还有多久"的展示文案。now 默认取当前时间；测试里可以传一个固定值，
-   避免用例因为真实时钟在整分/整时边界上流逝而偶发抖动——生产环境的调用方
-   （renderBar/renderBarFlat）都不传第二个参数，行为跟之前完全一致。 */
+/* 计算"重置还有多久"的展示文案。返回 {key, value}，由调用方用 i18n.t() 渲染。
+   now 默认取当前时间；测试里可以传一个固定值，避免用例因为真实时钟在整分/整时
+   边界上流逝而偶发抖动。 */
 export function fmtReset(ms, now = Date.now()) {
   const diff = ms - now;
-  if (diff <= 0) return "已重置";
-  if (diff < 3600_000) return `${Math.ceil(diff / 60_000)} 分钟后`;
-  if (diff < 86400_000) return `${Math.ceil(diff / 3600_000)} 小时后`;
-  return `${Math.ceil(diff / 86400_000)} 天后`;
+  if (diff <= 0) return { key: "reset.now" };
+  if (diff < 3600_000) return { key: "reset.minutes", value: Math.ceil(diff / 60_000) };
+  if (diff < 86400_000) return { key: "reset.hours", value: Math.ceil(diff / 3600_000) };
+  return { key: "reset.days", value: Math.ceil(diff / 86400_000) };
 }

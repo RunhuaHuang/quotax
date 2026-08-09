@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 import ssl
+import threading
 import urllib.request
 
 import httpx
@@ -11,6 +12,7 @@ import httpx
 TIMEOUT_SECONDS = 15.0
 
 _client: httpx.AsyncClient | None = None
+_client_lock = threading.Lock()
 
 
 def _system_proxy() -> str | None:
@@ -59,22 +61,25 @@ def friendly_error(e: Exception) -> str:
 def get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
-        kwargs: dict = {
-            "timeout": httpx.Timeout(TIMEOUT_SECONDS),
-            # 默认不跟随重定向：base_url 是用户自填的（new-api/one-api 中转站、
-            # Kimi API、ZenMux 等），如果开着 follow_redirects，一个恶意或配置
-            # 错误的 base_url 可以 3xx 跳转到任意主机，httpx 会把 Authorization
-            # 头也带过去——相当于把用户的 API Key 泄露给跳转目标。所有渠道的
-            # 官方接口地址都是写死的 https 直连域名，本来就不需要重定向。
-            "follow_redirects": False,
-            "headers": {"User-Agent": "quota-board/1.0"},
-        }
-        # 系统代理：用户开代理工具后，境外接口（chatgpt.com 等）的 TLS 握手可能
-        # 被网络环境干扰，走系统代理可恢复；没有代理时与之前行为完全一致。
-        proxy = _system_proxy()
-        if proxy:
-            kwargs["proxy"] = proxy
-        _client = httpx.AsyncClient(**kwargs)
+        with _client_lock:
+            # 双重检查：避免多个协程同时进入时创建出多个 client
+            if _client is None or _client.is_closed:
+                kwargs: dict = {
+                    "timeout": httpx.Timeout(TIMEOUT_SECONDS),
+                    # 默认不跟随重定向：base_url 是用户自填的（new-api/one-api 中转站、
+                    # Kimi API、ZenMux 等），如果开着 follow_redirects，一个恶意或配置
+                    # 错误的 base_url 可以 3xx 跳转到任意主机，httpx 会把 Authorization
+                    # 头也带过去——相当于把用户的 API Key 泄露给跳转目标。所有渠道的
+                    # 官方接口地址都是写死的 https 直连域名，本来就不需要重定向。
+                    "follow_redirects": False,
+                    "headers": {"User-Agent": "quota-board/1.0"},
+                }
+                # 系统代理：用户开代理工具后，境外接口（chatgpt.com 等）的 TLS 握手可能
+                # 被网络环境干扰，走系统代理可恢复；没有代理时与之前行为完全一致。
+                proxy = _system_proxy()
+                if proxy:
+                    kwargs["proxy"] = proxy
+                _client = httpx.AsyncClient(**kwargs)
     return _client
 
 

@@ -91,6 +91,7 @@ class CodexParser(BaseParser):
 
         records: list[NormalizedRecord] = []
         current_model: str | None = None
+        truncated = False
 
         with file_path.open("r", encoding="utf-8", errors="replace") as f:
             if offset > 0:
@@ -102,8 +103,9 @@ class CodexParser(BaseParser):
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
-                    # 末尾半行（Codex 正在写），留到下次
+                    # 末尾半行（Codex 正在写），保留旧游标，下次从当前行起点重试
                     result.lines_skipped += 1
+                    truncated = True
                     break
                 if not isinstance(entry, dict):
                     continue
@@ -162,7 +164,7 @@ class CodexParser(BaseParser):
                         cache_read=cache_read,
                     )
                 )
-            new_offset = f.tell()
+            new_offset = offset if truncated else f.tell()
 
         store.set_cursor(
             self.source, str(file_path), last_modified_ns=mtime_ns, last_line_offset=new_offset
