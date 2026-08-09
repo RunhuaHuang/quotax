@@ -23,7 +23,7 @@ from . import credentials as credentials_store
 from . import history as history_store
 from . import local_usage
 from . import oauth as oauth_store
-from .credentials import CRED_OK
+from .credentials import CRED_NO_TOKEN, CRED_OK
 from .models import ChannelResult, fail
 from .net import aclose, friendly_error
 from .providers import channel_category, query_channel
@@ -128,6 +128,14 @@ def _spawn_background(coro) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # 启动时自动探测本机已登录的订阅 CLI（Claude / Gemini / Grok / Codex /
+    # Copilot），为尚未配置的类型自动创建渠道——订阅渠道不需要填密钥，用户不该
+    # 为了「看到已登录的 CLI」还要手动到配置弹窗里逐个添加。探测在后台线程跑，
+    # 不阻塞服务启动；探测失败（如 Keychain 不可用）静默忽略。
+    try:
+        await asyncio.to_thread(_auto_detect_subscription_channels)
+    except Exception:
+        pass
     yield
     await aclose()
 
@@ -279,6 +287,70 @@ async def providers():
 async def list_channels():
     """渠道列表（密钥打码）。"""
     return [c.to_dict(secret=False) for c in config_store.list_channels()]
+
+
+# ── 订阅渠道自动探测 ──────────────────────────────────────────
+# 订阅类渠道（Claude / Gemini / Grok / Codex / Copilot）不需要用户填任何密钥——
+# 查询时本来就会实时读本机 CLI 凭据。但用户仍得手动在配置弹窗里「选类型 → 保存」
+# 才能创建渠道配置。这里把这一步自动化：探测本机已登录的 CLI，自动建对应渠道。
+#
+# 已存在同 type 的渠道则跳过（避免重复）；探测成功（ok / no_token / expired）才建，
+# not_found（本机没登录该 CLI）静默跳过。
+_SUBSCRIPTION_DETECTORS: dict[str, tuple] = {
+    # type → (探测函数, 渠道默认显示名)
+    "claude_subscription": (credentials_store.read_claude_credentials, "Claude 订阅"),
+    "gemini_subscription": (credentials_store.read_gemini_credentials, "Gemini 订阅"),
+    "grok_subscription": (credentials_store.read_grok_credentials, "Grok 订阅"),
+    "codex_subscription": (credentials_store.read_codex_credentials, "Codex 订阅"),
+    "copilot_subscription": (credentials_store.read_copilot_credentials, "GitHub Copilot"),
+}
+
+
+def _auto_detect_subscription_channels() -> dict:
+    """探测本机已登录的订阅 CLI，为尚未配置的类型自动创建渠道。
+
+    返回 {added: [{type, name, source}], skipped: [{type, reason}], existing: [...]}。
+    不会删除或修改任何已存在的渠道——纯增量。
+    """
+    existing_types = {c.type for c in config_store.list_channels()}
+    added: list[dict] = []
+    skipped: list[dict] = []
+    for ctype, (detector, default_name) in _SUBSCRIPTION_DETECTORS.items():
+        if ctype in existing_types:
+            continue
+        try:
+            cred = detector()
+        except Exception as e:  # 探测函数异常绝不阻塞整体流程
+            skipped.append({"type": ctype, "reason": f"探测出错: {e}"})
+            continue
+        # ok = 已登录有 token；no_token = 已登录但新版钥匙串不存明文 token；
+        # expired = 登录态过期。前两种都建渠道（渠道在，查询时自然会展示实时
+        # 结果/过期提示）；expired 也建——用户能看到「已过期」比「没配置」更有用。
+        # not_found / parse_error 跳过（本机没装/没登录该 CLI，建了也是空渠道）。
+        if cred.status not in (CRED_OK, CRED_NO_TOKEN, "expired"):
+            skipped.append({"type": ctype, "reason": cred.message or cred.status})
+            continue
+        try:
+            channel = config_store.upsert_channel(
+                {"type": ctype, "name": default_name, "enabled": True},
+                provided_fields={"type", "name", "enabled"},
+            )
+        except Exception as e:
+            skipped.append({"type": ctype, "reason": f"创建失败: {e}"})
+            continue
+        added.append({"type": ctype, "name": channel.name, "source": cred.source})
+        existing_types.add(ctype)
+    return {"added": added, "skipped": skipped}
+
+
+@app.post("/api/channels/auto-detect")
+async def auto_detect_channels():
+    """探测本机已登录的订阅 CLI 并自动创建对应渠道（手动触发）。
+
+    服务启动时也会自动跑一次（见 lifespan），这里供前端「重新探测」按钮调用。
+    新增的渠道会在下次 /api/quotas 查询时惰性建缓存，无需手动失效。
+    """
+    return await asyncio.to_thread(_auto_detect_subscription_channels)
 
 
 @app.post("/api/channels")

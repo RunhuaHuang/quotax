@@ -244,6 +244,7 @@ function bindEvents() {
   $("#btnExportSafe").addEventListener("click", () => exportConfig(false));
   $("#btnImportTrigger").addEventListener("click", () => $("#importFileInput").click());
   $("#importFileInput").addEventListener("change", onImportFileSelected);
+  $("#btnAutoDetect").addEventListener("click", onAutoDetect);
 
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { closeConfigModal(); closeSettingsModal(); closeHistoryModal(); }
@@ -1026,6 +1027,33 @@ function openConfigModal() {
 function renderChannelCount() {
   const el = $("#channelsCountLabel");
   if (el) el.textContent = t("config.channelsCount", { count: channels.length });
+}
+
+/* 自动探测本机已登录的订阅 CLI（Claude / Gemini / Grok / Codex / Copilot），
+   为尚未配置的类型自动创建渠道。服务启动时已自动跑过一次，这里给用户一个
+   「装了新 CLI 后手动再探一次」的入口。 */
+async function onAutoDetect() {
+  const btn = $("#btnAutoDetect");
+  if (btn) { btn.disabled = true; btn.textContent = t("config.detecting"); }
+  try {
+    const res = await fetch("/api/channels/auto-detect", { method: "POST" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const added = data.added || [];
+    if (added.length) {
+      // 按当前语言把探测到的类型名本地化，回退到后端给的 name
+      const names = added.map((a) => providerLabel(a.type)).join("、");
+      toast(t("toast.autoDetectFound", { count: added.length, names }), "ok");
+      await loadChannels();
+      await refreshQuotas(true);
+    } else {
+      toast(t("toast.autoDetectNone"), "info");
+    }
+  } catch (e) {
+    toast(t("toast.autoDetectFailed", { msg: e.message }), "err");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = t("config.autoDetect"); }
+  }
 }
 
 function closeConfigModal() {

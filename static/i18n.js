@@ -95,6 +95,9 @@ export const TRANSLATIONS = {
     "config.deleteHint": "删除",
     "config.autoRead": "自动读取",
     "config.uploadedCredentials": "已上传凭据",
+    "config.autoDetect": "自动探测本机登录",
+    "config.autoDetectHint": "扫描本机 CLI 登录状态，为 Claude / Codex / Gemini / Grok / Copilot 等已登录的订阅自动创建渠道",
+    "config.detecting": "探测中…",
 
     // 字段标签与 placeholder
     "field.apiKey": "API Key",
@@ -169,6 +172,9 @@ export const TRANSLATIONS = {
     "toast.importSuccess": "导入成功（{{mode}}），当前共 {{count}} 个渠道",
     "toast.importFailed": "导入失败: {{msg}}",
     "toast.deleteConfirm": "确定删除渠道「{{name}}」？",
+    "toast.autoDetectFound": "已自动添加 {{count}} 个渠道：{{names}}",
+    "toast.autoDetectNone": "没有探测到新的已登录 CLI（可能已添加过，或本机未登录该 CLI）",
+    "toast.autoDetectFailed": "探测失败: {{msg}}",
     "toast.importModeTitle": "选择导入方式：",
     "toast.importModeMerge": "• 确定 = 合并导入（追加到现有配置，同 id 覆盖）",
     "toast.importModeReplace": "• 取消 = 替换导入（清空现有全部渠道后替换）",
@@ -479,6 +485,9 @@ export const TRANSLATIONS = {
     "config.deleteHint": "Delete",
     "config.autoRead": "Auto-read",
     "config.uploadedCredentials": "Uploaded credentials",
+    "config.autoDetect": "Auto-detect local logins",
+    "config.autoDetectHint": "Scan local CLI logins and auto-create channels for Claude / Codex / Gemini / Grok / Copilot",
+    "config.detecting": "Detecting…",
 
     // Field labels & placeholders
     "field.apiKey": "API Key",
@@ -553,6 +562,9 @@ export const TRANSLATIONS = {
     "toast.importSuccess": "Import succeeded ({{mode}}), {{count}} channels now",
     "toast.importFailed": "Import failed: {{msg}}",
     "toast.deleteConfirm": "Delete channel \"{{name}}\"?",
+    "toast.autoDetectFound": "Auto-added {{count}} channel(s): {{names}}",
+    "toast.autoDetectNone": "No new CLI logins detected (already added, or not logged in on this machine)",
+    "toast.autoDetectFailed": "Detection failed: {{msg}}",
     "toast.importModeTitle": "Choose import mode:",
     "toast.importModeMerge": "• OK = merge (append to existing, same id overwritten)",
     "toast.importModeReplace": "• Cancel = replace (clear all existing channels first)",

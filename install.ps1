@@ -173,6 +173,19 @@ try {
   }
   Write-Host "uv: $(& uv --version)"
 
+  # --- 安装 quotax 命令到 PATH（%USERPROFILE%\.local\bin，通常 uv 已加入 PATH）---
+  # 之后用户只需在任意终端输入 quotax 即可启动 / 打开 WebUI。
+  $LocalBin = "$env:USERPROFILE\.local\bin"
+  if (-not (Test-Path $LocalBin)) { New-Item -ItemType Directory -Path $LocalBin -Force | Out-Null }
+  Copy-Item (Join-Path $PermDir "quotax.cmd") (Join-Path $LocalBin "quotax.cmd") -Force
+
+  # 检查 ~/.local/bin 是否在用户 PATH；不在则尝试加入用户级 PATH。
+  $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  if ($UserPath -notlike "*$LocalBin*") {
+    [Environment]::SetEnvironmentVariable("Path", "$LocalBin;$UserPath", "User")
+    Write-Host "已将 $LocalBin 加入用户 PATH（重开终端后生效）"
+  }
+
   # --- 同步依赖（uv sync 按 uv.lock 精确安装，含 Python 3.13）---
   Write-Host "安装依赖（首次可能需要下载 Python 3.13，请稍候）..."
   Push-Location $PermDir
@@ -234,8 +247,9 @@ try {
   Write-Host "   日志: $LogFile"
   Write-Host "   目录: $PermDir"
   Write-Host ""
-  Write-Host "   停止: 关闭后台 PowerShell 进程，或重启电脑"
-  Write-Host "   再次启动: cd $PermDir; uv run uvicorn app.main:app --port $Port"
+  Write-Host "   下次打开只需在终端输入:  quotax"
+  Write-Host "   停止服务:               quotax stop"
+  Write-Host "   查看状态:               quotax status"
   Write-Host "=============================================" -ForegroundColor Green
 } finally {
   Cleanup

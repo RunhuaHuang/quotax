@@ -42,6 +42,7 @@ irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
 
 > - 首次安装会下载 Python 3.13 与依赖，请耐心等待 1–2 分钟。
 > - 默认安装到 `~/QuotaX`（Windows 为 `%USERPROFILE%\QuotaX`），服务监听 `127.0.0.1:8900`。
+> - **安装后自动探测**：本机已登录的 Claude / Codex / Gemini / Grok / Copilot CLI 会被自动识别并创建对应渠道，无需手动添加。
 > - **网络不通 / GitHub 被墙？** 脚本内置多源镜像自动 fallback；也可手动指定镜像：
 >   ```bash
 >   QUOTAX_MIRROR=https://ghfast.top bash -c "$(curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.sh)"
@@ -50,8 +51,23 @@ irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
 >   $env:QUOTAX_MIRROR='https://ghfast.top'; irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
 >   ```
 > - **升级**：重新跑一次同样的命令即可，`config.json` / `usage.db` / `history/` 等个人数据会自动保留。
-> - **停止服务**：`lsof -ti tcp:8900 | xargs kill`（macOS/Linux），或关闭后台 PowerShell 进程（Windows）。
-> - **再次启动**：`cd ~/QuotaX && uv run uvicorn app.main:app --port 8900`。
+
+### 后续打开
+
+首次安装完成后，以后每次打开只需在终端输入：
+
+```
+quotax
+```
+
+这会自动启动后台服务并打开浏览器（服务已在运行则直接打开浏览器）。其他命令：
+
+| 命令 | 作用 |
+| --- | --- |
+| `quotax` | 启动服务并打开 WebUI（已运行则直接打开） |
+| `quotax stop` | 停止后台服务 |
+| `quotax status` | 查看运行状态 |
+| `quotax log [N]` | 查看最近 N 行日志（默认 50，仅 macOS/Linux） |
 
 ## 启动（源码方式）
 

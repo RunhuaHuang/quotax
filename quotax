@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+
+# ==============================================================================
+# quotax — QuotaX 一键启动器（由 install.sh 安装到 PATH）
+#
+# 用法：
+#   quotax          启动服务（已在运行则直接打开浏览器）
+#   quotax stop     停止后台服务
+#   quotax status   查看运行状态
+#   quotax log      查看最近日志
+#
+# 安装位置：~/.local/bin/quotax（install.sh 负责）。
+# ==============================================================================
+
+set -e
+
+# 安装目录（install.sh 写入这个占位，找不到则回退默认路径）
+PERM_DIR="${QUOTAX_HOME:-$HOME/QuotaX}"
+PORT="${QUOTAX_PORT:-8900}"
+LOG_FILE="$PERM_DIR/quotax.log"
+PID_FILE="$PERM_DIR/quotax.pid"
+
+# 判断服务是否在监听端口（不依赖 lsof，用 bash 内建 /dev/tcp 兜底）。
+is_running() {
+  if command -v lsof &>/dev/null; then
+    lsof -ti tcp:"$PORT" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    (echo >/dev/tcp/127.0.0.1/"$PORT") >/dev/null 2>&1
+  fi
+}
+
+open_browser() {
+  URL="http://127.0.0.1:$PORT"
+  (command -v open &>/dev/null && open "$URL") \
+    || (command -v xdg-open &>/dev/null && xdg-open "$URL") \
+    || true
+}
+
+case "${1:-start}" in
+  start|"")
+    if is_running; then
+      echo "QuotaX 已在运行 → 打开浏览器"
+      open_browser
+      exit 0
+    fi
+    if [ ! -d "$PERM_DIR" ] || [ ! -f "$PERM_DIR/app/main.py" ]; then
+      echo "Error: 未找到 QuotaX 安装目录 $PERM_DIR" >&2
+      echo "       请先运行安装脚本，或设置 QUOTAX_HOME 指向安装目录。" >&2
+      exit 1
+    fi
+    cd "$PERM_DIR"
+    # 确保 uv 在 PATH（install.sh 装到 ~/.local/bin）
+    export PATH="$HOME/.local/bin:$PATH"
+    if ! command -v uv &>/dev/null; then
+      echo "Error: 未找到 uv。请先安装 uv（macOS: brew install uv）。" >&2
+      exit 1
+    fi
+    # 后台启动 uvicorn，nohup 保证退出终端后服务继续运行。
+    mkdir -p "$PERM_DIR"
+    nohup uv run uvicorn app.main:app --host 127.0.0.1 --port "$PORT" > "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    echo -n "启动 QuotaX（端口 $PORT）"
+    # 轮询等待就绪（最多 30 秒）
+    for i in $(seq 1 30); do
+      if is_running; then
+        echo " ✅"
+        open_browser
+        echo "地址: http://127.0.0.1:$PORT"
+        echo "日志: $LOG_FILE"
+        exit 0
+      fi
+      echo -n "."
+      sleep 1
+    done
+    echo ""
+    echo "⚠️  服务仍在启动中，请稍后访问 http://127.0.0.1:$PORT"
+    echo "   日志: $LOG_FILE"
+    ;;
+
+  stop)
+    if is_running; then
+      if command -v lsof &>/dev/null; then
+        lsof -ti tcp:"$PORT" -sTCP:LISTEN | xargs kill 2>/dev/null || true
+      fi
+      sleep 1
+      echo "QuotaX 已停止"
+    else
+      echo "QuotaX 未在运行"
+    fi
+    rm -f "$PID_FILE"
+    ;;
+
+  status)
+    if is_running; then
+      echo "✅ QuotaX 运行中 → http://127.0.0.1:$PORT"
+    else
+      echo "❌ QuotaX 未运行（用 quotax 启动）"
+    fi
+    ;;
+
+  log)
+    if [ -f "$LOG_FILE" ]; then
+      tail -n "${2:-50}" "$LOG_FILE"
+    else
+      echo "无日志文件: $LOG_FILE"
+    fi
+    ;;
+
+  *)
+    echo "用法: quotax [start|stop|status|log]" >&2
+    echo "  start (默认)  启动服务并打开浏览器" >&2
+    echo "  stop          停止后台服务" >&2
+    echo "  status        查看运行状态" >&2
+    echo "  log [N]       查看最近 N 行日志（默认 50）" >&2
+    exit 2
+    ;;
+esac

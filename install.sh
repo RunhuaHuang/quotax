@@ -179,6 +179,23 @@ if ! command -v uv &>/dev/null; then
 fi
 echo "uv: $(uv --version)"
 
+# --- 安装 quotax 命令到 ~/.local/bin（与 uv 同目录，通常已在 PATH）---
+# 之后用户只需输入 quotax 即可启动 / 打开 WebUI。
+LOCAL_BIN="$HOME/.local/bin"
+mkdir -p "$LOCAL_BIN"
+cp "$PERM_DIR/quotax" "$LOCAL_BIN/quotax"
+chmod +x "$LOCAL_BIN/quotax"
+export PATH="$LOCAL_BIN:$PATH"
+
+# 检查 ~/.local/bin 是否在 shell 的 PATH 里；不在则提示用户加一行。
+if ! echo ":$PATH:" | grep -q ":$LOCAL_BIN:"; then
+  echo ""
+  echo "⚠️  提示：$LOCAL_BIN 不在你的 PATH 中。quotax 命令需要它在 PATH。"
+  echo "   请在 shell 配置文件里加一行（然后重开终端）："
+  echo "     export PATH=\"$LOCAL_BIN:\$PATH\""
+  echo ""
+fi
+
 # --- 同步依赖（uv sync 会按 uv.lock 精确安装，含 Python 3.13）---
 echo "安装依赖（首次可能需要下载 Python 3.13，请稍候）..."
 cd "$PERM_DIR"
@@ -241,6 +258,7 @@ echo "   地址:  http://127.0.0.1:$PORT"
 echo "   日志:  $LOG_FILE"
 echo "   目录:  $PERM_DIR"
 echo ""
-echo "   停止:        lsof -ti tcp:$PORT | xargs kill"
-echo "   再次启动:    cd $PERM_DIR && uv run uvicorn app.main:app --port $PORT"
+echo "   下次打开只需在终端输入:  quotax"
+echo "   停止服务:               quotax stop"
+echo "   查看状态:               quotax status"
 echo "============================================="
