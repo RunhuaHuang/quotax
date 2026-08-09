@@ -6,6 +6,10 @@
 
 把散落在各家官网 / CLI / 控制台里的余额和额度数字，聚合到一个本地面板上，一眼看完。订阅类渠道自动读取本机 CLI 登录态，无需填写任何密钥。
 
+![订阅用量与余额卡片](docs/dashboard-subscriptions.png)
+
+上方为订阅用量（Claude / Codex / OpenCode，自动读本机 CLI 登录态），下方为 API Key 余额（DeepSeek）。每个渠道一张卡，剩余百分比 + 重置倒计时一目了然。
+
 ![QuotaX 仪表盘（浅色）](docs/dashboard-main.png)
 
 ---

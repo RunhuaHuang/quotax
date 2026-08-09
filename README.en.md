@@ -6,6 +6,10 @@ English | [简体中文](./README.md)
 
 Aggregate balances and quotas scattered across vendor websites, CLIs, and consoles onto a single local dashboard. Subscription channels auto-read your local CLI login state — no API keys needed.
 
+![Subscription usage & balance cards](docs/dashboard-subscriptions.png)
+
+Top: subscription usage (Claude / Codex / OpenCode, auto-reading local CLI logins). Bottom: API-Key balance (DeepSeek). Each channel is a card with remaining-percentage + reset countdown at a glance.
+
 ![QuotaX dashboard (light)](docs/dashboard-main.png)
 
 ---
