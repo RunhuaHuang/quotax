@@ -2,7 +2,9 @@
 
 > 统一查看各 AI 渠道**余额 · 订阅用量 · Coding Plan 额度**的本地 WebUI。
 
-把散落在各家官网 / CLI / 控制台里的余额和额度数字，聚合到一个本地面板上，一眼看完。启动后浏览器打开 http://127.0.0.1:8900 。
+[English](./README.en.md) | 简体中文
+
+把散落在各家官网 / CLI / 控制台里的余额和额度数字，聚合到一个本地面板上，一眼看完。订阅类渠道自动读取本机 CLI 登录态，无需填写任何密钥。
 
 ![QuotaX 仪表盘（浅色）](docs/dashboard-main.png)
 
@@ -10,14 +12,15 @@
 
 ## 特性
 
-- **多渠道聚合**：余额（DeepSeek / 阶跃 / 硅基 / OpenRouter / Novita / Kimi API / 中转站）、Coding Plan（Kimi / 智谱 GLM 个人+团队 / MiniMax / 火山方舟 / ZenMux / 小米 MiMo）、订阅用量（Claude / Gemini / Grok / Codex / Copilot / OpenCode Zen·Go）、本地统计（Claude Code / OpenCode transcript）。
-- **用量统计看板（深度分析）**：独立 Tab，基于 SQLite 持久化的增量采集，提供四桶 token 总览、缓存命中率、按天趋势曲线、模型分布、逐请求日志、成本估算（LiteLLM 单价表 + rebill 回填）。数据源覆盖 Claude Code / Codex / Gemini CLI / Grok CLI / OpenCode 五个本机 CLI 日志。
-- **订阅渠道免填密钥**：自动读取本机 CLI 的登录凭据（Claude / Gemini / Grok / Codex / Copilot），**不刷新、不写入**，与你的 agent 共享同一份登录态。
-- **Codex OAuth 在线授权**：ChatGPT 订阅支持在 WebUI 点一下「通过 ChatGPT 登录」完成 OAuth 授权，自动获取凭据并创建渠道，无需手动上传 auth.json（多账号也支持）。
+- **多渠道聚合**：余额（DeepSeek / 阶跃 / 硅基 / OpenRouter / Novita / Kimi API / 中转站）、Coding Plan（Kimi / 智谱 GLM 个人+团队 / MiniMax / 火山方舟 / ZenMux / 小米 MiMo）、订阅用量（Claude / Gemini / Grok / Codex / Copilot / OpenCode）、本地统计（Claude Code / OpenCode transcript）。
+- **订阅渠道免填密钥 + 自动探测**：自动读取本机 CLI 的登录凭据（Claude / Gemini / Grok / Codex / Copilot），**不刷新、不写入**，与你的 agent 共享同一份登录态。服务启动时自动探测本机已登录的 CLI 并创建对应渠道，无需手动添加。
+- **用量统计看板（深度分析）**：独立 Tab，基于 SQLite 持久化的增量采集，提供四桶 token 总览、缓存命中率、按天趋势曲线、模型分布、逐请求日志、成本估算（LiteLLM 单价表 + rebill 回填）。
+- **Codex OAuth 在线授权**：ChatGPT 订阅支持在 WebUI 点一下「通过 ChatGPT 登录」完成 OAuth 授权，自动获取凭据并创建渠道。
 - **按渠道 id 独立缓存 + 请求合并**：成功 60s / 失败 15s，同一渠道并发查询只打一次上游。
-- **拖拽排序**：卡片可拖拽自定义顺序，顺序持久化到浏览器 `localStorage`，刷新后保留。
+- **拖拽排序**：卡片可拖拽自定义顺序，顺序持久化到浏览器 `localStorage`。
 - **历史趋势**：每次成功查询自动记录一条趋势点，用 SVG 折线图展示余额 / 剩余百分比随时间的变化。
 - **低余额告警**：为每个渠道设置剩余百分比阈值，低于阈值时卡片标橙、顶栏汇总计数。
+- **中 / 英双语**：界面支持简体中文与 English 一键切换。
 - **深 / 浅色主题**：跟随系统或手动切换。
 - **CLI 终端工具**：`quotaboard quota --brief` 单行摘要，适合 tmux statusbar / shell prompt。
 - **配置导入 / 导出**：含密钥完整备份（换机迁移）或脱敏导出（安全分享渠道结构）。
@@ -26,7 +29,7 @@
 
 ## 一键安装
 
-打开终端，粘贴对应你系统的命令回车即可——脚本会自动下载源码、安装 `uv` 与全部依赖、启动服务，最后帮你打开浏览器。
+打开终端，粘贴对应你系统的命令回车即可——脚本会自动下载源码、准备 Python 运行时、安装全部依赖、启动服务，最后帮你打开浏览器。
 
 **macOS / Linux：**
 
@@ -43,7 +46,7 @@ irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
 > - 首次安装会自动准备运行时：**优先复用本机已有的 Python 3.11+**；本机完全没有时才自动安装 Python 3.13。无需用户预装 Python。请耐心等待 1–2 分钟。
 > - 默认安装到 `~/QuotaX`（Windows 为 `%USERPROFILE%\QuotaX`），服务监听 `127.0.0.1:8900`。
 > - **安装后自动探测**：本机已登录的 Claude / Codex / Gemini / Grok / Copilot CLI 会被自动识别并创建对应渠道，无需手动添加。
-> - **网络不通 / GitHub 被墙？** 脚本内置多源镜像自动 fallback；也可手动指定镜像：
+> - **网络不通 / GitHub 被墙？** 脚本内置多源镜像自动 fallback（GitHub → ghfast.top → gh-proxy.com → moeyy）；也可手动指定镜像：
 >   ```bash
 >   QUOTAX_MIRROR=https://ghfast.top bash -c "$(curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.sh)"
 >   ```
@@ -69,18 +72,6 @@ quotax
 | `quotax status` | 查看运行状态 |
 | `quotax log [N]` | 查看最近 N 行日志（默认 50，仅 macOS/Linux） |
 
-## 启动（源码方式）
-
-```bash
-./run.sh          # 或: uv run uvicorn app.main:app --port 8900
-```
-
-测试 / 临时自测时，用环境变量 `QUOTABOARD_CONFIG` 指向一个临时文件，避免碰到项目根目录真实的 `config.json`：
-
-```bash
-QUOTABOARD_CONFIG=/tmp/quotaboard-test/config.json uv run uvicorn app.main:app --port 8931
-```
-
 ## 支持的渠道
 
 | 分类 | 渠道 | 认证方式 |
@@ -90,84 +81,49 @@ QUOTABOARD_CONFIG=/tmp/quotaboard-test/config.json uv run uvicorn app.main:app -
 | 订阅用量 | Claude Pro·Max / Gemini AI Studio / Grok SuperGrok·X / ChatGPT Codex / GitHub Copilot / OpenCode Zen·Go | Claude/Gemini/Grok/Codex/Copilot **自动读取本机 CLI 登录**；OpenCode 填 **Cookie + 工作区 ID** |
 | 本地统计 | Claude Code / OpenCode 本地已用 token（+ OpenCode 费用，如果有） | 无（读本机文件/数据库） |
 
-new-api / one-api 中转站：优先尝试原生 `/api/user/self`；如果部署要求"系统访问令牌 + `New-API-User` 头"而不是普通业务 `sk-` key，可以在渠道配置里额外填一个可选的 `user_id`（对应 `New-API-User` 请求头），或者干脆不填，让它自动回退到 OpenAI 兼容的 `/v1/dashboard/billing/subscription` + `/v1/dashboard/billing/usage`。
+![配置弹窗](docs/config-modal.png)
 
-火山方舟：同一账号可以**同时开通 Agent Plan 和 Coding Plan**，两个套餐会分别查询并**以左右 tab 展示**（卡片顶部「Agent Plan」/「Coding Plan」两个 tab，点哪个看哪个；每个 tab 内 5 小时 / 每周 / 每月窗口横排一行；没查到的套餐不显示对应 tab）。窗口 key 带 plan 维度（`agent_*`/`coding_*`），历史趋势图也会按套餐分线。其中一个套餐查询失败不影响另一个的展示，失败详情会附在卡片底部的 message 里。Access Key 请在火山引擎控制台创建：https://console.volcengine.com/iam/keymanage
+### new-api / one-api 中转站
 
-小米 MiMo：用量查询端点（`platform.xiaomimimo.com/api/v1/tokenPlan/usage`）只接受小米账号登录后的 **Cookie**（不是 API Key）。请登录 platform.xiaomimimo.com 后，从浏览器开发者工具复制完整 Cookie 填入渠道配置的「Cookie」字段。
+优先尝试原生 `/api/user/self`；如果部署要求"系统访问令牌 + `New-API-User` 头"而不是普通业务 `sk-` key，可以在渠道配置里额外填一个可选的 `user_id`（对应 `New-API-User` 请求头），或者干脆不填，让它自动回退到 OpenAI 兼容的 `/v1/dashboard/billing/subscription` + `/v1/dashboard/billing/usage`。
 
-OpenCode (Zen/Go)：opencode 官网是 SSR 页面、没有公开的 JSON API，额度数据（滚动 / 周 / 月三个周期的已用百分比和重置倒计时）以内嵌的 React Server Component 序列化字符串写在 `https://opencode.ai/workspace/<工作区ID>/go` 页面的 HTML 里。需要登录态，请登录 opencode.ai 后从浏览器复制两样东西填入渠道配置：① 完整 **Cookie**；② 地址栏里的**工作区 ID**（`wrk_xxx` 格式，如 `opencode.ai/workspace/wrk_abc123/go` 里的 `wrk_abc123`）。Cookie 只保存在本地 config.json（权限 600），仅用于只读查询。实现参考 [Doueen/opencode-usage-extension](https://github.com/Doueen/opencode-usage-extension)。
+### 火山方舟
 
-ChatGPT (Codex) 订阅有三种获取凭据的方式：① **OAuth 在线授权**（推荐）——新建 Codex 渠道时点「通过 ChatGPT 登录」，浏览器会打开 OpenAI 授权页，用 ChatGPT 账号登录授权后自动完成 PKCE 流程换回 token、解析 account_id、自动创建渠道，全程不用手动碰任何文件，多账号只需多点几次分别授权；② **上传 auth.json**——如果本机已经用 Codex CLI 登录过，可以直接上传 `~/.codex/auth.json`（多账号场景每个渠道配一份）；③ **自动读取本机 CLI 登录态**——不填任何东西，自动读 macOS Keychain 里的 `Codex Auth` 或 `~/.codex/auth.json`。OAuth 实现参考 [cliproxyapi](https://github.com/router-for-me/CLIProxyAPI)（client_id / endpoints / PKCE / id_token 解析均与其一致）。
+同一账号可以**同时开通 Agent Plan 和 Coding Plan**，两个套餐会分别查询并**以左右 tab 展示**（卡片顶部「Agent Plan」/「Coding Plan」两个 tab，点哪个看哪个；每个 tab 内 5 小时 / 每周 / 每月窗口横排一行；没查到的套餐不显示对应 tab）。窗口 key 带 plan 维度（`agent_*`/`coding_*`），历史趋势图也会按套餐分线。其中一个套餐查询失败不影响另一个的展示。Access Key 请在火山引擎控制台创建：https://console.volcengine.com/iam/keymanage
 
-## 卡片排序
+### 小米 MiMo
 
-仪表盘卡片默认按**分类**（Coding Plan → 订阅 → 余额 → 本地）分组展示。每个分类内部，可以**拖拽卡片右下角的把手（⠿）自由排序**：
+用量查询端点（`platform.xiaomimimo.com/api/v1/tokenPlan/usage`）只接受小米账号登录后的 **Cookie**（不是 API Key）。请登录 platform.xiaomimimo.com 后，从浏览器开发者工具复制完整 Cookie 填入渠道配置的「Cookie」字段。
 
-- 拖动一张卡到同分类内另一张卡的位置，两张卡交换顺序；
-- 顺序持久化到浏览器 `localStorage`（`quotaboard_prefs.card_order`），刷新或重开浏览器后保留；
-- 新增的渠道（localStorage 里没有记录的）会追加到该分类末尾；
-- 跨分类拖拽会被拦截（卡片归属哪个分类由后端决定，前端不能改）。
+### OpenCode (Zen/Go)
 
-## 不抢登录的设计
+opencode 官网是 SSR 页面、没有公开的 JSON API，额度数据（滚动 / 周 / 月三个周期的已用百分比和重置倒计时）以内嵌的 React Server Component 序列化字符串写在 `https://opencode.ai/workspace/<工作区ID>/go` 页面的 HTML 里。需要登录态，请登录 opencode.ai 后从浏览器复制两样东西填入渠道配置：① 完整 **Cookie**；② 地址栏里的**工作区 ID**（`wrk_xxx` 格式）。Cookie 只保存在本地 config.json（权限 600），仅用于只读查询。实现参考 [Doueen/opencode-usage-extension](https://github.com/Doueen/opencode-usage-extension)。
 
-- 所有查询均为**只读 GET**（火山方舟走的是只读的 OpenAPI 查询 Action，同样没有任何写操作），无任何副作用；
-- 订阅类渠道直接读本机 CLI 的凭据文件 / macOS Keychain（`~/.claude/.credentials.json` 或 Keychain 里的 `Claude Code-credentials`、`~/.gemini/oauth_creds.json`、`~/.grok/auth.json`、`~/.codex/auth.json`、Copilot hosts.json），**不复制、不刷新、不写入**——与 Claude Code / Gemini CLI / Grok CLI / Codex CLI 共享同一份登录态；
-- 凭据过期时只提示「请到对应 CLI 重新登录」，绝不代刷 token（避免刷新令牌轮换导致 agent 登录失效）；
-- 后端按渠道 id 分别缓存查询结果（成功 60s / 失败 15s，见下方「缓存」一节），避免高频打官方接口触发风控。
+### ChatGPT (Codex) 订阅
+
+有三种获取凭据的方式：
+
+1. **OAuth 在线授权**（推荐）——新建 Codex 渠道时点「通过 ChatGPT 登录」，浏览器会打开 OpenAI 授权页，用 ChatGPT 账号登录授权后自动完成 PKCE 流程换回 token、解析 account_id、自动创建渠道，全程不用手动碰任何文件，多账号只需多点几次分别授权。
+2. **上传 auth.json**——如果本机已经用 Codex CLI 登录过，可以直接上传 `~/.codex/auth.json`（多账号场景每个渠道配一份）。
+3. **自动读取本机 CLI 登录态**——不填任何东西，自动读 macOS Keychain 里的 `Codex Auth` 或 `~/.codex/auth.json`。
+
+OAuth 实现参考 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（client_id / endpoints / PKCE / id_token 解析均与其一致）。
 
 ### Claude Code 订阅：可能只有本地统计，没有实时用量
 
 新版 Claude Code 在 macOS 上，账号登录状态存在钥匙串条目 `Claude Code-credentials` 里，但**这个条目不一定包含明文 access token**——如果 `accessToken`/`refreshToken` 是空字符串（只有 `subscriptionType` / `rateLimitTier` / `scopes` 等元信息），说明账号确实已登录，只是本机没有存储可用的 token，查不了官方用量窗口（`api.anthropic.com/api/oauth/usage`）。
 
-这不是"未登录"，所以本项目**不会**提示"请重新登录"——那样会误导已登录的用户。遇到这种情况，本项目会**自动尝试 PTY 探测**：用伪终端（PTY）启动 `claude` CLI 执行 `/usage` 命令——CLI 自己拥有 Keychain 访问权限，能在终端里显示出真实用量面板，本项目解析终端文本即可拿到「每 5 小时 / 每周」的剩余百分比（参考 [CodexBar](https://github.com/steipete/CodexBar) 的 `ClaudeStatusProbe`）。如果 PTY 探测也不可用（CLI 未安装或未登录），才降级为 `status: "info"` + 本地 transcript 统计。
+这不是"未登录"，所以本项目**不会**提示"请重新登录"。遇到这种情况，本项目会**自动尝试 PTY 探测**：用伪终端（PTY）启动 `claude` CLI 执行 `/usage` 命令——CLI 自己拥有 Keychain 访问权限，能在终端里显示出真实用量面板，本项目解析终端文本即可拿到「每 5 小时 / 每周」的剩余百分比（参考 [CodexBar](https://github.com/steipete/CodexBar) 的 `ClaudeStatusProbe`）。如果 PTY 探测也不可用（CLI 未安装或未登录），才降级为 `status: "info"` + 本地 transcript 统计。
 
-> PTY 探测的前提是 Claude CLI 已在本机登录（`claude` 能正常使用）。如果 CLI 显示「Not logged in」，PTY 也拿不到订阅用量——需要先在终端运行一次 `claude` 完成登录。
-
-之前的实现有一段扫描 Keychain 里 `Claude Code-credentials-<hex>` 后缀条目的回退逻辑，用 `security dump-keychain` 全量扫描再逐个尝试——实测这些后缀条目里只有 `mcpOAuth`（MCP 服务器的 OAuth 凭据），从来不包含账号 token，纯属无效的探测路径，还可能触发钥匙串授权弹窗，已经删掉。
-
-## 本地已用统计：`GET /api/local-usage`
-
-多数据源本地已用统计（只读本机文件，不发网络请求），目前包含：
-
-- `claude_code`：解析 `~/.claude/projects/*/*.jsonl` 会话 transcript（单层目录结构，即 `~/.claude/projects/<项目名>/<会话id>.jsonl`——这就是 Claude Code 实际落盘 transcript 的层级，不需要、也不会递归扫描更深的目录），按 `message.model` 聚合 token 用量（`input`/`output`/`cache_read`/`cache_write`），按 `message.id` 去重（同一条消息可能在续接/分支会话里重复出现）；没有费用字段，只报 token 数。
-- `opencode`：读取 `~/.local/share/opencode/opencode.db`（SQLite），新旧两种 opencode 数据库结构都兼容；有费用字段时会显示费用（`totals.has_cost` 标记是否有真实费用数据，`cost` 恒为数值但只在 `has_cost` 为真时才代表真实花费）。
-
-请求：`GET /api/local-usage?days=14`（`days` 取值范围 1–90，默认 14）。
-
-响应：
-
-```json
-{
-  "days": 14,
-  "sources": [
-    {
-      "key": "claude_code",
-      "label": "Claude Code 本地已用统计",
-      "available": true,
-      "message": null,
-      "path": "/Users/xxx/.claude/projects",
-      "model_stats": [
-        {"model": "claude-opus-5", "sessions": 3, "messages": 44,
-         "input": 100, "output": 200, "cache_read": 300, "cache_write": 400}
-      ],
-      "totals": {"sessions": 5, "messages": 60, "input": 100, "output": 200,
-                 "cache_read": 300, "cache_write": 400, "cost": 0.0, "has_cost": false}
-    },
-    {"key": "opencode", "label": "OpenCode 本地已用统计", "available": true, "...": "..."}
-  ]
-}
-```
-
-每个 source 字段名保持一致：`key` / `label` / `available` / `message` / `path` / `model_stats` / `totals`；数据源不可用时 `available: false`、`message` 给出原因、`model_stats: []`、`totals: {}`。
-
-`GET /api/opencode-usage?days=14` 仍然保留，作为只含 opencode 这一个数据源的向后兼容薄封装，返回扁平结构（`available`/`message`/`days`/`db_path`/`model_stats`/`totals`）。
+> PTY 探测的前提是 Claude CLI 已在本机登录（`claude` 能正常使用）。
 
 ## 用量统计看板（深度分析）
 
+![用量统计看板](docs/usage-dashboard.png)
+
 顶栏「额度 / **用量统计**」Tab 切换。用量统计 Tab 是一个独立的深度分析看板，基于 SQLite 持久化的增量采集，提供趋势 / 模型分布 / 请求日志 / 成本估算等维度，设计参考 [Buktal/VaultOne](https://github.com/Buktal/VaultOne)。
 
-与 `/api/local-usage`（实时全量聚合、不落库、只给当前时间窗口的汇总数字）的区别：这一套会**把解析结果落库**（`usage.db`，与 config.json 同目录），支持历史趋势、逐请求明细、增量扫描（不全量重扫）。
+与额度页的本地已用统计（实时全量聚合、不落库、只给当前时间窗口的汇总数字）的区别：这一套会**把解析结果落库**（`usage.db`，与 config.json 同目录），支持历史趋势、逐请求明细、增量扫描（不全量重扫）。
 
 ### 数据源
 
@@ -183,7 +139,7 @@ ChatGPT (Codex) 订阅有三种获取凭据的方式：① **OAuth 在线授权*
 
 **cache-inclusive 归一化**：Codex / Gemini / Grok 的 input 字段都包含缓存命中的部分，解析时会统一减去 `cache_read` 得到"新鲜输入"，与 Claude Code 的口径对齐。
 
-**增量采集**：JSONL 源记录每个文件的 `(mtime, line_offset)` 游标，只读游标之后的新行；SQLite 源（opencode）记录水位线。重复采集幂等（`INSERT OR IGNORE` 按主键去重），不会产生重复记录。
+**增量采集**：JSONL 源记录每个文件的 `(mtime, line_offset)` 游标，只读游标之后的新行；遇到被并发写入的截断行时保留旧游标，下次重读。SQLite 源（opencode）记录水位线。重复采集幂等（`INSERT OR IGNORE` 按主键去重），不会产生重复记录。
 
 ### 前端看板
 
@@ -197,173 +153,102 @@ ChatGPT (Codex) 订阅有三种获取凭据的方式：① **OAuth 在线授权*
 
 ### 成本估算与单价表
 
-成本是**估算值**（按单价表算），不是上游真实账单。单价单位是「美元 / 百万 token」，四桶分离计费（input / output / cache_read / cache_creation 各自单价）。
+成本是**按单价表估算**的，不是真实账单——单价表来源：
 
-- **内置种子价格**：覆盖 50+ 模型（Anthropic 全系 Claude opus/sonnet/haiku、OpenAI GPT-5.6 sol/terra/luna 及 5.x/4.1/4o、DeepSeek v4-flash/pro、Gemini、GLM、Grok 等），数据来自各家官网定价页（2026-08）。离线兜底用。
-- **模型名归一化 fallback**：`claude-sonnet-5-20260101` 会先试完整名，再按 `-` 逐段去尾（→ `claude-sonnet-5` → `claude-sonnet` → `claude`），命中即用，解决版本号 / 日期后缀的匹配问题。
-- **从 LiteLLM 更新**：点「从 LiteLLM 更新单价」一键拉取 [BerriAI/litellm](https://github.com/BerriAI/litellm) 的全网模型单价表（per_token → per_million 转换），合并进当前单价表。
-- **手动编辑**：单价表面板可新增 / 覆盖 / 删除模型单价（内置价不可删，可覆盖）。
-- **rebill 补算**：采集时模型无价会记为 0 成本；更新单价后点「补算 0 成本记录」，只重算这些 0 成本记录（不改动已有真实价格的记录，保证历史账目稳定）。
+1. **内置价**：项目自带一份常见模型的单价（随版本更新）。
+2. **LiteLLM 拉取**：点「从 LiteLLM 更新单价」从 [LiteLLM model_prices](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) 拉取最新单价，覆盖内置价。
+3. **手动编辑**：在单价表面板手动添加 / 覆盖任意模型的输入 / 输出 / 缓存读 / 缓存写单价。
 
-### API
+所有持久化的单价只存在本地 `usage.db` 的 `model_pricing` 表，与代码内置价合并后用于成本计算。已有记录的单价变更后可点「补算 0 成本记录」对历史数据重新算费。
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| POST | `/api/usage/collect` | 触发增量采集（解析本机 CLI 日志 → 算成本 → 落库），幂等 |
-| GET | `/api/usage/overview?days=&source=&model=` | 总览：四桶 token + 成本 + 缓存命中率 + 请求数 |
-| GET | `/api/usage/trend?days=&source=&model=` | 按天趋势（四桶 token + 成本，补零） |
-| GET | `/api/usage/models?days=&source=&metric=tokens\|cost` | 模型分布（Top 8 + 其他） |
-| GET | `/api/usage/log?days=&source=&model=&limit=&offset=` | 逐请求日志（分页） |
-| GET | `/api/usage/filters?days=` | 筛选项（已入库数据源 + 模型名列表） |
-| GET | `/api/usage/pricing` | 读取单价表 |
-| PUT | `/api/usage/pricing` | 新增 / 覆盖单个模型单价 |
-| DELETE | `/api/usage/pricing/{model_key}` | 删除自定义单价（内置不可删） |
-| POST | `/api/usage/pricing/litellm` | 从 LiteLLM 拉取并合并单价 |
-| POST | `/api/usage/pricing/rebill` | 用当前单价补算 0 成本记录 |
+## 卡片排序
 
-`days` 取值 1–365。`usage.db` 可用环境变量 `QUOTABOARD_USAGE_DB` 覆盖路径（测试隔离用）。
+仪表盘卡片默认按**分类**（Coding Plan → 订阅 → 余额 → 本地）分组展示。每个分类内部，可以**拖拽卡片右下角的把手（⠿）自由排序**：
 
-## `GET /api/quotas`：查询与缓存
-
-`GET /api/quotas?force=0&ids=ch_a,ch_b`
-
-- 不带任何参数：并行查询全部渠道（停用的渠道直接返回 `status: "disabled"`，不发起网络请求），按渠道 id 分别读写缓存。
-- `ids`：逗号分隔的渠道 id 列表，只查询/返回这些渠道（其它渠道的缓存条目完全不受影响，也不会被清掉）。不存在的 id 静默忽略。典型用途：卡片上的"刷新此渠道"按钮只应该刷新这一个渠道，不该把所有已配置渠道全部打一遍上游。
-- `force`：跳过缓存强制重新查询。和 `ids` 正交——`?ids=ch_a&force=1` 只强刷 `ch_a`，不影响其它渠道的缓存。不带 `ids` 时 `force=1` 会强刷全部渠道。
-
-单个渠道查询异常不会导致整个接口 500（内部用了 `asyncio.gather(..., return_exceptions=True)` 兜底成 `error` 结果）。
-
-### `ChannelResult.status` 取值
-
-`/api/quotas` 返回的每个渠道结果里的 `status` 字段，取值含义：
-
-| status | 含义 | 前端建议样式 |
-| --- | --- | --- |
-| `ok` | 查询成功，`windows`/`amount` 是真实额度数据 | 正常/绿色 |
-| `info` | 查询成功但不是"额度数据"——比如 Claude 已登录但本机没有可用 token，只能展示信息性说明（`message`）而非真实额度，`windows` 为空 | 信息/中性色，不要当成错误 |
-| `expired` | 凭据/API Key 过期或失效，需要用户重新登录或更换 Key | 警告/黄色或红色 |
-| `not_found` | 未登录/未找到凭据（订阅类渠道专属） | 中性/提示登录 |
-| `error` | 网络错误、上游返回异常、解析失败等其它错误 | 错误/红色 |
-| `disabled` | 渠道被用户停用，未发起查询 | 灰色/停用态 |
-
-## 缓存
-
-后端按**渠道 id** 分别缓存查询结果：成功缓存 60 秒，失败缓存 15 秒（对齐 cc-switch 的思路：错误短缓存方便快速重试，同时避免高频打官方接口触发风控）。之前的实现是整体缓存（任一渠道失败就把全局 TTL 都拖到 15s），已经改成按 id 独立缓存 + TTL。
-
-同一渠道如果正在查询中，并发的请求会等待同一个结果，而不是重复发起（比如多个浏览器标签页同时打开时，避免各自触发一次刷新、并发打上游）。
-
-渠道的增删改会失效对应渠道自己的缓存条目，不影响其它渠道。
-
-## 配置
-
-- 渠道与密钥保存在项目目录 `config.json`（原子写入，创建时即 `chmod 600`，已加入 `.gitignore`）；解析失败（文件损坏）时会把坏文件备份成 `config.json.corrupted.<时间戳>` 并报错，不会假装"没有渠道"（避免用户一保存就把损坏文件彻底覆盖，密钥全丢）。
-- 订阅类渠道无需密钥，检测到本机登录即可查询，未登录会显示「未登录」（`status: "not_found"`）。
-- 编辑渠道时：
-  - `api_key`/`ak`/`sk` 三个密钥字段留空、或者传回 `GET` 时拿到的打码值（如 `"sk-R********1234"`），都视为"不修改密钥"，沿用旧值——绝不会被打码串覆盖；
-  - 其它字段（`name`/`base_url`/`region`/`organization`/`project`/`user_id`/`enabled`）如果请求体里完全没提供该字段，也会沿用旧值，不会被清空或回退成默认值（比如前端的"启用/停用"快捷开关只发 `{"id","type","enabled"}` 这种最小 payload，不会把渠道的自定义名称、Base URL 等清掉）；如果字段**显式**传了空字符串/`null`，则视为用户想清空这个可选字段，按空值写入。
-- 新建渠道时，`type` 必须是已知渠道类型，且该类型 `fields` 列表里的必填项（`api_key`/`ak`/`sk`/`base_url`）不能为空；`region`/`organization`/`project`/`user_id` 永远是可选的。校验失败返回 `400`，`detail` 是中文说明。
-
-### 配置弹窗
-
-![配置弹窗](docs/config-modal.png)
-
-配置弹窗里可以新增 / 编辑 / 删除渠道，切换渠道类型时表单字段会动态变化（比如选火山方舟会变成 AccessKey / SecretKey / Region，选订阅类则提示"无需填密钥"）。底部还有配置导入 / 导出按钮。
-
-## 配置导入 / 导出
-
-配置弹窗底部有三个按钮：
-
-- **导出配置（含密钥）**：`GET /api/config/export?include_secrets=true`，导出完整 config.json（含明文密钥），适合个人备份 / 换机迁移。请妥善保管导出文件。
-- **导出（脱敏）**：`GET /api/config/export?include_secrets=false`，密钥字段（`api_key`/`ak`/`sk`）整体不导出，只导出渠道结构（名称、类型、base_url 等），可安全分享给他人参考配置。导入方需要自己填密钥。
-- **导入配置**：`POST /api/config/import?mode=merge|replace`，读取本地 JSON 文件。
-  - `merge`（默认）：追加到现有配置，同 id 渠道覆盖；导入数据里没带的密钥会沿用现有同 id 渠道的密钥（和编辑渠道时"留空表示不修改"一致）。
-  - `replace`：清空现有全部渠道后用导入的替换（危险操作，前端会二次确认）。
+- 拖动一张卡到同分类内另一张卡的位置，两张卡交换顺序；
+- 顺序持久化到浏览器 `localStorage`（`quotaboard_prefs.card_order`），刷新或重开浏览器后保留；
+- 新增的渠道会追加到该分类末尾；
+- 跨分类拖拽会被拦截（卡片归属哪个分类由后端决定，前端不能改）。
 
 ## 历史趋势
 
-每次成功的额度查询（`status: "ok"`）会自动追加一条趋势记录到 `history/<channel_id>.jsonl`（与 config.json 同目录），同一天（UTC）只保留最后一条。
+![历史趋势](docs/history-modal.png)
 
-- `GET /api/history?days=30&ids=ch_a,ch_b`：读取历史趋势数据。`days` 取值 1–365，`ids` 可选，不传则返回全部已配置渠道。每个渠道返回一个精简后的记录数组（只含 `ts`/`status`/`amount`/`windows`，不含 message/source 等易变文本）。
-- 前端顶栏「趋势」按钮打开历史趋势弹窗，用 SVG 折线图展示各渠道的余额 / 剩余百分比随时间的变化。只画已配置渠道的趋势；已删除渠道的孤儿 JSONL 不会返回。
-- 趋势记录是**附加价值**：磁盘写失败绝不影响额度查询（fire-and-forget，异常静默）。
-
-![历史趋势弹窗](docs/history-modal.png)
+点顶栏「趋势」打开。每次成功的额度查询会自动记录一条趋势点（历史数据存 `history/` 子目录下的 JSONL，与 config.json 同目录）。支持按渠道、按时间范围（7/14/30/90/180 天）筛选，用 SVG 折线图展示余额或剩余百分比随时间的变化。火山渠道的 Agent / Coding 两个套餐会分线展示。
 
 ## 低余额阈值告警
 
-设置弹窗里可以为每个渠道设置「剩余百分比阈值」。当某渠道的任一百分比窗口剩余低于该阈值时：
-
-- 卡片会高亮成琥珀色边框（`is-low-alert` 样式）；
-- 顶栏汇总徽章增加「低额度 N」计数。
-
-阈值仅保存在浏览器 `localStorage`（`quotaboard_prefs.thresholds`），不上传后端，不参与任何网络请求。
-
 ![设置弹窗](docs/settings-modal.png)
+
+在设置弹窗里为每个渠道设置「剩余百分比阈值」。低于阈值时：卡片边框标橙、状态点变红；顶栏汇总栏出现「低额度」计数。阈值只存在浏览器本地，不影响后端查询。
+
+## 配置导入 / 导出
+
+配置弹窗底部：
+
+- **导出配置（含密钥）**：导出完整的 `config.json`（含明文 API Key），用于个人备份 / 换机迁移。请妥善保管。
+- **导出（脱敏）**：导出不含密钥的渠道结构（类型 / 名称 / base_url 等），可安全分享给他人参考你的渠道配置。
+- **导入配置**：导入时会弹窗选择**合并**（追加到现有配置，同 id 覆盖，更安全推荐）或**替换**（清空现有全部渠道后替换）。
+
+## 不抢登录的设计
+
+所有订阅类渠道（Claude / Gemini / Grok / Codex / Copilot）只读本机 CLI 的凭据文件 / 钥匙串，**绝不刷新 token、绝不写入任何凭据副本**——你本机的 agent 登录状态完全不受打扰，QuotaX 只是一个只读的旁观者。token 过期时只会在卡片上提示「已过期」，需要你去对应 CLI 重新登录，QuotaX 不会代你做 OAuth refresh。
 
 ## CLI 终端集成
 
-项目自带命令行工具 `quotaboard`（复用与 Web 后端完全相同的查询与配置逻辑，一次性进程、无缓存、不写任何凭据副本）。用于终端 / tmux statusbar / shell prompt / 脚本：
+除了 WebUI，还提供命令行工具（`quotaboard`，通过 `uv run quotaboard` 调用），适合在终端、tmux、shell prompt 或脚本里一次性查询额度：
 
 ```bash
-uv run quotaboard quota                       # 文本分栏摘要（每渠道一行）
-uv run quotaboard quota --brief               # 单行紧凑摘要（tmux / prompt 用）
-uv run quotaboard quota --json                # 结构化 JSON（脚本 / jq 用）
-uv run quotaboard quota --ids ch_a,ch_b       # 只查指定渠道
-uv run quotaboard channels                    # 列出渠道（密钥打码）
-uv run quotaboard cost --days 14              # 本地已用统计（只读本机文件）
-uv run quotaboard config set-api-key --channel ch_a --key sk-xxx   # 脚本化更新密钥
+uv run quotaboard quota                  # 查询所有渠道额度摘要（终端分栏）
+uv run quotaboard quota --json           # JSON 输出（便于脚本解析）
+uv run quotaboard quota --brief          # 精简模式（适合放 shell prompt）
+uv run quotaboard quota --ids ch_a,ch_b  # 只查指定渠道
+uv run quotaboard channels               # 列出已配置渠道（密钥打码）
+uv run quotaboard cost --days 7          # 本地已用 token 统计
 ```
 
-`quota --brief` 输出示例（一个 ok 渠道 + 一个出错的渠道）：
+退出码：`0` 全部正常；`1` 有 error/expired 渠道；`2` 配置损坏或用法错误——适合在脚本里做健康检查。
 
-```
-DeepSeek 72% · Claude Pro 剩 31% · 中转站 ✗
-```
+## 缓存
 
-`--json` 输出的 `channels` 数组结构与 `GET /api/quotas` 完全一致（含 `status`/`amount`/`windows`/`reset_at`，火山双套餐同样会拆成 `<id>_agent`/`<id>_coding` 两条），脚本可以复用同一套解析逻辑。
-
-退出码约定：`0` 全部渠道正常（ok/info/disabled）；`1` 存在 error/expired/not_found 渠道；`2` 配置损坏或用例错误。订阅类渠道（Claude / Gemini / Grok / Codex / Copilot）在 CLI 里同样只读本机 CLI 凭据，不刷新、不写入。
-
-## 设置（主题 / 刷新频率）
-
-设置弹窗（顶栏齿轮图标）：
-
-- **主题**：跟随系统 / 浅色 / 深色 三选一。手动选择会脱离系统主题，通过 `<html data-theme="...">` 强制覆盖。选择保存在 `localStorage`，刷新后保留。
-- **自动刷新频率**：关闭 / 30 秒 / 1 分钟 / 90 秒（默认）/ 3 分钟 / 5 分钟。默认 90 秒略大于后端成功缓存 TTL（60 秒），确保定时刷新能拿到真正的新数据而不是一直命中缓存。
+为避免频繁打扰上游接口，每个渠道的查询结果在进程内有独立缓存：**成功缓存 60 秒，失败缓存 15 秒**。同一渠道在缓存有效期内的并发查询会合并成一次上游请求（请求去重 / in-flight 复用）。点顶栏「刷新」按钮可强制绕过缓存立即真查。
 
 ## 安全说明
 
-- **只读承诺**：所有订阅类渠道只读本机 CLI 凭据（`security find-generic-password -w` / `read_text`），没有任何写入 / 刷新 / `security add-generic-password` 调用；凭据过期只提示重新登录，绝不代刷 token。
-- **密钥存储**：`config.json` 和上传的 Codex 凭据文件均以 `0o600` 权限原子写入（临时文件创建时即带权限，不存在 world-readable 窗口，再 `os.replace` 原子替换）。
-- **DNS rebinding 防护**：服务无认证、只监听 127.0.0.1，但 `GET /api/config/export?include_secrets=true` 会返回明文密钥。仅"监听本机"不是安全边界——恶意网页可用 DNS rebinding 攻击。因此中间件校验 `Host` 请求头必须在白名单（`127.0.0.1` / `localhost` / `::1`）内，Host 是浏览器自动填写、JS 无法伪造的 forbidden header，能挡住这类跨站读取。
-- **路径穿越防护**：Codex 上传凭据的关联路径（`extra.codex_auth_file`）经 `resolve_codex_auth_file` 校验，必须解析到 config 同目录的 `credentials/` 子目录内、且文件名匹配 `codex_*.json`，挡住 `../../` 或绝对路径读取 / 删除任意文件。
-- **XSS 防护**：所有渲染到 DOM 的用户可控文本（渠道名、base_url、message、模型名等）均经 `esc()` 转义；渲染到 `href` 的 URL 额外经 `safeUrl()` 做 scheme 白名单（仅允许 `http/https`），挡住 `javascript:` 协议注入。
-
-## 参考实现
-
-余额/额度查询端点移植自开源项目：
-- [Proma](https://github.com/proma-ai/Proma)（DeepSeek / Kimi / MiniMax / 智谱 / Codex 查询）
-- [cc-switch](https://github.com/farion1231/cc-switch)（Claude / Gemini / Grok / Copilot 订阅用量、火山方舟 SigV4、阶跃/硅基/OpenRouter/Novita 余额、opencode 本地统计）
-- [xai-org/grok-build](https://github.com/xai-org/grok-build)（Grok CLI billing 端点与请求头）
-- [0xtbug/Mimo-Usage](https://github.com/0xtbug/Mimo-Usage)（小米 MiMo tokenPlan/usage 端点与请求头）
-- [Doueen/opencode-usage-extension](https://github.com/Doueen/opencode-usage-extension)（OpenCode Zen/Go 订阅额度 SSR 页面抓取与解析）
-- [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)（ChatGPT Codex OAuth PKCE 流程、client_id、id_token 解析）
-- [steipete/CodexBar](https://github.com/steipete/CodexBar)（Claude Code PTY `/usage` 探测：macOS Keychain token 为空时的终端文本解析方案）
-- [Buktal/VaultOne](https://github.com/Buktal/VaultOne)（用量统计深度分析看板：四桶分离计费、模型名归一化 fallback、LiteLLM 拉取、rebill 回填、cache-inclusive 归一化、增量采集游标、Codex/Gemini/Grok 日志解析口径）
+- 服务**只监听 `127.0.0.1`**，不对外暴露。
+- 所有凭据（API Key / AK·SK / Cookie）只存在本地 `config.json`（权限 `600`），不发送到任何第三方。
+- 订阅渠道只读本机 CLI 凭据，不刷新不写入。
+- 默认不跟随重定向（`follow_redirects: false`），防止恶意 base_url 3xx 跳转泄露 Authorization 头。
+- DNS rebinding 防护：校验请求 Host 头白名单，防止恶意网页跨域读取本机接口。
 
 ## 开发
 
 ```bash
-uv sync --group dev
-uv run pytest                     # Python 单测
-node --test tests/frontend/view-utils.test.mjs   # 前端纯函数单测（node:test）
-uv run ruff check app/ tests/     # lint
+git clone https://github.com/RunhuaHuang/quotax.git
+cd quotax
+uv sync                      # 安装依赖（复用本机 Python 3.11+）
+uv run pytest                # 跑测试（249 用例）
+uv run uvicorn app.main:app --port 8900   # 启动开发服务
 ```
 
-测试全部是纯函数 / 本地文件 / 临时 SQLite 上的单测，不发起任何真实网络请求，也不会读写项目根目录的真实 `config.json`（用 `tmp_path` + `QUOTABOARD_CONFIG` / monkeypatch 隔离）。
+测试时用环境变量指向临时配置，避免碰到真实的 `config.json`：
+
+```bash
+QUOTABOARD_CONFIG=/tmp/quotax-test/config.json uv run uvicorn app.main:app --port 8931
+```
+
+前端是纯静态文件（无构建步骤），改完 `static/` 下的 JS/CSS 刷新即可。
 
 ## 技术栈
 
-- **后端**：Python 3.11+ + FastAPI + httpx，无数据库（config.json + JSONL）。
-- **前端**：原生 HTML/CSS/JS（ES module），零构建步骤、零前端依赖，字体自托管。
-- **CLI**：复用后端查询逻辑，argparse 入口 `quotaboard`。
+- **后端**：Python 3.11+ · FastAPI · httpx · 无外部数据库（config.json + SQLite + JSONL）
+- **前端**：原生 ES Modules · 零构建零依赖 · 自托管字体（DM Sans + JetBrains Mono）
+- **运行时管理**：uv（自动管理 Python 版本与虚拟环境）
+
+## 参考实现
+
+- [CodexBar](https://github.com/steipete/CodexBar) — Claude PTY 用量探测、Codex 凭据解析
+- [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) — Codex OAuth PKCE 流程
+- [Buktal/VaultOne](https://github.com/Buktal/VaultOne) — 用量统计看板设计
+- [Doueen/opencode-usage-extension](https://github.com/Doueen/opencode-usage-extension) — OpenCode 额度解析
+- [BerriAI/litellm](https://github.com/BerriAI/litellm) — 模型单价表数据源
