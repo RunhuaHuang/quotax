@@ -101,7 +101,22 @@ quotax
 
 ### OpenCode (Zen/Go)
 
-opencode 官网是 SSR 页面、没有公开的 JSON API，额度数据（滚动 / 周 / 月三个周期的已用百分比和重置倒计时）以内嵌的 React Server Component 序列化字符串写在 `https://opencode.ai/workspace/<工作区ID>/go` 页面的 HTML 里。需要登录态，请登录 opencode.ai 后从浏览器复制两样东西填入渠道配置：① 完整 **Cookie**；② 地址栏里的**工作区 ID**（`wrk_xxx` 格式）。Cookie 只保存在本地 config.json（权限 600），仅用于只读查询。实现参考 [Doueen/opencode-usage-extension](https://github.com/Doueen/opencode-usage-extension)。
+opencode 官网是 SSR 页面、没有公开的 JSON API，额度数据（滚动 / 周 / 月三个周期的已用百分比和重置倒计时）以内嵌的 React Server Component 序列化字符串写在 `https://opencode.ai/workspace/<工作区ID>/go` 页面的 HTML 里。需要登录态，需要从浏览器复制两样东西填入渠道配置：① 完整 **Cookie**；② 地址栏里的**工作区 ID**（`wrk_xxx` 格式）。Cookie 只保存在本地 config.json（权限 600），仅用于只读查询。
+
+**获取 Cookie 的步骤（推荐用 Cookie-Editor 插件）：**
+
+1. 在 Chrome / Edge / Firefox 安装 [Cookie-Editor](https://cookie-editor.cgagnier.ca/) 插件（免费开源）。
+2. 浏览器登录 [opencode.ai](https://opencode.ai)，进入你的 workspace 页面（地址栏能看到 `wrk_xxx`）。
+3. 点击浏览器工具栏的 Cookie-Editor 图标，会列出当前站点的所有 Cookie。
+4. 找到名为 **`auth`** 的那一条（通常在列表顶部），点开它，复制 **Value** 字段的完整值。
+
+   ![用 Cookie-Editor 获取 opencode 的 auth cookie](docs/opencode-cookie.png)
+
+5. 也可以点底部「导出」按钮（带方框的图标）→ 选 **Export as Header**，得到一整段 `Cookie: name=value; ...` 文本，直接整段粘贴到渠道配置的 Cookie 字段即可（程序会自动解析）。
+
+> 如果不想装插件，也可以用浏览器开发者工具（F12 → Application/应用 → Cookies → `opencode.ai`）逐条复制，但 Cookie-Editor 的 Export as Header 更省事。
+
+实现参考 [Doueen/opencode-usage-extension](https://github.com/Doueen/opencode-usage-extension)。
 
 ### ChatGPT (Codex) 订阅
 

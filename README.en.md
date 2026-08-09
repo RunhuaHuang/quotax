@@ -101,7 +101,22 @@ The usage endpoint (`platform.xiaomimimo.com/api/v1/tokenPlan/usage`) only accep
 
 ### OpenCode (Zen/Go)
 
-opencode.ai is an SSR page with no public JSON API; quota data (rolling / weekly / monthly used-percentage and reset countdowns) is embedded as a serialized React Server Component string in the HTML of `https://opencode.ai/workspace/<workspace-id>/go`. Login is required — copy two things from your browser into the channel config after logging into opencode.ai: ① the full **Cookie**; ② the **Workspace ID** from the URL bar (`wrk_xxx` format). The Cookie is stored only in local config.json (permissions 600), used for read-only queries. Reference: [Doueen/opencode-usage-extension](https://github.com/Doueen/opencode-usage-extension).
+opencode.ai is an SSR page with no public JSON API; quota data (rolling / weekly / monthly used-percentage and reset countdowns) is embedded as a serialized React Server Component string in the HTML of `https://opencode.ai/workspace/<workspace-id>/go`. Login is required — copy two things from your browser into the channel config after logging into opencode.ai: ① the full **Cookie**; ② the **Workspace ID** from the URL bar (`wrk_xxx` format). The Cookie is stored only in local config.json (permissions 600), used for read-only queries.
+
+**Steps to get the Cookie (Cookie-Editor extension recommended):**
+
+1. Install [Cookie-Editor](https://cookie-editor.cgagnier.ca/) in Chrome / Edge / Firefox (free, open-source).
+2. Log into [opencode.ai](https://opencode.ai) in the browser and open your workspace page (the URL bar shows `wrk_xxx`).
+3. Click the Cookie-Editor icon in the browser toolbar — it lists all cookies for the current site.
+4. Find the one named **`auth`** (usually at the top), expand it, and copy the full **Value** field.
+
+   ![Getting the opencode auth cookie via Cookie-Editor](docs/opencode-cookie.png)
+
+5. Alternatively, click the "Export" button (the boxed icon) at the bottom → choose **Export as Header** to get a full `Cookie: name=value; ...` string — paste the whole thing into the channel config's Cookie field (the app parses it automatically).
+
+> If you'd rather not install an extension, use the browser DevTools (F12 → Application → Cookies → `opencode.ai`) and copy each cookie — but Cookie-Editor's "Export as Header" is far more convenient.
+
+Reference: [Doueen/opencode-usage-extension](https://github.com/Doueen/opencode-usage-extension).
 
 ### ChatGPT (Codex) subscription
 
