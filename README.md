@@ -24,7 +24,36 @@
 
 ![QuotaX 仪表盘（深色）](docs/dashboard-dark.png)
 
-## 启动
+## 一键安装
+
+打开终端，粘贴对应你系统的命令回车即可——脚本会自动下载源码、安装 `uv` 与全部依赖、启动服务，最后帮你打开浏览器。
+
+**macOS / Linux：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.sh | bash
+```
+
+**Windows（PowerShell）：**
+
+```powershell
+irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
+```
+
+> - 首次安装会下载 Python 3.13 与依赖，请耐心等待 1–2 分钟。
+> - 默认安装到 `~/QuotaX`（Windows 为 `%USERPROFILE%\QuotaX`），服务监听 `127.0.0.1:8900`。
+> - **网络不通 / GitHub 被墙？** 脚本内置多源镜像自动 fallback；也可手动指定镜像：
+>   ```bash
+>   QUOTAX_MIRROR=https://ghfast.top bash -c "$(curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.sh)"
+>   ```
+>   ```powershell
+>   $env:QUOTAX_MIRROR='https://ghfast.top'; irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
+>   ```
+> - **升级**：重新跑一次同样的命令即可，`config.json` / `usage.db` / `history/` 等个人数据会自动保留。
+> - **停止服务**：`lsof -ti tcp:8900 | xargs kill`（macOS/Linux），或关闭后台 PowerShell 进程（Windows）。
+> - **再次启动**：`cd ~/QuotaX && uv run uvicorn app.main:app --port 8900`。
+
+## 启动（源码方式）
 
 ```bash
 ./run.sh          # 或: uv run uvicorn app.main:app --port 8900
