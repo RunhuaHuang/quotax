@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from ..config import Channel
 from ..models import ChannelResult
-from . import balances, coding_plans, mimo, subscriptions, volcengine
+from . import balances, coding_plans, mimo, opencode, subscriptions, volcengine
 
 REGISTRY: dict[str, object] = {
     # 余额类
@@ -33,6 +33,7 @@ REGISTRY: dict[str, object] = {
     "grok_subscription": subscriptions.query_grok,
     "codex_subscription": subscriptions.query_codex,
     "copilot_subscription": subscriptions.query_copilot,
+    "opencode_subscription": opencode.query_opencode,
 }
 
 

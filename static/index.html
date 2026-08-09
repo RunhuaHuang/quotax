@@ -22,7 +22,7 @@
 </script>
 <!-- 自托管字体（DM Sans + JetBrains Mono，零外网依赖） -->
 <link rel="stylesheet" href="/static/fonts/fonts.css">
-<link rel="stylesheet" href="/static/styles.css">
+<link rel="stylesheet" href="/static/styles.css?v=5">
 </head>
 <body>
 
@@ -85,14 +85,26 @@
 </header>
 
 <main>
-  <div id="lastUpdated" class="last-updated"></div>
+  <!-- 视图切换 Tab：额度（现有 dashboard）/ 用量统计（深度分析看板） -->
+  <nav class="view-tabs" id="viewTabs" role="tablist">
+    <button class="view-tab active" data-view="quota" role="tab" aria-selected="true">额度</button>
+    <button class="view-tab" data-view="usage" role="tab" aria-selected="false">用量统计</button>
+  </nav>
 
-  <div id="dashboard" class="dashboard">
-    <!-- 卡片按分类分组渲染 -->
-  </div>
+  <!-- 视图：额度（原有内容） -->
+  <section id="view-quota" class="view-pane active">
+    <div id="lastUpdated" class="last-updated"></div>
+    <div id="dashboard" class="dashboard">
+      <!-- 卡片按分类分组渲染 -->
+    </div>
+    <!-- 每个本地统计来源（Claude Code / OpenCode ...）各渲染一个区块，由 app.js 动态生成 -->
+    <section id="localUsage" class="local-wrap hidden"></section>
+  </section>
 
-  <!-- 每个本地统计来源（Claude Code / OpenCode ...）各渲染一个区块，由 app.js 动态生成 -->
-  <section id="localUsage" class="local-wrap hidden"></section>
+  <!-- 视图：用量统计（深度分析看板，由 usage.js 渲染） -->
+  <section id="view-usage" class="view-pane">
+    <div id="usageView"></div>
+  </section>
 </main>
 
 <footer class="footer">
@@ -213,6 +225,7 @@
 
 <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 
-<script type="module" src="/static/app.js"></script>
+<script type="module" src="/static/app.js?v=5"></script>
+<script type="module" src="/static/usage.js?v=5"></script>
 </body>
 </html>

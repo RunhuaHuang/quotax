@@ -45,7 +45,7 @@ class ConfigCorruptedError(RuntimeError):
 
 
 # 这些字段名即便出现在某个渠道的 fields 列表里也永远是可选的（新建渠道时不强制必填）。
-# api_key / ak / sk / base_url 才是各渠道自己 fields 列表里出现时的必填项。
+# api_key / ak / sk / base_url / workspace_id 才是各渠道自己 fields 列表里出现时的必填项。
 OPTIONAL_FIELD_NAMES = {"region", "organization", "project", "user_id"}
 
 # 渠道类型目录（含各类所需的配置字段、分类、默认名称）
@@ -184,6 +184,14 @@ PROVIDERS: dict[str, dict] = {
         "default_name": "GitHub Copilot",
         "manage_url": "https://github.com/settings/copilot",
     },
+    "opencode_subscription": {
+        "category": "subscription",
+        "label": "OpenCode (Zen/Go) 订阅",
+        # api_key 借用为 Cookie 存储（同 mimo）；workspace_id 可选——不填时自动从 Cookie 探测
+        "fields": ["api_key"],
+        "default_name": "OpenCode 订阅",
+        "manage_url": "https://opencode.ai/",
+    },
 }
 
 CATEGORY_LABELS = {
@@ -207,6 +215,7 @@ class Channel:
     organization: str | None = None
     project: str | None = None
     user_id: str | None = None  # new-api/one-api 部分部署需要 New-API-User 头配合系统访问令牌
+    workspace_id: str | None = None  # OpenCode 工作区 ID（wrk_xxx），拼进官网 SSR 页面路径
     enabled: bool = True
     extra: dict = field(default_factory=dict)
 
@@ -227,6 +236,8 @@ class Channel:
             d["project"] = self.project
         if self.user_id:
             d["user_id"] = self.user_id
+        if self.workspace_id:
+            d["workspace_id"] = self.workspace_id
         if self.extra:
             d["extra"] = self.extra
         if secret:
@@ -255,6 +266,7 @@ class Channel:
             organization=d.get("organization"),
             project=d.get("project"),
             user_id=d.get("user_id"),
+            workspace_id=d.get("workspace_id"),
             enabled=bool(d.get("enabled", True)),
             extra=d.get("extra") or {},
         )
@@ -358,6 +370,7 @@ _MERGE_ON_UPDATE_FIELDS = (
     "organization",
     "project",
     "user_id",
+    "workspace_id",
     "enabled",
     "extra",
 )

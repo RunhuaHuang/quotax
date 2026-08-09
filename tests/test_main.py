@@ -830,3 +830,147 @@ def test_host_whitelist_does_not_block_static_files(client):
 def test_host_whitelist_does_not_block_index_page(client):
     resp = client.get("/")
     assert resp.status_code == 200
+
+
+# ── Codex OAuth 端点（start / callback / poll）─────────────────
+
+
+def _make_fake_tokens():
+    """构造一个 mock CodexTokens，避免真实网络 token 交换。"""
+    from app import oauth
+
+    return oauth.CodexTokens(
+        access_token="at_fake",
+        refresh_token="rt_fake",
+        id_token="header.payload.sig",
+        account_id="acc_oauth_test",
+        email="oauth@test.com",
+        plan_type="plus",
+        expires_at_ms=9999999999999,
+    )
+
+
+async def _fake_exchange_ok(*a, **k):
+    """async mock：exchange_code 成功路径（exchange_code 本身是 async）。"""
+    return _make_fake_tokens()
+
+
+def test_codex_oauth_start_returns_authorize_url(client, monkeypatch):
+    """start 端点生成 authorize URL（mock 掉 1455 端口服务器，测试环境起不了）。"""
+    monkeypatch.setattr(app_main, "_start_callback_server", lambda loop: None)
+    resp = client.post("/api/auth/codex/start")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["authorize_url"].startswith("https://auth.openai.com/oauth/authorize?")
+    assert "client_id=app_EMoamEEZ73f0CkXaXp7hrann" in body["authorize_url"]
+    assert "code_challenge_method=S256" in body["authorize_url"]
+    # redirect_uri 必须是固定的 localhost:1455
+    assert "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback" in body["authorize_url"]
+    assert len(body["state"]) == 32
+
+
+def test_codex_oauth_callback_creates_channel(client, monkeypatch):
+    """OAuth 回调核心逻辑：mock token 交换成功 → 自动创建 codex 渠道 + 写凭据文件。
+
+    直接调用 _process_oauth_callback（1455 端口回调服务器内部就是调它），不经过
+    HTTP 端点——回调走的是独立的 1455 服务器而非主服务的 FastAPI 路由。
+    """
+    from app import oauth
+
+    monkeypatch.setattr(oauth, "exchange_code", _fake_exchange_ok)
+    # 先登记一个合法 state（回调要用它校验 CSRF）
+    state = "test_state_create"
+    oauth.store_flow(state, "verifier_x")
+
+    html = asyncio.run(app_main._process_oauth_callback("auth_code_xyz", state, None))
+    assert "授权成功" in html
+
+    # 渠道已自动创建
+    channels = client.get("/api/channels").json()
+    codex_channels = [c for c in channels if c["type"] == "codex_subscription"]
+    assert len(codex_channels) == 1
+    assert "oauth@test.com" in codex_channels[0]["name"]
+    assert codex_channels[0]["extra"]["codex_auth_file"].startswith("credentials/codex_")
+
+    # 结果已写入 _OAUTH_RESULTS（供 poll 取回）
+    result = app_main._OAUTH_RESULTS.pop(state, None)
+    assert result is not None
+    assert result["status"] == "ok"
+    assert result["email"] == "oauth@test.com"
+
+
+def test_codex_oauth_callback_rejects_unknown_state(client, monkeypatch):
+    """state 不匹配（CSRF 攻击 / 过期）必须拒绝，不能建渠道。"""
+    from app import oauth
+
+    monkeypatch.setattr(oauth, "exchange_code", _fake_exchange_ok)
+    html = asyncio.run(app_main._process_oauth_callback("c", "nonexistent_state", None))
+    assert "授权失败" in html
+    assert client.get("/api/channels").json() == []
+
+
+def test_codex_oauth_callback_handles_openai_error(client):
+    """OpenAI 回调带 error 参数（用户拒绝授权）时不应建渠道。"""
+    html = asyncio.run(app_main._process_oauth_callback(None, "any", "access_denied"))
+    assert "授权失败" in html
+    assert client.get("/api/channels").json() == []
+
+
+def test_codex_oauth_callback_token_exchange_failure(client, monkeypatch):
+    """token 交换失败时回调返回失败页、不建渠道。"""
+    from app import oauth
+
+    async def fail_exchange(*a, **k):
+        raise oauth.OAuthError("token exchange failed")
+
+    monkeypatch.setattr(oauth, "exchange_code", fail_exchange)
+    state = "test_state_fail"
+    oauth.store_flow(state, "v")
+    html = asyncio.run(app_main._process_oauth_callback("c", state, None))
+    assert "授权失败" in html
+    assert client.get("/api/channels").json() == []
+
+
+def test_codex_oauth_poll_returns_pending_then_result(client, monkeypatch):
+    """poll 端点：授权完成前返回 pending，完成后返回结果。"""
+    from app import oauth
+
+    monkeypatch.setattr(oauth, "exchange_code", _fake_exchange_ok)
+    state = "test_state_poll"
+    oauth.store_flow(state, "v")
+
+    # 还没回调 → pending
+    assert client.get(f"/api/auth/codex/poll?state={state}").json() == {"status": "pending"}
+
+    # 触发回调处理（写入 _OAUTH_RESULTS）
+    asyncio.run(app_main._process_oauth_callback("c", state, None))
+
+    # poll 取到结果（取出即删）
+    result = client.get(f"/api/auth/codex/poll?state={state}").json()
+    assert result["status"] == "ok"
+    assert "channel" in result
+    assert result["email"] == "oauth@test.com"
+
+    # 再 poll 已经空了（取出即删）
+    assert client.get(f"/api/auth/codex/poll?state={state}").json() == {"status": "pending"}
+
+
+def test_codex_oauth_created_channel_credentials_file_format(client, monkeypatch):
+    """OAuth 建的渠道，其凭据文件必须是合法 auth.json（能被 query_codex 链路解析）。"""
+    from app import oauth
+    from app.config import CONFIG_PATH
+    from app.credentials import CRED_OK, parse_codex_credentials
+
+    monkeypatch.setattr(oauth, "exchange_code", _fake_exchange_ok)
+    state = "test_state_cred"
+    oauth.store_flow(state, "v")
+    asyncio.run(app_main._process_oauth_callback("c", state, None))
+
+    channels = client.get("/api/channels").json()
+    ch = next(c for c in channels if c["type"] == "codex_subscription")
+    cred_path = CONFIG_PATH.parent / ch["extra"]["codex_auth_file"]
+    cred_content = cred_path.read_text(encoding="utf-8")
+    parsed = parse_codex_credentials(cred_content, str(cred_path))
+    assert parsed.status == CRED_OK
+    assert parsed.token == "at_fake"
+    assert parsed.extra["account_id"] == "acc_oauth_test"

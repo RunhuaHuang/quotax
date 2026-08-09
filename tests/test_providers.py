@@ -660,3 +660,303 @@ def test_query_zhipu_team_missing_api_key_is_reported_clearly():
     result = asyncio.run(coding_plans.query_zhipu_team(Channel(id="ch_zt", type="zhipu_team", name="GLM 团队")))
     assert result.status == "error"
     assert "API Key" in result.message
+
+
+# ── OpenCode query_opencode ────────────────────────────────────
+#
+# OpenCode 官网是 SSR 页面（没有 JSON API），额度数据以内嵌的 RSC 序列化字符串
+# 写在 HTML 里。测试覆盖：SSR HTML 成功解析三周期 / 未登录（302 + 登录页文案）/
+# 缺 Cookie / 缺工作区 ID / 页面结构变更（解析不到数据）五条路径。所有测试均
+# monkeypatch 模块级 request_text，不发起真实网络请求。
+
+# 模拟 opencode.ai /go 页面里内嵌的真实 RSC 数据结构（节选关键片段）
+_FAKE_OC_HTML = """
+<!DOCTYPE html><html><head><title>opencode</title></head><body>
+<script>self.$R=self.$R||[];</script>
+<script>_$HY.r["rollingUsage[\"wrk_test\"]"]=$R[10]=r=>(r?"rollingUsage":null)</script>
+rollingUsage:$R[123]={status:"active",resetInSec:86400,usagePercent:42}
+weeklyUsage:$R[124]={status:"active",resetInSec:432000,usagePercent:67}
+monthlyUsage:$R[125]={status:"active",resetInSec:2592000,usagePercent:35}
+<script>_$HY.fe()</script>
+</body></html>
+"""
+
+
+def _run_opencode(monkeypatch, html_response=None, exc=None):
+    """用写死的上游 HTML 跑一遍 query_opencode，不发起任何真实网络请求。"""
+    import asyncio
+
+    from app.config import Channel
+    from app.providers import opencode
+
+    if exc is not None:
+        async def fake_request_text(method, url, *, headers=None, json_body=None):
+            raise exc
+    else:
+        async def fake_request_text(method, url, *, headers=None, json_body=None):
+            return html_response
+
+    monkeypatch.setattr(opencode, "request_text", fake_request_text)
+    channel = Channel(
+        id="ch_oc",
+        type="opencode_subscription",
+        name="OpenCode",
+        api_key="auth=abc; session=xyz",
+        workspace_id="wrk_test",
+    )
+    return asyncio.run(opencode.query_opencode(channel))
+
+
+def test_query_opencode_parses_three_periods_from_ssr_html(monkeypatch):
+    result = _run_opencode(monkeypatch, html_response=_FAKE_OC_HTML)
+    assert result.status == "ok"
+    assert result.plan_name == "OpenCode (Zen/Go) 订阅"
+    by_label = {w.label: w for w in result.windows}
+    # rolling 映射成 five_hour（resetInSec=18000=5h，就是 5 小时额度）
+    assert set(by_label) == {"每 5 小时", "每周额度", "每月额度"}
+    assert by_label["每 5 小时"].used_percent == 42.0
+    assert by_label["每周额度"].used_percent == 67.0
+    assert by_label["每月额度"].used_percent == 35.0
+    # remaining_percent 应为 100 - used
+    assert by_label["每 5 小时"].remaining_percent == 58.0
+    # rolling 的 key 必须是 five_hour（而非 custom），否则前端 5h 槽位显示"未提供"
+    by_key = {w.key: w for w in result.windows}
+    assert "five_hour" in by_key
+    assert by_key["five_hour"].used_percent == 42.0
+    # reset_at 是「抓取时刻 + resetInSec」，这里只验证 resetInSec 的大小关系正确
+    assert by_label["每 5 小时"].reset_at > by_label["每周额度"].reset_at - 432000 * 1000
+
+
+def test_query_opencode_redirect_means_not_logged_in(monkeypatch):
+    # 未登录访问 /go 会被 302 重定向到 /auth/authorize（实测确认）
+    from app.net import ResponseError
+
+    result = _run_opencode(monkeypatch, exc=ResponseError(302, ""))
+    assert result.status == "expired"
+    assert "Cookie" in result.message
+
+
+def test_query_opencode_login_page_html_is_expired(monkeypatch):
+    # 退化路径：服务端返回 200 但内容是登录引导页
+    result = _run_opencode(
+        monkeypatch,
+        html_response="<html><body>Continue with GitHub Continue with Google</body></html>",
+    )
+    assert result.status == "expired"
+    assert "Cookie" in result.message
+
+
+def test_query_opencode_missing_cookie_is_reported(monkeypatch):
+    import asyncio
+
+    from app.config import Channel
+    from app.providers import opencode
+
+    result = asyncio.run(
+        opencode.query_opencode(
+            Channel(id="ch_oc", type="opencode_subscription", name="OC", workspace_id="wrk_test")
+        )
+    )
+    assert result.status == "error"
+    assert "Cookie" in result.message
+
+
+def test_query_opencode_auto_discovers_workspace_id(monkeypatch):
+    """workspace_id 未填时，自动从 /zen 页面探测 wrk_xxx，再用它查额度。"""
+    import asyncio
+
+    from app.config import Channel
+    from app.providers import opencode
+
+    async def fake_request_text(method, url, *, headers=None, json_body=None):
+        if "/zen" in url:
+            return '<html>workspace: wrk_AUTO_FOUND_123</html>'
+        return _FAKE_OC_HTML  # /go 页面
+
+    monkeypatch.setattr(opencode, "request_text", fake_request_text)
+    # 不填 workspace_id，只填 Cookie
+    channel = Channel(id="ch_oc", type="opencode_subscription", name="OC", api_key="Fe26.2**abc")
+    result = asyncio.run(opencode.query_opencode(channel))
+    assert result.status == "ok"
+    assert result.plan_name == "OpenCode (Zen/Go) 订阅"
+
+
+def test_query_opencode_auto_discover_fails_reports_helpful_error(monkeypatch):
+    """workspace_id 未填 + 自动探测也找不到 wrk_ 时，给出明确的操作指引。"""
+    import asyncio
+
+    from app.config import Channel
+    from app.providers import opencode
+
+    async def fake_request_text(method, url, *, headers=None, json_body=None):
+        if "/zen" in url:
+            return "<html>no workspace id here</html>"
+        return _FAKE_OC_HTML
+
+    monkeypatch.setattr(opencode, "request_text", fake_request_text)
+    channel = Channel(id="ch_oc", type="opencode_subscription", name="OC", api_key="Fe26.2**abc")
+    result = asyncio.run(opencode.query_opencode(channel))
+    assert result.status == "error"
+    assert "工作区 ID" in result.message
+
+
+def test_query_opencode_no_usage_data_in_html_is_error(monkeypatch):
+    # 页面结构变更：HTML 里没有 *Usage:$R 序列化字符串
+    result = _run_opencode(monkeypatch, html_response="<html><body>hello no quota here</body></html>")
+    assert result.status == "error"
+    assert "未解析到额度数据" in result.message
+
+
+def test_parse_opencode_usage_extracts_absolute_reset_at():
+    """解析函数用「抓取时刻 + resetInSec」换算绝对重置时间，而非直接存秒数。"""
+    from app.providers.opencode import parse_opencode_usage
+
+    fetched_at = 1_700_000_000_000  # 固定抓取时刻，避免依赖真实时钟
+    windows = parse_opencode_usage(_FAKE_OC_HTML, fetched_at)
+    rolling = next(w for w in windows if w.key == "five_hour")
+    # rolling resetInSec=86400 → reset_at = fetched_at + 86400*1000
+    assert rolling.reset_at == fetched_at + 86400 * 1000
+
+
+def test_query_opencode_extracts_wrk_id_from_url(monkeypatch):
+    """用户可能误填整条 URL，provider 应从中抠出 wrk_xxx 部分。"""
+    import asyncio
+
+    from app.config import Channel
+    from app.providers import opencode
+
+    captured = {}
+
+    async def fake_request_text(method, url, *, headers=None, json_body=None):
+        captured["url"] = url
+        return _FAKE_OC_HTML
+
+    monkeypatch.setattr(opencode, "request_text", fake_request_text)
+    channel = Channel(
+        id="ch_oc",
+        type="opencode_subscription",
+        name="OC",
+        api_key="auth=abc",
+        workspace_id="https://opencode.ai/workspace/wrk_abc123/go",
+    )
+    result = asyncio.run(opencode.query_opencode(channel))
+    assert result.status == "ok"
+    assert captured["url"] == "https://opencode.ai/workspace/wrk_abc123/go"
+
+
+def test_query_opencode_bare_cookie_value_gets_auth_prefix(monkeypatch):
+    """用户从浏览器复制的 auth cookie 值是裸串（Fe26.2**...），不含 `auth=` 前缀。
+    provider 必须自动补上 `auth=`，否则服务端拿不到 session 返回 302 登录。
+    回归背景：之前直接 headers["Cookie"] = cookie 把裸值发出去，每次都误报 expired。
+    """
+    import asyncio
+
+    from app.config import Channel
+    from app.providers import opencode
+
+    captured = {}
+
+    async def fake_request_text(method, url, *, headers=None, json_body=None):
+        captured["cookie"] = (headers or {}).get("Cookie", "")
+        return _FAKE_OC_HTML
+
+    monkeypatch.setattr(opencode, "request_text", fake_request_text)
+    # 裸 cookie 值（不带 auth= 前缀，模拟用户直接复制 cookie value）
+    channel = Channel(
+        id="ch_oc",
+        type="opencode_subscription",
+        name="OC",
+        api_key="Fe26.2**abc*def*ghi",
+        workspace_id="wrk_test",
+    )
+    result = asyncio.run(opencode.query_opencode(channel))
+    assert result.status == "ok"
+    # 裸值应被补成 auth=Fe26.2**abc*def*ghi
+    assert captured["cookie"] == "auth=Fe26.2**abc*def*ghi"
+
+
+def test_query_opencode_full_cookie_string_kept_as_is(monkeypatch):
+    """用户若已填了完整的 `auth=xxx` 或多个 cookie，原样使用，不重复加前缀。"""
+    import asyncio
+
+    from app.config import Channel
+    from app.providers import opencode
+
+    captured = {}
+
+    async def fake_request_text(method, url, *, headers=None, json_body=None):
+        captured["cookie"] = (headers or {}).get("Cookie", "")
+        return _FAKE_OC_HTML
+
+    monkeypatch.setattr(opencode, "request_text", fake_request_text)
+    channel = Channel(
+        id="ch_oc",
+        type="opencode_subscription",
+        name="OC",
+        api_key="auth=Fe26.2**abc; other=val",
+        workspace_id="wrk_test",
+    )
+    result = asyncio.run(opencode.query_opencode(channel))
+    assert result.status == "ok"
+    assert captured["cookie"] == "auth=Fe26.2**abc; other=val"
+
+
+# ── Claude utilization 语义：剩余比例，不是已用比例 ──────────────
+#
+# 回归背景：Claude 的 /api/oauth/usage 返回的 utilization 字段表示「剩余/可用
+# 比例」（0=全用完, 1=全可用），不是「已用比例」。之前误当已用处理，导致
+# 100%可用的窗口显示成 100%已用。交叉验证依据：utilization=1.0 时 limits 数组
+# 对应条目的 severity=normal（充足），而不是 critical。
+
+
+def _run_claude_usage(monkeypatch, api_response):
+    """mock token + API 响应，跑 query_claude。"""
+    from app.config import Channel
+    from app.credentials import CRED_OK, Credential
+    from app.providers import subscriptions
+
+    monkeypatch.setattr(
+        subscriptions, "read_claude_credentials",
+        lambda: Credential("sk-test", CRED_OK, "test"),
+    )
+
+    async def fake_request_json(method, url, *, headers=None, json_body=None):
+        return api_response
+
+    monkeypatch.setattr(subscriptions, "request_json", fake_request_json)
+    return asyncio.run(
+        subscriptions.query_claude(Channel(id="ch_c", type="claude_subscription", name="Claude"))
+    )
+
+
+def test_claude_utilization_is_used(monkeypatch):
+    """utilization 直接是「已用百分比」的数值（1.0 = 1%，不是 100%）。
+    PTY 交叉验证：CLI 显示 "Current session 1% used" 对应 utilization=1.0；
+    "Current week 0% used" 对应 utilization=0.0。"""
+    resp = {
+        "five_hour": {"utilization": 1.0, "resets_at": "2026-08-09T07:59:59+00:00"},
+        "seven_day": {"utilization": 0.0, "resets_at": "2026-08-15T10:59:59+00:00"},
+    }
+    result = _run_claude_usage(monkeypatch, resp)
+    assert result.status == "ok"
+    by_label = {w.label: w for w in result.windows}
+    # utilization=1.0 → 已用 1%（不是 100%！），剩余 99%
+    assert by_label["每 5 小时"].used_percent == 1.0
+    assert by_label["每 5 小时"].remaining_percent == 99.0
+    # utilization=0.0 → 已用 0%，剩余 100%
+    assert by_label["每周额度"].used_percent == 0.0
+    assert by_label["每周额度"].remaining_percent == 100.0
+
+
+def test_claude_utilization_partial(monkeypatch):
+    """utilization=35.0 → 已用 35%，剩余 65%。"""
+    resp = {
+        "five_hour": {"utilization": 35.0, "resets_at": "2026-08-09T07:59:59+00:00"},
+        "seven_day": {"utilization": 67.5, "resets_at": "2026-08-15T10:59:59+00:00"},
+    }
+    result = _run_claude_usage(monkeypatch, resp)
+    by_label = {w.label: w for w in result.windows}
+    assert by_label["每 5 小时"].used_percent == 35.0
+    assert by_label["每 5 小时"].remaining_percent == 65.0
+    assert by_label["每周额度"].used_percent == 67.5
+    assert by_label["每周额度"].remaining_percent == 32.5

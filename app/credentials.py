@@ -136,24 +136,17 @@ def _parse_claude_json(content: str, source: str) -> Credential:
     if not token:
         # 已登录（有 subscriptionType 等元信息），但本机没有存明文 access token。
         # 这主要发生在 macOS：新版 Claude Code 把凭据存进 Keychain，但只留元信息、
-        # 不留明文 accessToken（系统安全策略限制第三方读取）。Windows/Linux 版把
-        # 凭据写成 ~/.claude/.credentials.json 明文文件，accessToken 齐全，可正常
-        # 查询官方用量——所以这个"查不到"是 macOS 专属现象，不是账号问题。
-        is_mac_keychain = source.startswith("macOS Keychain")
-        where = "本机钥匙串" if is_mac_keychain else "本机凭据文件"
+        # 不留明文 accessToken（系统安全策略限制第三方读取）。此时本项目会自动尝试
+        # PTY 探测（启动 claude CLI 执行 /usage）——但如果 CLI 本身也未登录（auth
+        # token 为空），PTY 同样拿不到用量，才会走到这里展示本地统计作为替代。
+        # 解决办法：在终端运行一次 claude 完成登录，PTY 即可自动获取实时用量。
         plan_hint = f"（{subscription_type}）" if subscription_type else ""
-        if is_mac_keychain:
-            message = (
-                f"已检测到 Claude Code 登录{plan_hint}，但 macOS 钥匙串未存储可读取的 "
-                "access token（新版 Claude Code 的安全策略），无法查询官方用量窗口。"
-                "下方展示本地 transcript 统计作为替代。"
-                "（Windows / Linux 版 Claude Code 凭据为明文文件，可正常查询官方用量。）"
-            )
-        else:
-            message = (
-                f"已检测到 Claude Code 登录{plan_hint}，但{where}未存储可用的 access token，"
-                "无法查询官方用量窗口；下方展示本地 transcript 统计。"
-            )
+        message = (
+            f"已检测到 Claude Code 登录{plan_hint}，但本机未存储可读取的 access token，"
+            "PTY 探测也未获取到用量（Claude CLI 可能未登录）。"
+            "请在终端运行一次 claude 完成登录，之后即可自动获取实时用量；"
+            "下方暂时展示本地 transcript 统计作为替代。"
+        )
         return Credential(
             "",
             CRED_NO_TOKEN,
@@ -168,7 +161,10 @@ def _parse_claude_json(content: str, source: str) -> Credential:
 
     if _expired(entry.get("expiresAt") or entry.get("expires_at")):
         return Credential(token, CRED_EXPIRED, source, "Claude 登录已过期，请重新运行 claude 登录")
-    return Credential(token, CRED_OK, source)
+    return Credential(
+        token, CRED_OK, source,
+        extra={"subscription_type": subscription_type, "rate_limit_tier": rate_limit_tier},
+    )
 
 
 # ── Gemini CLI ──────────────────────────────────────────────

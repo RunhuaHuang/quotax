@@ -22,10 +22,14 @@ from . import config as config_store
 from . import credentials as credentials_store
 from . import history as history_store
 from . import local_usage
+from . import oauth as oauth_store
 from .credentials import CRED_OK
 from .models import ChannelResult, fail
 from .net import aclose, friendly_error
 from .providers import channel_category, query_channel
+from .usage import collect as usage_collect
+from .usage import pricing as usage_pricing
+from .usage import store as usage_store
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -72,11 +76,14 @@ def _canonical_channel_id(channel_id: str) -> str:
     return channel_id
 
 
-# 结果缓存：按渠道 id 分别缓存，成功 60s / 失败 15s（对齐 cc-switch：错误短缓存
-# 以便快速重试，同时避免高频打官方接口触发风控）。之前是整体 all-or-nothing——
-# 任一渠道失败就把全局 TTL 都降到 15s，导致成功的渠道也被牵连着每 15 秒重查。
-QUOTA_CACHE_TTL_MS = 60_000
-QUOTA_ERROR_CACHE_TTL_MS = 15_000
+# 结果缓存：按渠道 id 分别缓存，成功 5 分钟 / 失败 15 分钟。
+# 成功结果缓存 5 分钟：额度数据本身变化不快，5 分钟足够新鲜，且大幅减少对上游
+# 接口的请求频率（避免触发 Anthropic / OpenAI 等的速率限制 429）。
+# 失败结果缓存 15 分钟：错误（尤其 429 限流）不宜快速重试——15 秒重试只会持续
+# 撞限流，15 分钟给上游足够冷却时间。用户需要立刻重试时点「刷新」按钮（force=1
+# 绕过缓存）即可。
+QUOTA_CACHE_TTL_MS = 300_000
+QUOTA_ERROR_CACHE_TTL_MS = 900_000
 _cache: dict[str, tuple[float, dict]] = {}
 # 在飞的查询 task，按渠道 id 登记。值是 (task, 发起时的配置代际)——复用一个仍在
 # 运行的 task 前必须比对代际：若期间发生过 import_config / 编辑渠道（_generation
@@ -239,6 +246,7 @@ class ChannelPayload(BaseModel):
     organization: str | None = None
     project: str | None = None
     user_id: str | None = None
+    workspace_id: str | None = None
     enabled: bool = True
     # dict | None（不是单纯 dict）：允许一个把所有字段都发过来、空值发 null 的
     # 前端显式传 "extra": null，而不是被结构校验拒掉；config_store.Channel.
@@ -414,6 +422,250 @@ async def upload_codex_credentials(channel_id: str, payload: CodexCredentialPayl
         raise HTTPException(status_code=400, detail=str(e)) from e
     await _invalidate_cache(channel_id)
     return {"ok": True, "source": str(path), "account_id": cred.extra.get("account_id")}
+
+
+# ── Codex OAuth 在线授权 ──────────────────────────────────────
+#
+# redirect_uri 固定 http://localhost:1455/auth/callback（OpenAI 对 client_id 做
+# 精确 redirect_uri 白名单校验，只认这一个）。因此 OAuth 回调不走主服务的 HTTP
+# 路由，而是在 start 端点临时启动一个 1455 端口的轻量 HTTP 服务器接收回调（与
+# Codex CLI / cliproxyapi 的做法一致）。服务器在 OAuth 完成（或超时）后关闭。
+
+# OAuth 回调结果暂存：1455 回调服务器写入、/api/auth/codex/poll 读出（按 state）。
+_OAUTH_RESULTS: dict[str, dict] = {}
+
+
+def _build_oauth_result_html(title: str, message: str) -> str:
+    """OAuth 回调结果页（纯静态 HTML，样式内联，不依赖外部 CSS）。"""
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} - QuotaX</title>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;
+    background:#0f1117;color:#e6e6e6;}}
+  .card{{text-align:center;padding:48px 32px;max-width:420px;}}
+  .icon{{width:56px;height:56px;margin:0 auto 20px;border-radius:50%;
+    display:flex;align-items:center;justify-content:center;font-size:28px;
+    background:{'#10a37f' if title == '授权成功' else '#ef4444'};color:#fff;}}
+  h1{{font-size:20px;margin:0 0 12px;font-weight:600;}}
+  p{{font-size:14px;line-height:1.6;color:#999;margin:0;}}
+</style></head>
+<body><div class="card">
+  <div class="icon">{'✓' if title == '授权成功' else '✕'}</div>
+  <h1>{title}</h1><p>{message}</p>
+</div></body></html>"""
+
+
+def _esc_html(s: str) -> str:
+    """极简 HTML 转义（OAuth 结果页是后端拼的静态 HTML，需转义用户可控内容）。"""
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+# 活跃的 OAuth 回调服务器引用：同一时刻只允许一个 1455 端口服务器（端口唯一，
+# 第二次 start 时若上一个还在跑会端口冲突）。新流程开始前先关掉旧的。
+_oauth_server_lock = asyncio.Lock()
+_active_oauth_server: dict = {}
+
+
+async def _process_oauth_callback(code: str | None, state: str | None, error: str | None) -> str:
+    """OAuth 回调核心处理：换 token → 建/关联渠道 → 写结果 → 返回 HTML 给浏览器。
+
+    被 1455 端口回调服务器调用（同步上下文里通过 run_coroutine_threadsafe 调入）。
+    成功/失败都返回一段 HTML，显示在 OAuth 弹出的浏览器窗口里，用户看完关掉即可。
+    """
+    base_state = state or ""
+
+    if error:
+        _OAUTH_RESULTS[base_state] = {"status": "error", "message": f"OpenAI 授权失败: {error}"}
+        return _build_oauth_result_html("授权失败", f"OpenAI 返回错误: {_esc_html(error)}")
+
+    if not code or not state:
+        _OAUTH_RESULTS[base_state] = {"status": "error", "message": "回调缺少 code 或 state 参数"}
+        return _build_oauth_result_html("授权失败", "回调缺少必要参数")
+
+    # 取回 code_verifier（同时校验 state——take_flow 内置 pop，state 不匹配返回 None）
+    verifier = oauth_store.take_flow(base_state)
+    if verifier is None:
+        _OAUTH_RESULTS[base_state] = {
+            "status": "error",
+            "message": "OAuth 状态已过期或不匹配（state 校验失败），请重新发起授权",
+        }
+        return _build_oauth_result_html("授权失败", "授权状态已过期，请回到 QuotaX 重新点击登录")
+
+    try:
+        tokens = await oauth_store.exchange_code(code, verifier)
+    except oauth_store.OAuthError as e:
+        _OAUTH_RESULTS[base_state] = {"status": "error", "message": str(e)}
+        return _build_oauth_result_html("授权失败", _esc_html(str(e)))
+
+    # 生成 auth.json 并新建 codex 渠道（复用上传凭据的存储/查询链路）
+    auth_content = oauth_store.tokens_to_auth_json(tokens)
+    name = f"Codex ({tokens.email})" if tokens.email else "Codex (OAuth)"
+    channel = config_store.upsert_channel(
+        {"type": "codex_subscription", "name": name, "enabled": True},
+        provided_fields={"type", "name", "enabled"},
+    )
+    cred_dir = config_store.CONFIG_PATH.parent / "credentials"
+    cred_dir.mkdir(parents=True, exist_ok=True)
+    rel_path = f"credentials/codex_{channel.id}.json"
+    cred_path = cred_dir / f"codex_{channel.id}.json"
+    fd = os.open(str(cred_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(auth_content)
+    except BaseException:
+        try:
+            os.unlink(str(cred_path))
+        except OSError:
+            pass
+        raise
+    extra = dict(channel.extra)
+    extra["codex_auth_file"] = rel_path
+    config_store.upsert_channel(
+        {"id": channel.id, "type": channel.type, "extra": extra},
+        provided_fields={"id", "type", "extra"},
+    )
+    await _invalidate_cache(channel.id)
+
+    _OAUTH_RESULTS[base_state] = {
+        "status": "ok",
+        "channel": channel.to_dict(secret=False),
+        "account_id": tokens.account_id,
+        "email": tokens.email,
+    }
+    account_info = f"（{_esc_html(tokens.email)}）" if tokens.email else ""
+    return _build_oauth_result_html(
+        "授权成功",
+        f"已自动添加 Codex 渠道{account_info}，可以关闭此窗口回到 QuotaX。",
+    )
+
+
+def _start_callback_server(loop: object) -> None:
+    """在 1455 端口启动一个轻量 HTTP 服务器接收 OAuth 回调（同步阻塞，用线程跑）。
+
+    用标准库 http.server（而非 starlette/uvicorn）——这是个只接收一次回调就关闭
+    的临时服务器，没必要走 ASGI。服务器跑在后台线程里，收到回调后通过
+    run_coroutine_threadsafe 把处理逻辑调度回主事件循环（_process_oauth_callback
+    是 async 的，因为它要 await exchange_code / _invalidate_cache）。
+
+    loop 必须由调用方在主事件循环上下文里传进来（本函数会被 to_thread 调到工作线程，
+    工作线程里 asyncio.get_event_loop() 拿不到主循环）。
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):  # 静默默认日志（避免污染 uvicorn 输出）
+            pass
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path != "/auth/callback":
+                self.send_response(404)
+                self.end_headers()
+                return
+            qs = parse_qs(parsed.query)
+            code = qs.get("code", [None])[0]
+            state = qs.get("state", [None])[0]
+            error = qs.get("error", [None])[0]
+
+            # 调度回主事件循环处理（async），同步等待结果拿到 HTML
+            future = asyncio.run_coroutine_threadsafe(
+                _process_oauth_callback(code, state, error), loop
+            )
+            try:
+                html = future.result(timeout=30)
+            except Exception as e:  # 处理超时或异常——给用户一个错误页，不裸 500
+                html = _build_oauth_result_html("授权失败", _esc_html(f"处理回调时出错: {e}"))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode("utf-8"))
+            # 处理完即停服务器（回调是一次性的），释放 1455 端口给下一次 OAuth
+            _stop_callback_server()
+
+    def _run():
+        try:
+            httpd = HTTPServer(("127.0.0.1", oauth_store.CALLBACK_PORT), _Handler)
+            _active_oauth_server["server"] = httpd
+            _active_oauth_server["thread"] = threading.current_thread()
+            httpd.serve_forever()
+        except OSError:
+            # 端口被占（用户可能同时在用 Codex CLI 登录）——记下，start 端点会据此报错
+            _active_oauth_server["error"] = "port_in_use"
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    # 给服务器一点点时间启动，让 start 端点能检测到端口占用错误
+    time.sleep(0.15)
+
+
+def _stop_callback_server() -> None:
+    """关闭 1455 端口的回调服务器，释放端口。"""
+    httpd = _active_oauth_server.pop("server", None)
+    if httpd is not None:
+        try:
+            httpd.shutdown()
+            httpd.server_close()
+        except OSError:
+            pass
+
+
+@app.post("/api/auth/codex/start")
+async def codex_oauth_start():
+    """发起 Codex OAuth：生成 PKCE + state，启动 1455 回调服务器，返回 authorize URL。
+
+    前端拿到 URL 后用 window.open() 在用户浏览器里打开（authorize 页有 Cloudflare
+    挑战，必须真实浏览器访问）。OpenAI 授权完成后回调 localhost:1455/auth/callback，
+    临时服务器收到 code 后换 token、建渠道、把结果写进 _OAUTH_RESULTS，前端通过
+    /api/auth/codex/poll 轮询拿到结果。
+    """
+    async with _oauth_server_lock:
+        # 先关掉上一次未完成的回调服务器（端口唯一，不关会端口冲突）
+        _stop_callback_server()
+        _active_oauth_server.clear()
+        # 在主事件循环上下文拿到 loop，传给工作线程里的回调服务器（它要靠这个 loop
+        # 把 async 的 _process_oauth_callback 调度回来）。to_thread 的工作线程里
+        # get_event_loop() 会失败，所以必须在主线程侧取好再传进去。
+        loop = asyncio.get_running_loop()
+        # start_callback_server 是同步阻塞的（含 time.sleep + 线程启动），放线程里跑
+        await asyncio.to_thread(_start_callback_server, loop)
+        if _active_oauth_server.get("error") == "port_in_use":
+            raise HTTPException(
+                status_code=409,
+                detail=f"OAuth 回调端口 {oauth_store.CALLBACK_PORT} 被占用（可能 Codex CLI 正在登录），"
+                "请关闭占用该端口的程序后重试",
+            )
+
+    state = oauth_store.generate_state()
+    verifier, challenge = oauth_store.generate_pkce()
+    oauth_store.store_flow(state, verifier)
+    return {
+        "authorize_url": oauth_store.build_authorize_url(state, challenge),
+        "state": state,
+    }
+
+
+@app.get("/api/auth/codex/poll")
+async def codex_oauth_poll(state: str):
+    """前端轮询 OAuth 完成状态。
+
+    1455 回调服务器在 token 交换成功后把结果暂存进 _OAUTH_RESULTS，前端用 state
+    轮询这里拿结果（成功则拿到新渠道，失败则拿到错误）。未完成返回 pending。
+    """
+    result = _OAUTH_RESULTS.pop(state, None)
+    if result is None:
+        return {"status": "pending"}
+    return result
 
 
 # ── /api/quotas：按渠道 id 分别缓存 + 请求合并 ─────────────────
@@ -656,6 +908,154 @@ async def opencode_usage(days: int = 14):
     """向后兼容的薄封装：只返回 opencode 这一个数据源，扁平结构。"""
     days = min(max(days, 1), 90)
     return await asyncio.to_thread(local_usage.get_opencode_usage, days)
+
+
+# ── 用量统计（深度分析看板）─────────────────────────────────────
+#
+# 与 /api/local-usage（实时全量聚合、不落库）不同，这一组接口走 SQLite 持久化：
+# 采集（解析本机 CLI 日志）→ 落库 → 聚合查询（趋势 / 模型分布 / 请求日志）。
+# 数据源：Claude Code / Codex / Gemini CLI / Grok CLI / OpenCode 本地日志，只读。
+# 成本由 PricingTable 估算（LiteLLM 单价表），不是上游真实账单——仅作参考。
+
+
+@app.post("/api/usage/collect")
+async def usage_collect_endpoint():
+    """触发增量采集：扫描本机各 CLI 日志的新增内容，算成本后落库。
+
+    幂等：重复调用只处理增量（每个文件记 mtime + line_offset 游标）。
+    采集在 to_thread 里跑（文件 / SQLite I/O 是同步阻塞）。
+    """
+    return await asyncio.to_thread(usage_collect.collect_all)
+
+
+@app.get("/api/usage/overview")
+async def usage_overview(
+    days: int = 14, source: str | None = None, model: str | None = None
+):
+    """用量总览：四桶 token + 总成本 + 缓存命中率 + 请求数。"""
+    days = min(max(days, 1), 365)
+    return await asyncio.to_thread(
+        lambda: usage_store.query_overview(days, source or None, model or None)
+    )
+
+
+@app.get("/api/usage/trend")
+async def usage_trend(
+    days: int = 14, source: str | None = None, model: str | None = None
+):
+    """按天趋势：每天四桶 token + 成本（补零，供趋势曲线）。"""
+    days = min(max(days, 1), 365)
+    return await asyncio.to_thread(
+        lambda: usage_store.query_trend(days, source or None, model or None)
+    )
+
+
+@app.get("/api/usage/models")
+async def usage_models(
+    days: int = 14, source: str | None = None, metric: str = "tokens"
+):
+    """按模型分布：Top 8 + 其他汇总。metric=tokens|cost 控制排序度量。"""
+    days = min(max(days, 1), 365)
+    metric = "cost" if metric == "cost" else "tokens"
+    return await asyncio.to_thread(
+        lambda: usage_store.query_model_breakdown(days, source or None, metric)
+    )
+
+
+@app.get("/api/usage/log")
+async def usage_log(
+    days: int = 14,
+    source: str | None = None,
+    model: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+):
+    """逐请求日志（分页，按时间倒序）。"""
+    days = min(max(days, 1), 365)
+    limit = min(max(limit, 1), 1000)
+    offset = max(offset, 0)
+    return await asyncio.to_thread(
+        lambda: usage_store.query_request_log(days, source or None, model or None, limit, offset)
+    )
+
+
+@app.get("/api/usage/filters")
+async def usage_filters(days: int = 30):
+    """筛选项：已入库的数据源 + 窗口内的模型名列表，供前端下拉填充。"""
+    days = min(max(days, 1), 365)
+    return await asyncio.to_thread(
+        lambda: {"sources": usage_store.query_sources(), "models": usage_store.query_models(days)}
+    )
+
+
+# ── 单价表（定价）读 / 写 / LiteLLM 更新 ─────────────────────────
+
+
+@app.get("/api/usage/pricing")
+async def usage_pricing_get():
+    """读取当前单价表（内置 + 持久化的用户修改 + LiteLLM 拉取项）。"""
+    book = usage_collect.get_book()
+    return {"entries": book.entries()}
+
+
+@app.put("/api/usage/pricing")
+async def usage_pricing_put(payload: dict):
+    """新增 / 覆盖单个模型单价。payload:
+    {model_key, input_per_million, output_per_million, cache_read_per_million,
+     cache_creation_per_million}
+
+    写入后落盘持久化。空字段视为 0（不计费）。
+    """
+    model_key = (payload.get("model_key") or "").strip()
+    if not model_key:
+        raise HTTPException(status_code=400, detail="model_key 不能为空")
+    book = usage_collect.get_book()
+    book.upsert(
+        model_key,
+        payload.get("input_per_million") or 0,
+        payload.get("output_per_million") or 0,
+        payload.get("cache_read_per_million") or 0,
+        payload.get("cache_creation_per_million") or 0,
+        is_builtin=False,
+    )
+    await asyncio.to_thread(usage_store.save_pricing, book)
+    return {"ok": True, "entries": book.entries()}
+
+
+@app.delete("/api/usage/pricing/{model_key}")
+async def usage_pricing_delete(model_key: str):
+    """删除一个自定义单价项。内置价不允许删（返回 400）。"""
+    book = usage_collect.get_book()
+    # 找原始条目判断是否内置
+    entries = {e["model_key"]: e for e in book.entries()}
+    target = entries.get(usage_pricing.normalize_key(model_key))
+    if target is None:
+        raise HTTPException(status_code=404, detail="单价项不存在")
+    if target["is_builtin"]:
+        raise HTTPException(status_code=400, detail="内置价格不可删除，可编辑覆盖")
+    book.remove(model_key)
+    await asyncio.to_thread(usage_store.save_pricing, book)
+    return {"ok": True}
+
+
+@app.post("/api/usage/pricing/litellm")
+async def usage_pricing_litellm():
+    """从 LiteLLM 拉取全网模型单价，合并进当前单价表并落盘。
+
+    网络失败时单价表保持不变，返回 error 说明原因。
+    """
+    book = usage_collect.get_book()
+    result = await asyncio.to_thread(usage_pricing.update_from_litellm, book)
+    if result["error"] is None:
+        await asyncio.to_thread(usage_store.save_pricing, book)
+    return result
+
+
+@app.post("/api/usage/pricing/rebill")
+async def usage_pricing_rebill():
+    """用当前单价表重算所有"当初无价记为 0"的记录成本（只补 0，不改已有价）。"""
+    book = usage_collect.get_book()
+    return await asyncio.to_thread(usage_store.rebill_zero_cost, book)
 
 
 # ── 配置导入/导出 ─────────────────────────────────────────────

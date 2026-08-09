@@ -65,12 +65,14 @@ def test_claude_no_token_real_world_diagnosis_case():
     assert "重新运行" not in cred.message
 
 
-def test_claude_no_token_message_mentions_source_kind():
+def test_claude_no_token_message_guides_user_to_login():
+    """CRED_NO_TOKEN 的文案应提醒用户去终端登录（PTY fallback 依赖 CLI 登录态），
+    而不是说"无法查询"——因为有 PTY 探测，登录后即可自动获取用量。"""
     content = json.dumps({"claudeAiOauth": {"accessToken": "", "subscriptionType": "max"}})
     cred = _parse_claude_json(content, "/Users/x/.claude/.credentials.json")
     assert cred.status == CRED_NO_TOKEN
-    assert "钥匙串" not in cred.message  # 来源是文件，措辞应该说"凭据文件"
-    assert "凭据文件" in cred.message
+    assert "claude" in cred.message.lower()  # 提醒运行 claude 登录
+    assert "登录" in cred.message  # 包含登录指引
 
 
 def test_claude_not_found_when_no_oauth_key():

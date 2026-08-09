@@ -35,6 +35,7 @@ const PROVIDER_META = {
   grok_subscription:   { icon: "G", logo: "/static/icons/grok.png",      a: "#94a3b8", b: "#475569", cat: "subscription" },
   codex_subscription:  { icon: "C", logo: "/static/icons/codex.png",     a: "#10a37f", b: "#0b5c48", cat: "subscription" },
   copilot_subscription:{ icon: "GH", logo: "/static/icons/copilot.svg",   a: "#8b949e", b: "#30363d", cat: "subscription" },
+  opencode_subscription:{ icon: "OC", logo: "/static/icons/opencode.svg", a: "#a855f7", b: "#6b21a8", cat: "subscription" },
 };
 
 const FALLBACK_META = { icon: "?", a: "var(--accent)", b: "var(--accent-2)", cat: "balance" };
@@ -72,8 +73,9 @@ const PREFS_KEY = "quotaboard_prefs";
 
 /* 自动刷新间隔（毫秒）。默认 5 分钟——自动刷新是"兜底保活"，用户想立刻看
    最新数据时点顶栏「刷新」按钮即可强制全刷（force=1 绕过后端缓存，真查所有
-   渠道）。后端成功缓存 TTL 60s，间隔远大于 TTL 时定时刷新几乎总能拿到新数据，
-   且不会频繁打扰上游。用户可在设置里改成 30/60/90/180/300 秒。 */
+   渠道）。后端成功缓存 5 分钟 / 失败缓存 15 分钟（避免频繁请求触发上游 429 限流）。
+   间隔大于等于缓存 TTL 时定时刷新才能拿到新数据；间隔小于 TTL 时刷新会命中缓存
+   （节省上游请求），点「刷新」按钮可强制绕过。用户可在设置里调整频率。 */
 const REFRESH_INTERVALS = [
   { value: 0, label: "关闭" },
   { value: 30_000, label: "30 秒" },
@@ -264,7 +266,29 @@ function bindEvents() {
       deleteChannel(id);
     }
   });
+
+  // 视图 Tab 切换：额度 / 用量统计。切换时隐藏 / 显示对应 pane，
+  // 并通过自定义事件通知 usage.js 首次进入用量视图时加载数据。
+  $("#viewTabs").addEventListener("click", (e) => {
+    const tab = e.target.closest(".view-tab");
+    if (!tab) return;
+    switchView(tab.dataset.view);
+  });
 }
+
+function switchView(view) {
+  const tabs = document.querySelectorAll(".view-tab");
+  const panes = document.querySelectorAll(".view-pane");
+  tabs.forEach((t) => {
+    const on = t.dataset.view === view;
+    t.classList.toggle("active", on);
+    t.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  panes.forEach((p) => p.classList.toggle("active", p.id === `view-${view}`));
+  // 通知用量统计模块：切到它的视图了（它自己决定是否要首次加载）
+  document.dispatchEvent(new CustomEvent("quotax:view-change", { detail: { view } }));
+}
+window.switchView = switchView;
 
 /* ── 数据加载 ───────────────────────────────────────────── */
 
@@ -985,6 +1009,10 @@ function renderDynamicFields(existing = null) {
   // MiMo 渠道的"api_key"实际存的是 Cookie（小米账号 session），不是 sk- key——
   // 表单 label / placeholder 需要相应调整，避免用户误以为是 API Key。
   const isMimo = type === "mimo";
+  // OpenCode 渠道同样把 Cookie 存进 api_key 字段（opencode.ai 登录态），
+  // 另需 workspace_id（wrk_xxx）。与 MiMo 同源：官网无 JSON API，靠 SSR 页面
+  // + 浏览器 Cookie。
+  const isOpenCode = type === "opencode_subscription";
   // 火山渠道的 AK/SK 需要在火山引擎 IAM 控制台创建，提示用户去哪拿
   const isVolcengine = type === "volcengine";
 
@@ -992,10 +1020,13 @@ function renderDynamicFields(existing = null) {
     if (f === "api_key") {
       if (isMimo) {
         fields += field("api_key", "Cookie", "登录 platform.xiaomimimo.com 后从浏览器复制完整 Cookie", true, "text");
+      } else if (isOpenCode) {
+        fields += field("api_key", "Cookie", "登录 opencode.ai 后从浏览器复制完整 Cookie", true, "text");
       } else {
         fields += field("api_key", "API Key", "sk-...");
       }
     }
+    else if (f === "workspace_id") fields += field("workspace_id", "工作区 ID", "wrk_xxx（opencode.ai 地址栏取）", false, "text");
     else if (f === "base_url") fields += field("base_url", "Base URL", "https://...", true, "text");
     else if (f === "ak") fields += field("ak", "AccessKey ID", "在火山 IAM 控制台创建（见下方提示）", false, "text");
     else if (f === "sk") fields += field("sk", "Secret AccessKey", "在火山 IAM 控制台创建（见下方提示）");
@@ -1006,23 +1037,33 @@ function renderDynamicFields(existing = null) {
 
   const hint = isMimo
     ? "MiMo 用量查询需要小米账号登录后的 Cookie（不是 API Key）。请登录 platform.xiaomimimo.com，从浏览器开发者工具复制完整 Cookie 填入。Cookie 只保存在本地 config.json（权限 600），仅用于只读查询。"
-    : isVolcengine
-      ? "Access Key 请在火山引擎控制台创建：https://console.volcengine.com/iam/keymanage（AK/SK 只保存在本地 config.json（权限 600），仅用于只读查询）。"
-      : meta.category === "subscription"
-        ? "订阅类渠道无需填写密钥：自动读取本机 CLI 的登录凭据（只读，不刷新不写入）。"
-        : meta.category === "local"
-          ? "本地统计无需任何密钥，直接读取本地数据库。"
-          : "密钥只保存在本地 config.json（权限 600），仅用于查询余额。";
+    : isOpenCode
+      ? "OpenCode 官网没有 JSON API，额度数据内嵌在登录后的网页里。只需登录 opencode.ai 后从浏览器复制完整 Cookie 填入即可——工作区 ID 会自动探测。Cookie 只保存在本地 config.json（权限 600），仅用于只读查询。"
+      : isVolcengine
+        ? "Access Key 请在火山引擎控制台创建：https://console.volcengine.com/iam/keymanage（AK/SK 只保存在本地 config.json（权限 600），仅用于只读查询）。"
+        : meta.category === "subscription"
+          ? "订阅类渠道无需填写密钥：自动读取本机 CLI 的登录凭据（只读，不刷新不写入）。"
+          : meta.category === "local"
+            ? "本地统计无需任何密钥，直接读取本地数据库。"
+            : "密钥只保存在本地 config.json（权限 600），仅用于查询余额。";
 
-  // Codex 渠道：可选上传一份 auth.json（多账号）。保存渠道时如果选了文件，
-  // onSaveChannel 会把内容上传到 /api/channels/<id>/codex-credentials 并关联；
-  // 留空则继续用本机 Codex CLI 登录态（或已有的上传凭据）。
-  let codexUpload = "";
+  // Codex 渠道：OAuth 在线登录（推荐）+ 可选上传 auth.json（多账号）。
+  // OAuth 按钮：点一下打开 ChatGPT 登录页，授权后自动建/关联渠道，最省事。
+  // auth.json 上传：已有 Codex CLI 登录态时直接上传 auth.json，省去重新 OAuth。
+  let codexAuth = "";
   if (type === "codex_subscription") {
     const cur = existing?.extra?.codex_auth_file
       ? `当前使用已上传凭据（${esc(existing.extra.codex_auth_file)}）`
       : "当前使用本机 Codex CLI 登录（~/.codex/auth.json）";
-    codexUpload = `
+    codexAuth = `
+      <div class="field-full oauth-section">
+        <label>ChatGPT 登录（OAuth）</label>
+        <button type="button" class="btn btn-oauth" id="btnCodexOauth">
+          <svg viewBox="0 0 24 24" class="icon" aria-hidden="true"><path fill="currentColor" d="M12 2C6.48 2 2 6.48 2 12c0 4.42 2.87 8.17 6.84 9.5.5.08.66-.23.66-.5v-1.69c-2.77.6-3.36-1.34-3.36-1.34-.46-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.87 1.52 2.34 1.07 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.92 0-1.11.38-2 1.03-2.71-.1-.25-.45-1.29.1-2.64 0 0 .84-.27 2.75 1.02.79-.22 1.65-.33 2.5-.33.85 0 1.71.11 2.5.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.35.2 2.39.1 2.64.65.71 1.03 1.6 1.03 2.71 0 3.82-2.34 4.66-4.57 4.91.36.31.69.92.69 1.85V21c0 .27.16.59.67.5C19.14 20.16 22 16.42 22 12A10 10 0 0 0 12 2z"/></svg>
+          <span>通过 ChatGPT 登录</span>
+        </button>
+        <div class="field-hint">点此在新窗口用 ChatGPT 账号授权，授权完成后自动创建/关联 Codex 渠道（OAuth token 仅存本地，权限 600）。</div>
+      </div>
       <div class="field-full">
         <label for="fCodexAuth">auth.json（可选，多账号）</label>
         <div class="file-upload">
@@ -1037,7 +1078,7 @@ function renderDynamicFields(existing = null) {
       </div>`;
   }
 
-  container.innerHTML = fields + codexUpload + `<div class="form-hint">${hint}</div>`;
+  container.innerHTML = fields + codexAuth + `<div class="form-hint">${hint}</div>`;
 
   // Codex 文件选择后更新自定义 UI 的文件名显示
   const codexInput = $("#fCodexAuth");
@@ -1050,6 +1091,12 @@ function renderDynamicFields(existing = null) {
       }
     });
   }
+
+  // Codex OAuth 按钮：发起 ChatGPT 在线授权
+  const oauthBtn = $("#btnCodexOauth");
+  if (oauthBtn) {
+    oauthBtn.addEventListener("click", () => startCodexOAuth(oauthBtn));
+  }
 }
 
 function resetForm() {
@@ -1061,6 +1108,66 @@ function resetForm() {
   renderDynamicFields();
   $("#btnFormSave").textContent = "保存渠道";
   $("#btnFormReset").classList.add("hidden");
+}
+
+/* ── Codex OAuth 在线授权 ────────────────────────────────────
+   流程：POST /start 拿 authorize URL → window.open 打开 OpenAI 登录页 →
+   轮询 /poll 等 OAuth 完成的结果（回调端点换好 token、建好渠道后写入结果）→
+   成功则刷新渠道列表和额度，失败则提示。 */
+
+async function startCodexOAuth(btn) {
+  const originalHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = `<span class="oauth-spinner"></span><span>正在准备授权…</span>`;
+  try {
+    const res = await fetch("/api/auth/codex/start", { method: "POST" });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`);
+    const { authorize_url, state } = await res.json();
+
+    // 打开授权窗口（浏览器能过 OpenAI 的 Cloudflare 挑战）
+    const popup = window.open(authorize_url, "codex_oauth", "width=560,height=720");
+    if (!popup) {
+      // 浏览器拦截了弹窗——降级为当前页跳转，并在新标签完成
+      toast("弹窗被拦截，已在新标签打开授权页", "err");
+      window.location.href = authorize_url;
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+      return;
+    }
+
+    btn.innerHTML = `<span class="oauth-spinner"></span><span>等待授权完成…</span>`;
+    // 轮询结果（最长 5 分钟，每 2 秒一次）
+    const deadline = Date.now() + 5 * 60 * 1000;
+    let result = null;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        const pollRes = await fetch(`/api/auth/codex/poll?state=${encodeURIComponent(state)}`);
+        if (pollRes.ok) {
+          const data = await pollRes.json();
+          if (data.status !== "pending") { result = data; break; }
+        }
+      } catch { /* 轮询失败继续重试 */ }
+    }
+
+    if (!result) {
+      toast("授权超时（5 分钟内未完成），请重试", "err");
+    } else if (result.status === "ok") {
+      const email = result.email ? `（${result.email}）` : "";
+      toast(`ChatGPT 授权成功，已添加 Codex 渠道${email}`, "ok");
+      try { popup.close(); } catch { /* 窗口可能已关 */ }
+      resetForm();
+      await loadChannels();
+      await refreshQuotas(true);
+    } else {
+      toast("授权失败: " + (result.message || "未知错误"), "err");
+    }
+  } catch (err) {
+    toast("发起授权失败: " + err.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = originalHtml;
+  }
 }
 
 function fillForm(ch) {
@@ -1076,6 +1183,7 @@ function fillForm(ch) {
   set("region", ch.region || "");
   set("organization", ch.organization || "");
   set("project", ch.project || "");
+  set("workspace_id", ch.workspace_id || "");
   $("#btnFormSave").textContent = "更新渠道";
   $("#btnFormReset").classList.remove("hidden");
   // modal 本身是覆盖层（可滚动），滚 window 没有意义；把表单滚动到可见区域顶部
@@ -1086,6 +1194,7 @@ async function onSaveChannel(e) {
   e.preventDefault();
   const type = $("#fType").value;
   const meta = providersCatalog[type];
+  const isOpenCode = type === "opencode_subscription";
   const payload = {
     id: editingId || undefined,
     type,
@@ -1097,10 +1206,10 @@ async function onSaveChannel(e) {
     payload[f] = read(f);
   }
 
-  const fieldLabel = (r) => (r === "api_key" ? "API Key" : r === "ak" ? "AccessKey ID" : r === "sk" ? "Secret" : "Base URL");
+  const fieldLabel = (r) => (r === "api_key" ? (isOpenCode ? "Cookie" : "API Key") : r === "ak" ? "AccessKey ID" : r === "sk" ? "Secret" : r === "base_url" ? "Base URL" : r === "workspace_id" ? "工作区 ID" : r);
 
   // base_url 始终必填；密钥类字段（api_key/ak/sk）只在"新建"时必填。
-  // 编辑时留空表示沿用原值——后端会保留旧密钥，不会被清空，所以不能强制要求重新输入。
+  // workspace_id 已改为自动探测，不再是必填字段。
   for (const r of ["base_url"]) {
     if (meta.fields.includes(r) && !payload[r]) {
       toast(`请填写 ${fieldLabel(r)}`, "err");

@@ -167,6 +167,33 @@ def test_save_and_load_roundtrip(isolated_config):
     assert config_store._load_raw() == data
 
 
+def test_opencode_workspace_id_roundtrip_and_preserved_on_minimal_edit(isolated_config):
+    """OpenCode 渠道的 workspace_id 字段必须能持久化往返，且编辑渠道时的最小
+    payload（只发 id/type/enabled）不能把它清空——和 name/region 等字段同一套
+    `_MERGE_ON_UPDATE_FIELDS` 保留语义。"""
+    created = config_store.upsert_channel(
+        {
+            "type": "opencode_subscription",
+            "name": "OpenCode",
+            "api_key": "auth=abc",
+            "workspace_id": "wrk_test123",
+        },
+        provided_fields={"type", "name", "api_key", "workspace_id"},
+    )
+    assert created.workspace_id == "wrk_test123"
+
+    # 持久化往返：save → load，workspace_id 不丢
+    reloaded = config_store.get_channel(created.id)
+    assert reloaded.workspace_id == "wrk_test123"
+
+    # 最小 payload（启停开关）不能清掉 workspace_id
+    toggled = config_store.upsert_channel(
+        {"id": created.id, "type": "opencode_subscription", "enabled": False},
+        provided_fields={"id", "type", "enabled"},
+    )
+    assert toggled.workspace_id == "wrk_test123"
+
+
 def test_save_raw_sets_permissions_600(isolated_config):
     config_store._save_raw({"channels": []})
     mode = stat.S_IMODE(os.stat(config_store.CONFIG_PATH).st_mode)

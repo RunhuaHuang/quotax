@@ -29,6 +29,62 @@ from ..net import ParseError, ResponseError, request_json
 USER_AGENT = "quota-board/1.0 (macOS; read-only usage checker)"
 
 
+def _try_pty_usage(base: dict) -> ChannelResult | None:
+    """PTY fallback：用伪终端跑 claude CLI 的 /usage，解析终端文本拿到用量。
+
+    当 macOS Keychain 里有 Claude 登录元信息但 accessToken 为空（第三方读不到
+    明文 token）时调用。CLI 自己有 Keychain 权限，能在终端显示用量面板。
+
+    返回 ChannelResult（status=ok + windows）或 None（CLI 不存在 / 未登录 /
+    解析不到订阅用量——调用方据此降级为 info + 本地统计）。
+    """
+    from ..claude_pty import fetch_usage_via_pty
+
+    usage = fetch_usage_via_pty()
+    if usage is None or usage.session_percent_left is None:
+        # PTY 不可用，或 CLI 未登录（/usage 只返回本地统计，没有订阅用量标签）
+        return None
+
+    windows = []
+    # session_percent_left 是「剩余百分比」，转成 used_percent
+    session_used = 100 - usage.session_percent_left
+    windows.append(
+        window(
+            "five_hour",
+            "每 5 小时",
+            used_percent=float(session_used),
+            remaining_percent=float(usage.session_percent_left),
+        )
+    )
+    if usage.weekly_percent_left is not None:
+        weekly_used = 100 - usage.weekly_percent_left
+        windows.append(
+            window(
+                "weekly",
+                "每周额度",
+                used_percent=float(weekly_used),
+                remaining_percent=float(usage.weekly_percent_left),
+            )
+        )
+    if usage.weekly_opus_percent_left is not None:
+        opus_used = 100 - usage.weekly_opus_percent_left
+        windows.append(
+            window(
+                "weekly",
+                "每周（Opus）",
+                used_percent=float(opus_used),
+                remaining_percent=float(usage.weekly_opus_percent_left),
+            )
+        )
+    return ChannelResult(
+        status="ok",
+        plan_name="Claude 订阅（PTY 探测）",
+        windows=windows,
+        source="claude CLI /usage (PTY)",
+        **base,
+    )
+
+
 def _pick(d: dict, *keys, default=None):
     """按多个候选 key 依次取值——用于兼容同一个字段的 camelCase / snake_case 两种
     命名（不同网关/客户端库对同一个上游 JSON API 的字段命名转换习惯不一致）。"""
@@ -91,8 +147,13 @@ async def query_claude(channel: Channel) -> ChannelResult:
     cred = await asyncio.to_thread(read_claude_credentials)
     if cred.status == CRED_NO_TOKEN:
         # 已登录（钥匙串里有 claudeAiOauth 元信息），但本机没有存明文 access
-        # token，查不了官方用量窗口——这不是错误，是"有数据但只能看本地统计"，
-        # 所以用 status="info" 而不是 error/not_found（那两个会被前端当成异常）。
+        # token，查不了官方用量窗口。尝试用 PTY 跑 claude CLI 的 /usage——CLI 自己
+        # 有 Keychain 访问权限，能在终端里显示出用量面板。PTY 是同步阻塞 I/O，
+        # 用 to_thread 包裹避免阻塞事件循环。参考 CodexBar 的 ClaudeStatusProbe。
+        pty_result = await asyncio.to_thread(_try_pty_usage, base)
+        if pty_result is not None:
+            return pty_result
+        # PTY 也不可用（CLI 未安装 / 未登录 / 解析不到用量）：降级为 info + 本地统计
         subscription_type = (cred.extra or {}).get("subscription_type")
         plan_name = f"Claude {subscription_type.capitalize()} 订阅" if subscription_type else "Claude 订阅"
         return ChannelResult(
@@ -121,52 +182,31 @@ async def query_claude(channel: Channel) -> ChannelResult:
         return fail("error", "Claude 用量响应格式错误", source=cred.source, **base)
 
     windows = []
-    for key, label in [
-        ("five_hour", "每 5 小时"),
-        ("seven_day_opus", "每周（Opus）"),
-        ("seven_day_sonnet", "每周（Sonnet）"),
-        ("seven_day", "每周额度"),
+    # Claude 的 utilization 字段表示「已用百分比」的数值（1.0 = 1%，不是 100%）。
+    # 交叉验证：PTY 跑 claude CLI /usage，终端显示 "Current session 1% used"
+    # 对应 API five_hour.utilization=1.0；"Current week 0% used" 对应 0.0。
+    # 所以 used_percent = utilization（直接取值，不乘 100）。
+    for key, label, win_key in [
+        ("five_hour", "每 5 小时", "five_hour"),
+        ("seven_day", "每周额度", "weekly"),
     ]:
         item = data.get(key)
         if isinstance(item, dict) and item.get("utilization") is not None:
-            used = float(item["utilization"]) * 100
+            used = max(0.0, min(100.0, float(item["utilization"])))
             windows.append(
                 window(
-                    "five_hour" if key == "five_hour" else "weekly",
+                    win_key,
                     label,
                     used_percent=used,
                     remaining_percent=max(0.0, 100 - used),
                     reset_at=to_ts(item.get("resets_at")),
                 )
             )
-    # 未知窗口也展示（API 可能新增窗口类型）
-    for key, item in data.items():
-        if key in (
-            "five_hour",
-            "seven_day",
-            "seven_day_opus",
-            "seven_day_sonnet",
-            "extra_usage",
-        ):
-            continue
-        if isinstance(item, dict) and item.get("utilization") is not None:
-            used = float(item["utilization"]) * 100
-            windows.append(
-                window(
-                    "custom",
-                    key.replace("_", " "),
-                    used_percent=used,
-                    remaining_percent=max(0.0, 100 - used),
-                    reset_at=to_ts(item.get("resets_at")),
-                )
-            )
 
-    plan_name = None
-    extra = data.get("extra_usage")
-    if isinstance(extra, dict):
-        if extra.get("is_enabled") is True:
-            limit = float(extra.get("monthly_limit") or 0)
-            used_credits = float(extra.get("used_credits") or 0)
+    extra_usage = data.get("extra_usage")
+    if isinstance(extra_usage, dict) and extra_usage.get("is_enabled") is True:
+            limit = float(extra_usage.get("monthly_limit") or 0)
+            used_credits = float(extra_usage.get("used_credits") or 0)
             if limit > 0:
                 windows.append(
                     window(
@@ -176,11 +216,13 @@ async def query_claude(channel: Channel) -> ChannelResult:
                         remaining_percent=max(0.0, 100 - used_credits / limit * 100),
                         used_label=f"${used_credits:,.2f}",
                         max_label=f"${limit:,.2f}",
-                        reset_at=to_ts(extra.get("reset_at")),
+                        reset_at=to_ts(extra_usage.get("reset_at")),
                     )
                 )
-        currency = extra.get("currency")
-        plan_name = f"Claude 订阅（超额：{currency or 'USD'}）" if extra.get("is_enabled") else "Claude 订阅"
+
+    # plan_name 用 subscription_type（pro / max 等），不再拼"（超额：USD）"
+    subscription_type = (cred.extra or {}).get("subscription_type")
+    plan_name = f"Claude {subscription_type.capitalize()}" if subscription_type else "Claude 订阅"
 
     if not windows:
         return fail(
