@@ -2,8 +2,8 @@
 
 // 不依赖 DOM/localStorage 的纯函数抽到 view-utils.js（可被 node:test 直接
 // import 测试），这里只 import 使用，避免同一份逻辑两处维护。
-import { normalizeThreeWindows, canonicalChannelId, channelBreachesThreshold, noPercentData, fmtReset } from "./view-utils.js?v=6";
-import { t, thas, toggleLang, getLang } from "./i18n.js?v=6";
+import { normalizeThreeWindows, canonicalChannelId, channelBreachesThreshold, noPercentData, fmtReset } from "./view-utils.js?v=7";
+import { t, thas, toggleLang, getLang } from "./i18n.js?v=7";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -153,6 +153,8 @@ function savePrefs(patch) {
 async function init() {
   bindEvents();
   applyStoredTheme(); // 尽早应用主题，避免首屏闪烁
+  updateAutoRefreshLabel(); // 首屏就显示「自动刷新 · 5 分钟」（在 applyStaticI18n 之前，
+                            // 因为该 label 不带 data-i18n，不会被 i18n 覆盖）
   applyStaticI18n();  // 翻译 HTML 中的静态节点
   // 会话快照：整页刷新/重新打开时**同步**恢复上次画面（脚本一执行就渲染，
   // 不闪骨架屏、不等网络），新数据在后台到达后无缝替换。只有完全没有快照的
@@ -170,6 +172,7 @@ async function init() {
   if (dashboardLoadedOnce) renderDashboard();
   await Promise.all([loadChannels(), refreshQuotas(true), loadLocalUsage()]);
   setupAutoRefresh();
+  updateAutoRefreshLabel();
   setupVisibilityAutoRefresh();
   setupThemeReactivity();
   setupLangReactivity();
@@ -216,6 +219,7 @@ function bindEvents() {
   $("#autoRefresh").addEventListener("change", (e) => {
     if (e.target.checked) setupAutoRefresh();
     else clearInterval(autoRefreshTimer);
+    updateAutoRefreshLabel();
   });
 
   // 语言切换
@@ -423,6 +427,21 @@ function setupAutoRefresh() {
   const interval = getRefreshInterval();
   if ($("#autoRefresh").checked && !document.hidden && interval > 0) {
     autoRefreshTimer = setInterval(() => refreshQuotas(false), interval);
+  }
+}
+
+/* 在自动刷新开关的 label 上显示当前刷新频率（如「自动刷新 · 5m」），
+   这样用户不用打开设置就能看到间隔。刷新频率变化或语言切换后都要调用。 */
+function updateAutoRefreshLabel() {
+  const interval = getRefreshInterval();
+  const label = $("#autoRefresh").parentElement.querySelector(".switch-label");
+  if (!label) return;
+  if (interval === 0) {
+    label.textContent = t("app.autoRefresh");
+  } else {
+    const opt = REFRESH_INTERVALS.find((o) => o.value === interval);
+    const short = opt ? t(opt.labelKey) : `${Math.round(interval / 60_000)}m`;
+    label.textContent = `${t("app.autoRefresh")} · ${short}`;
   }
 }
 
@@ -1491,6 +1510,7 @@ function applyLang() {
   renderSummaryChips(quotas);
   if (dashboardLoadedOnce) renderDashboard();
   renderLocalUsage();
+  updateAutoRefreshLabel();
   // 打开的弹窗同步重绘
   if (!$("#settingsModal").classList.contains("hidden")) openSettingsModal();
   if (!$("#configModal").classList.contains("hidden")) {
@@ -1560,6 +1580,7 @@ function renderRefreshOptions() {
         $("#autoRefresh").checked = true;
         setupAutoRefresh();
       }
+      updateAutoRefreshLabel();
       renderRefreshOptions();
     });
   });

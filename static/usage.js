@@ -5,7 +5,7 @@
 // 本文件是独立 ES module（与 app.js 作用域隔离），自带 $ / esc / fmtTime 等工具，
 // 不依赖 app.js 暴露全局变量——避免加载顺序耦合。
 
-import { t, getLang } from "./i18n.js?v=6";
+import { t, getLang } from "./i18n.js?v=7";
 
 const $ = (sel) => document.querySelector(sel);
 const USAGE_DAYS_KEY = "quotaboard_prefs.usage_days";
