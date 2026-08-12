@@ -20,13 +20,43 @@ PORT="${QUOTAX_PORT:-8900}"
 LOG_FILE="$PERM_DIR/quotax.log"
 PID_FILE="$PERM_DIR/quotax.pid"
 
-# 判断服务是否在监听端口（不依赖 lsof，用 bash 内建 /dev/tcp 兜底）。
-is_running() {
-  if command -v lsof &>/dev/null; then
-    lsof -ti tcp:"$PORT" -sTCP:LISTEN >/dev/null 2>&1
-  else
-    (echo >/dev/tcp/127.0.0.1/"$PORT") >/dev/null 2>&1
+if ! [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || ((10#$PORT < 1 || 10#$PORT > 65535)); then
+  echo "Error: QUOTAX_PORT 必须是 1 到 65535 之间的整数。" >&2
+  exit 2
+fi
+
+is_quotax_command() {
+  local command="$1"
+  case "$command" in
+    *uvicorn*app.main:app*|*app.main:app*uvicorn*) ;;
+    *) return 1 ;;
+  esac
+  local port_pattern="(^|[[:space:]])--port([[:space:]]+|=)${PORT}($|[[:space:]])"
+  [[ "$command" =~ $port_pattern ]]
+}
+
+# 返回确认属于当前端口 QuotaX 的进程 PID；不能只凭进程命令判断，否则同一台机器
+# 上运行另一个端口的 QuotaX 时，status/stop 可能误认或误杀另一实例。
+quotax_pid() {
+  local pid command
+  if [ -f "$PID_FILE" ]; then
+    pid=$(tr -cd '0-9' < "$PID_FILE")
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+      if is_quotax_command "$command"; then echo "$pid"; return 0; fi
+    fi
   fi
+  if command -v lsof &>/dev/null; then
+    while IFS= read -r pid; do
+      command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+      if is_quotax_command "$command"; then echo "$pid"; return 0; fi
+    done < <(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+  fi
+  return 1
+}
+
+is_running() {
+  quotax_pid >/dev/null
 }
 
 open_browser() {
@@ -55,13 +85,17 @@ case "${1:-start}" in
       echo "Error: 未找到 uv。请先安装 uv（macOS: brew install uv）。" >&2
       exit 1
     fi
+    # 日志超过 5 MiB 时在启动前轮转一份，避免 quotax.log 无限增长。
+    if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 5242880 ]; then
+      mv -f "$LOG_FILE" "$LOG_FILE.1"
+    fi
     # 后台启动 uvicorn，nohup 保证退出终端后服务继续运行。
     mkdir -p "$PERM_DIR"
     nohup uv run uvicorn app.main:app --host 127.0.0.1 --port "$PORT" > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     echo -n "启动 QuotaX（端口 $PORT）"
     # 轮询等待就绪（最多 30 秒）
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
       if is_running; then
         echo " ✅"
         open_browser
@@ -78,11 +112,22 @@ case "${1:-start}" in
     ;;
 
   stop)
-    if is_running; then
-      if command -v lsof &>/dev/null; then
-        lsof -ti tcp:"$PORT" -sTCP:LISTEN | xargs kill 2>/dev/null || true
+    if PID=$(quotax_pid); then
+      kill "$PID" 2>/dev/null || true
+      # uv run may leave a child uvicorn process behind. Re-scan the same
+      # command/port identity briefly, then use KILL only for the still
+      # matching QuotaX process rather than any unrelated listener.
+      for _ in $(seq 1 5); do
+        sleep 0.2
+        if NEXT_PID=$(quotax_pid); then
+          kill "$NEXT_PID" 2>/dev/null || true
+        else
+          break
+        fi
+      done
+      if NEXT_PID=$(quotax_pid); then
+        kill -KILL "$NEXT_PID" 2>/dev/null || true
       fi
-      sleep 1
       echo "QuotaX 已停止"
     else
       echo "QuotaX 未在运行"
@@ -99,8 +144,13 @@ case "${1:-start}" in
     ;;
 
   log)
+    LOG_LINES="${2:-50}"
+    if ! [[ "$LOG_LINES" =~ ^[0-9]{1,5}$ ]] || ((10#$LOG_LINES < 1 || 10#$LOG_LINES > 10000)); then
+      echo "Error: 日志行数必须是 1 到 10000 之间的整数。" >&2
+      exit 2
+    fi
     if [ -f "$LOG_FILE" ]; then
-      tail -n "${2:-50}" "$LOG_FILE"
+      tail -n "$((10#$LOG_LINES))" "$LOG_FILE"
     else
       echo "无日志文件: $LOG_FILE"
     fi

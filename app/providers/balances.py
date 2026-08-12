@@ -5,7 +5,7 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 from ..config import Channel
-from ..models import ChannelResult, amount, fail, ok, window
+from ..models import ChannelResult, amount, fail, finite_float, ok, window
 from ..net import ParseError, ResponseError, request_json
 from ._common import _require
 
@@ -63,23 +63,27 @@ async def query_deepseek(channel: Channel) -> ChannelResult:
     infos = data.get("balance_infos") if isinstance(data, dict) else None
     if not isinstance(infos, list) or not infos:
         return fail("error", "DeepSeek 未返回余额数据", **base)
+    infos = [item for item in infos if isinstance(item, dict)]
+    if not infos:
+        return fail("error", "DeepSeek 余额数据格式错误", **base)
 
     preferred = (
         next((i for i in infos if str(i.get("currency", "")).upper() == "CNY"), None)
-        or next((i for i in infos if float(i.get("total_balance") or 0) > 0), None)
+        or next((i for i in infos if (finite_float(i.get("total_balance"), 0.0) or 0.0) > 0), None)
         or infos[0]
     )
     currency = str(preferred.get("currency") or "CNY")
-    total = float(preferred.get("total_balance") or 0)
+    total = finite_float(preferred.get("total_balance"), 0.0) or 0.0
     symbol = "¥" if currency.upper() in ("CNY", "RMB") else ("$" if currency.upper() == "USD" else "")
 
+    is_available = data.get("is_available") if isinstance(data, dict) else None
     return ok(
         plan_name="DeepSeek 账户余额",
         amount=amount(total, currency, symbol),
         # 余额没有"百分比"概念——直接显示金额（前端渲染成无百分比空环，
         # 金额在 sub 行；不传 used/remaining_percent，避免出现没意义的 100%）
         windows=[window("balance", "账户余额", max_label=f"{symbol}{total:,.2f}")],
-        message="DeepSeek 账户余额不可用" if data.get("is_available") is False else None,
+        message="DeepSeek 账户余额不可用" if is_available is False else None,
         **base,
     )
 
@@ -108,7 +112,9 @@ async def query_stepfun(channel: Channel) -> ChannelResult:
     except Exception as e:
         status, message = _status_for_error(e)
         return fail(status, message, **base)
-    balance = float(data.get("balance") or 0) if isinstance(data, dict) else 0
+    if not isinstance(data, dict) or "balance" not in data:
+        return fail("error", "StepFun 余额响应格式错误", **base)
+    balance = max(0.0, finite_float(data.get("balance"), 0.0) or 0.0)
     return ok(
         plan_name="StepFun 账户",
         amount=amount(balance, "CNY", "¥"),
@@ -143,7 +149,9 @@ async def query_siliconflow(channel: Channel) -> ChannelResult:
         status, message = _status_for_error(e)
         return fail(status, message, **base)
     info = data.get("data") if isinstance(data, dict) else None
-    total = float(info.get("totalBalance") or 0) if isinstance(info, dict) else 0
+    if not isinstance(info, dict) or "totalBalance" not in info:
+        return fail("error", "硅基流动余额响应格式错误", **base)
+    total = max(0.0, finite_float(info.get("totalBalance"), 0.0) or 0.0)
     currency = "USD" if ".com" in domain else "CNY"
     symbol = "$" if currency == "USD" else "¥"
     return ok(
@@ -178,8 +186,10 @@ async def query_openrouter(channel: Channel) -> ChannelResult:
     except Exception as e:
         status, message = _status_for_error(e)
         return fail(status, message, **base)
-    credits = float(data.get("credits") or 0) if isinstance(data, dict) else 0
-    used = float(data.get("total_usage") or 0) if isinstance(data, dict) else 0
+    if not isinstance(data, dict) or ("credits" not in data and "total_usage" not in data):
+        return fail("error", "OpenRouter 余额响应格式错误", **base)
+    credits = max(0.0, finite_float(data.get("credits"), 0.0) or 0.0)
+    used = max(0.0, finite_float(data.get("total_usage"), 0.0) or 0.0)
     total = credits + used
     windows = []
     if total > 0:
@@ -225,7 +235,9 @@ async def query_novita(channel: Channel) -> ChannelResult:
     except Exception as e:
         status, message = _status_for_error(e)
         return fail(status, message, **base)
-    balance = float(data.get("balance") or 0) if isinstance(data, dict) else 0
+    if not isinstance(data, dict) or "balance" not in data:
+        return fail("error", "Novita 余额响应格式错误", **base)
+    balance = max(0.0, finite_float(data.get("balance"), 0.0) or 0.0)
     return ok(
         plan_name="Novita 账户",
         amount=amount(balance, "USD", "$"),
@@ -259,9 +271,12 @@ async def query_kimi_api(channel: Channel) -> ChannelResult:
     except Exception as e:
         status, message = _status_for_error(e)
         return fail(status, message, **base)
-    balance = data.get("data", {}).get("available_balance", {}) if isinstance(data, dict) else {}
-    total = float(balance.get("total_balance") or 0) if isinstance(balance, dict) else 0
-    currency = str(balance.get("currency") or "CNY") if isinstance(balance, dict) else "CNY"
+    data_body = data.get("data") if isinstance(data, dict) else None
+    balance = data_body.get("available_balance") if isinstance(data_body, dict) else None
+    if not isinstance(balance, dict) or "total_balance" not in balance:
+        return fail("error", "Kimi API 余额响应格式错误", **base)
+    total = max(0.0, finite_float(balance.get("total_balance"), 0.0) or 0.0)
+    currency = str(balance.get("currency") or "CNY")
     symbol = "¥" if currency.upper() in ("CNY", "RMB") else "$"
     return ok(
         plan_name="Kimi API 账户",
@@ -313,8 +328,8 @@ async def query_newapi(channel: Channel) -> ChannelResult:
     else:
         info = data.get("data") if isinstance(data, dict) else None
         if isinstance(info, dict) and (info.get("quota") is not None or info.get("used_quota") is not None):
-            quota = float(info.get("quota") or 0) / 500000
-            used = float(info.get("used_quota") or 0) / 500000
+            quota = (finite_float(info.get("quota"), 0.0) or 0.0) / 500000
+            used = (finite_float(info.get("used_quota"), 0.0) or 0.0) / 500000
             windows = []
             if quota + used > 0:
                 total = quota + used
@@ -353,9 +368,10 @@ async def query_newapi(channel: Channel) -> ChannelResult:
         if not isinstance(sub, dict):
             errors.append("/v1/dashboard/billing/subscription 响应格式不是对象")
         else:
-            limit = float(
-                sub.get("hard_limit_usd") or sub.get("system_hard_limit_usd") or sub.get("soft_limit_usd") or 0
-            )
+            limit = finite_float(
+                sub.get("hard_limit_usd") or sub.get("system_hard_limit_usd") or sub.get("soft_limit_usd"),
+                0.0,
+            ) or 0.0
             used = None
             try:
                 usage = await request_json(
@@ -364,7 +380,7 @@ async def query_newapi(channel: Channel) -> ChannelResult:
                     headers=headers,
                 )
                 if isinstance(usage, dict) and usage.get("total_usage") is not None:
-                    used = float(usage["total_usage"]) / 100  # OpenAI 该端点单位是 cent
+                    used = (finite_float(usage["total_usage"], 0.0) or 0.0) / 100  # OpenAI 该端点单位是 cent
             except (ResponseError, ParseError, ValueError, TypeError):
                 pass  # /usage 很多中转站没实现，缺失不影响 subscription 的额度上限数据
 

@@ -11,12 +11,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import os
+import re
+import threading
 import time
+import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows 没有 fcntl，仍保留线程内锁
+    fcntl = None
 
 from . import config as config_store
 
@@ -26,12 +37,71 @@ logger = logging.getLogger(__name__)
 # 每天最多 1 条，MAX_POINTS 条够画约半年的趋势；超出后自动淘汰最早的。
 MAX_POINTS = 200
 
+_SAFE_CHANNEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_lock_guard = threading.Lock()
+_history_locks: dict[str, threading.Lock] = {}
+
+
+def _legacy_channel_history_path(channel_id: str) -> Path:
+    """旧版本 sanitize 文件名，仅用于兼容已有历史文件的读取/删除。"""
+    safe = "".join(c for c in str(channel_id) if c.isalnum() or c in "-_") or "unknown"
+    return config_store.HISTORY_DIR / f"{safe}.jsonl"
+
 
 def _channel_history_path(channel_id: str) -> Path:
-    """单个渠道的 JSONL 路径。channel_id 是我们自己生成的 ch_xxxxxx，不含路径分隔符，
-    但仍做一层 sanitize 防御（避免 id 被构造成 ../ 逃逸出 history 目录）。"""
-    safe = "".join(c for c in channel_id if c.isalnum() or c in "-_") or "unknown"
-    return config_store.HISTORY_DIR / f"{safe}.jsonl"
+    """单个渠道的 JSONL 路径，并保证不同 ID 不会因 sanitize 互相碰撞。
+
+    正常的 ``ch_xxx`` / 导入的安全 ID 保留可读文件名；包含路径分隔符、空格或
+    Unicode 的 ID 使用 SHA-256 文件名，避免 ``a/b`` 与 ``ab`` 共用同一历史文件，
+    同时不会让用户可控 ID 逃逸出 history 目录。
+    """
+    raw = str(channel_id)
+    if _SAFE_CHANNEL_ID.fullmatch(raw):
+        stem = raw
+    else:
+        stem = hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
+    return config_store.HISTORY_DIR / f"{stem}.jsonl"
+
+
+def _history_read_path(channel_id: str) -> Path:
+    """优先读取新安全路径；升级旧版本时回退到 legacy sanitize 路径。"""
+    path = _channel_history_path(channel_id)
+    if path.exists():
+        return path
+    legacy = _legacy_channel_history_path(channel_id)
+    return legacy if legacy.exists() else path
+
+
+def _lock_for(path: Path) -> threading.Lock:
+    key = str(path)
+    with _lock_guard:
+        lock = _history_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _history_locks[key] = lock
+        return lock
+
+
+@contextmanager
+def _history_transaction_lock(path: Path):
+    """串行化同一渠道的读-改-写，并尽力跨进程互斥。
+
+    历史记录通常由后台线程写入；仅靠 os.replace 只能保证单次写入原子，两个线程
+    仍可能同时读到旧文件并互相覆盖。线程锁覆盖本进程的常见场景，fcntl 锁文件则
+    让多个 uvicorn worker/CLI 进程也能避免同一渠道的丢更新。
+    """
+    lock = _lock_for(path)
+    with lock:
+        lock_path = path.with_name(f".{path.name}.lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as lock_file:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _day_key(ts_ms: int) -> str:
@@ -85,21 +155,22 @@ def record_result(channel_id: str, result: dict) -> None:
         entry = _slim_result(result, now_ms)
         path = _channel_history_path(channel_id)
 
-        config_store.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-        records = _read_channel_history(path)
-        today = _day_key(now_ms)
+        with _history_transaction_lock(path):
+            # 兼容旧版 sanitize 文件：首次写入新 ID 时先读旧记录，再写入安全路径。
+            records = _read_channel_history(_history_read_path(channel_id))
+            today = _day_key(now_ms)
 
-        # 同一天去重：替换今天的旧记录（保留当天最后一次刷新的值）
-        if records and _day_key(records[-1]["ts"]) == today:
-            records[-1] = entry
-        else:
-            records.append(entry)
+            # 同一天去重：替换今天的旧记录（保留当天最后一次刷新的值）
+            if records and _day_key(records[-1]["ts"]) == today:
+                records[-1] = entry
+            else:
+                records.append(entry)
 
-        # 按 MAX_POINTS 截断（保留最近的）
-        if len(records) > MAX_POINTS:
-            records = records[-MAX_POINTS:]
+            # 按 MAX_POINTS 截断（保留最近的）
+            if len(records) > MAX_POINTS:
+                records = records[-MAX_POINTS:]
 
-        _write_channel_history(path, records)
+            _write_channel_history(path, records)
     except Exception as e:  # 趋势记录失败不该影响额度查询
         logger.debug("记录历史趋势失败（已忽略，不影响查询）: %s", e)
 
@@ -117,7 +188,14 @@ def _read_channel_history(path: Path) -> list[dict]:
                     continue
                 try:
                     rec = json.loads(line)
-                    if isinstance(rec, dict) and isinstance(rec.get("ts"), (int, float)):
+                    ts = rec.get("ts") if isinstance(rec, dict) else None
+                    if (
+                        isinstance(rec, dict)
+                        and isinstance(ts, (int, float))
+                        and not isinstance(ts, bool)
+                        and math.isfinite(float(ts))
+                        and float(ts) > 0
+                    ):
                         records.append(rec)
                 except json.JSONDecodeError:
                     continue
@@ -129,13 +207,25 @@ def _read_channel_history(path: Path) -> list[dict]:
 
 def _write_channel_history(path: Path, records: list[dict]) -> None:
     """原子写入渠道历史 JSONL（先写临时文件再 replace，避免半写坏）。"""
-    tmp = path.with_suffix(".jsonl.tmp")
+    # 临时文件名必须每次唯一；固定 .jsonl.tmp 在并发写入时会互相截断/删除对方
+    # 的临时文件，即使最终 replace 是原子的也可能丢整批记录。
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    fd = None
     try:
-        with tmp.open("w", encoding="utf-8") as f:
+        fd = os.open(str(tmp), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = None
             for rec in records:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                f.write(json.dumps(rec, ensure_ascii=False, allow_nan=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(str(tmp), str(path))
     except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
@@ -163,7 +253,7 @@ def get_history(channel_ids: list[str] | None = None, days: int = 30) -> dict:
 
     out: dict[str, list] = {}
     for cid in wanted:
-        records = _read_channel_history(_channel_history_path(cid))
+        records = _read_channel_history(_history_read_path(cid))
         out[cid] = [r for r in records if r["ts"] >= since_ms]
     return {"days": days, "channels": out}
 
@@ -172,6 +262,12 @@ def delete_channel_history(channel_id: str) -> None:
     """渠道被删除时清理它的历史 JSONL。失败静默（孤儿文件不影响功能）。"""
     try:
         path = _channel_history_path(channel_id)
-        path.unlink(missing_ok=True)
+        with _history_transaction_lock(path):
+            path.unlink(missing_ok=True)
+            # 清理升级前旧版本的 sanitize 文件；若它与另一个恶意/旧 ID 碰撞，
+            # 这是旧格式本身无法区分的遗留问题，新写入不会再产生这种碰撞。
+            legacy = _legacy_channel_history_path(channel_id)
+            if legacy != path:
+                legacy.unlink(missing_ok=True)
     except Exception:  # noqa: S110 — 删除孤儿文件失败不影响功能，无需处理
         pass

@@ -24,7 +24,7 @@
 </script>
 <!-- 自托管字体（DM Sans + JetBrains Mono，零外网依赖） -->
 <link rel="stylesheet" href="/static/fonts/fonts.css">
-<link rel="stylesheet" href="/static/styles.css?v=7">
+<link rel="stylesheet" href="/static/styles.css?v=11">
 </head>
 <body>
 
@@ -179,21 +179,85 @@
       </button>
     </div>
     <div class="modal-body">
-      <div class="setting-row">
-        <div class="setting-label" data-i18n="settings.theme">主题</div>
-        <div class="setting-control" id="themeOptions"></div>
-      </div>
-      <div class="setting-row">
-        <div class="setting-label" data-i18n="settings.refreshInterval">自动刷新频率</div>
-        <div class="setting-control" id="refreshOptions"></div>
-      </div>
-      <div class="setting-row setting-row-stretch">
-        <div class="setting-label">
-          <span data-i18n="settings.threshold">低余额阈值告警</span>
-          <span class="setting-desc" data-i18n="settings.thresholdDesc">为各渠道设置余额/剩余额度百分比阈值，低于阈值时卡片标橙、汇总栏计数告警。阈值仅保存在浏览器本地。</span>
+      <section class="setting-section">
+        <div class="setting-section-title" data-i18n="settings.displaySection">显示与页面刷新</div>
+        <div class="setting-row">
+          <div class="setting-label" data-i18n="settings.theme">主题</div>
+          <div class="setting-control" id="themeOptions"></div>
         </div>
-      </div>
-      <div id="thresholdList" class="threshold-list"></div>
+        <div class="setting-row">
+          <div class="setting-label" data-i18n="settings.refreshInterval">自动刷新频率</div>
+          <div class="setting-control" id="refreshOptions"></div>
+          <div class="setting-desc" data-i18n="settings.browserRefreshDesc">仅控制当前页面；页面关闭后由下方后台监控独立运行。</div>
+        </div>
+      </section>
+
+      <section class="setting-section monitor-section">
+        <div class="setting-section-head">
+          <div>
+            <div class="setting-section-title" data-i18n="settings.monitorTitle">后台持续监控</div>
+            <div class="setting-desc" data-i18n="settings.monitorDesc">即使关闭浏览器，QuotaX 服务仍会按周期检查额度，并在越过阈值时通知；默认关闭。</div>
+          </div>
+          <label class="switch" title="后台持续监控">
+            <input type="checkbox" id="monitorEnabled" aria-label="后台持续监控" data-i18n-aria="settings.monitorToggleAria">
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+          </label>
+        </div>
+        <div class="monitor-form-grid">
+          <label><span data-i18n="settings.monitorInterval">检查间隔</span>
+            <select id="monitorInterval">
+              <option value="60" data-i18n="settings.interval1m">1 分钟</option>
+              <option value="300" data-i18n="settings.interval5m">5 分钟</option>
+              <option value="900" data-i18n="settings.interval15m">15 分钟</option>
+              <option value="1800" data-i18n="settings.interval30m">30 分钟</option>
+              <option value="3600" data-i18n="settings.interval1h">1 小时</option>
+            </select>
+          </label>
+          <label><span data-i18n="settings.cooldown">重复告警冷却</span>
+            <select id="monitorCooldown">
+              <option value="900" data-i18n="settings.interval15m">15 分钟</option>
+              <option value="3600" data-i18n="settings.interval1h">1 小时</option>
+              <option value="21600" data-i18n="settings.interval6h">6 小时</option>
+              <option value="86400" data-i18n="settings.interval24h">24 小时</option>
+            </select>
+          </label>
+          <label><span data-i18n="settings.retention">用量历史保留</span>
+            <select id="monitorRetention">
+              <option value="30" data-i18n="settings.days30">30 天</option>
+              <option value="90" data-i18n="settings.days90">90 天</option>
+              <option value="180" data-i18n="settings.days180">180 天</option>
+              <option value="365" data-i18n="settings.days365">365 天</option>
+              <option value="730" data-i18n="settings.days730">730 天</option>
+            </select>
+          </label>
+          <div class="monitor-toggle-field">
+            <span class="monitor-field-label" data-i18n="settings.desktopNotifications">桌面通知</span>
+            <label class="switch switch-sm">
+              <input type="checkbox" id="monitorDesktop" aria-label="桌面通知" data-i18n-aria="settings.desktopNotificationsAria">
+              <span class="switch-track"><span class="switch-thumb"></span></span>
+            </label>
+          </div>
+        </div>
+        <label class="monitor-webhook-field"><span data-i18n="settings.webhook">Webhook（可选）</span>
+          <input type="password" id="monitorWebhook" autocomplete="off" data-i18n-placeholder="settings.webhookPlaceholder" placeholder="https://...">
+        </label>
+        <div class="setting-desc" data-i18n="settings.webhookDesc">越过阈值和恢复时发送标准 JSON；地址可能含签名，安全导出会自动清空。</div>
+        <div id="monitorStatusPanel" class="monitor-status" aria-live="polite"></div>
+        <div class="monitor-actions">
+          <button type="button" class="btn btn-primary" id="btnSaveMonitor" data-i18n="settings.saveMonitor">保存监控设置</button>
+          <button type="button" class="btn btn-ghost" id="btnRunMonitor" data-i18n="settings.runNow">立即检查</button>
+        </div>
+      </section>
+
+      <section class="setting-section threshold-section">
+        <div class="setting-row setting-row-stretch">
+          <div class="setting-label">
+            <span data-i18n="settings.threshold">低余额阈值告警</span>
+            <span class="setting-desc" data-i18n="settings.thresholdDesc">阈值同步保存在 QuotaX 后端。低于阈值时卡片标橙、汇总栏计数；开启后台监控后，浏览器关闭也能告警。</span>
+          </div>
+        </div>
+        <div id="thresholdList" class="threshold-list"></div>
+      </section>
     </div>
   </div>
 </div>
@@ -229,7 +293,7 @@
 
 <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 
-<script type="module" src="/static/app.js?v=7"></script>
-<script type="module" src="/static/usage.js?v=7"></script>
+<script type="module" src="/static/app.js?v=9"></script>
+<script type="module" src="/static/usage.js?v=9"></script>
 </body>
 </html>

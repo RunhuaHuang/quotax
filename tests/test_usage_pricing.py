@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from app.usage import pricing
 
 
@@ -61,11 +63,43 @@ def test_calc_cost_unknown_model_zero():
     assert cost["total_usd"] == Decimal(0)
 
 
+def test_calc_cost_ignores_nonfinite_and_negative_token_counts():
+    book = pricing.PricingBook()
+    rate = book.resolve("claude-sonnet-5")
+    cost = pricing.calc_cost(
+        {"input": float("nan"), "output": float("inf"), "cache_read": -1, "cache_creation": "not-a-number"},
+        rate,
+    )
+    assert cost["total_usd"] == Decimal("0.000000")
+
+
 def test_upsert_overrides_builtin():
     book = pricing.PricingBook()
     book.upsert("claude-sonnet-5", 99.0, 99.0, 0, 0, is_builtin=False)
     rate = book.resolve("claude-sonnet-5")
     assert rate.input == Decimal("99.0")
+    entry = next(e for e in book.entries() if e["model_key"] == "claude-sonnet-5")
+    assert entry["is_builtin"] is True
+
+
+@pytest.mark.parametrize("invalid", [-1, "NaN", "Infinity", 1_000_001, True])
+def test_upsert_rejects_invalid_rates(invalid):
+    book = pricing.PricingBook()
+    with pytest.raises(ValueError):
+        book.upsert("custom-model", invalid, 0, 0, 0)
+
+
+def test_builtin_prices_include_current_cache_write_and_gemini_rates():
+    book = pricing.PricingBook()
+    gpt = book.resolve("gpt-5.6-terra")
+    assert gpt.cache_creation == Decimal("2.5")
+
+    gemini_pro = book.resolve("gemini-2.5-pro")
+    assert gemini_pro.output == Decimal("10.0")
+
+    gemini_flash = book.resolve("gemini-2.5-flash")
+    assert gemini_flash.input == Decimal("0.3")
+    assert gemini_flash.output == Decimal("2.5")
 
 
 def test_apply_litellm_merges():

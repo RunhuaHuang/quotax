@@ -2,8 +2,8 @@
 
 // 不依赖 DOM/localStorage 的纯函数抽到 view-utils.js（可被 node:test 直接
 // import 测试），这里只 import 使用，避免同一份逻辑两处维护。
-import { normalizeThreeWindows, canonicalChannelId, channelBreachesThreshold, noPercentData, fmtReset } from "./view-utils.js?v=7";
-import { t, thas, toggleLang, getLang } from "./i18n.js?v=7";
+import { normalizeThreeWindows, canonicalChannelId, channelBreachesThreshold, noPercentData, fmtReset } from "./view-utils.js?v=9";
+import { t, thas, toggleLang, getLang } from "./i18n.js?v=9";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -100,6 +100,28 @@ let localUsage = null;
 let editingId = null;
 let autoRefreshTimer = null;
 let dashboardLoadedOnce = false;
+let monitorStatus = null;
+let monitorStatusRequestRevision = 0;
+let monitorStatusAbortController = null;
+let quotaRequestRevision = 0;
+let quotaAbortController = null;
+
+const DEFAULT_BACKEND_SETTINGS = {
+  monitor: {
+    enabled: false,
+    interval_seconds: 300,
+    desktop_notifications: true,
+    webhook_url: "",
+    cooldown_seconds: 3600,
+    retention_days: 365,
+    thresholds: {},
+  },
+};
+let appSettings = {
+  monitor: { ...DEFAULT_BACKEND_SETTINGS.monitor, thresholds: {} },
+};
+let settingsSaveChain = Promise.resolve();
+let settingsSaveRevision = 0;
 
 /* ── 用户偏好（持久化到 localStorage）───────────────────────── */
 
@@ -168,6 +190,7 @@ async function init() {
     renderFatalError(t("empty.initFailedTitle") + `: ${t("empty.quotaLoadFailedDesc")} (${e.message})`);
     return;
   }
+  await loadSettings();
   // 快照恢复时 providersCatalog 可能还没就绪（类型标签用 fallback），这里重绘修正
   if (dashboardLoadedOnce) renderDashboard();
   await Promise.all([loadChannels(), refreshQuotas(true), loadLocalUsage()]);
@@ -233,6 +256,8 @@ function bindEvents() {
   $("#settingsModal").addEventListener("click", (e) => {
     if (e.target === $("#settingsModal")) closeSettingsModal();
   });
+  $("#btnSaveMonitor").addEventListener("click", saveMonitoringSettings);
+  $("#btnRunMonitor").addEventListener("click", runMonitorNow);
 
   // 历史趋势弹窗
   $("#btnHistory").addEventListener("click", openHistoryModal);
@@ -346,6 +371,69 @@ async function loadProviders() {
   categories = data.categories || {};
 }
 
+function normalizeBackendSettings(data) {
+  const incoming = data?.monitor || {};
+  return {
+    monitor: {
+      ...DEFAULT_BACKEND_SETTINGS.monitor,
+      ...incoming,
+      thresholds: incoming.thresholds && typeof incoming.thresholds === "object" ? incoming.thresholds : {},
+    },
+  };
+}
+
+function clearLegacyThresholds() {
+  try {
+    const prefs = loadPrefs();
+    if (!("thresholds" in prefs)) return;
+    delete prefs.thresholds;
+    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+  } catch {}
+}
+
+async function saveMonitorPatch(patch) {
+  const requestPatch = JSON.parse(JSON.stringify(patch));
+  const revision = ++settingsSaveRevision;
+  const operation = settingsSaveChain.catch(() => {}).then(async () => {
+    const res = await fetch("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ monitor: requestPatch }),
+    });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try { detail = (await res.json()).detail || detail; } catch {}
+      throw new Error(detail);
+    }
+    const normalized = normalizeBackendSettings(await res.json());
+    // 多次保存严格串行；旧响应不能覆盖用户在等待期间刚输入的较新本地状态。
+    if (revision === settingsSaveRevision) appSettings = normalized;
+    clearLegacyThresholds();
+    return normalized;
+  });
+  settingsSaveChain = operation;
+  return operation;
+}
+
+async function loadSettings() {
+  const legacyThresholds = loadPrefs().thresholds || {};
+  try {
+    const res = await fetch("/api/settings", { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    appSettings = normalizeBackendSettings(await res.json());
+    // 一次性迁移旧版本只存在 localStorage 的阈值。后端已有阈值时以后端为准，
+    // 避免多设备/多浏览器之间互相覆盖。
+    if (!Object.keys(appSettings.monitor.thresholds).length && Object.keys(legacyThresholds).length) {
+      await saveMonitorPatch({ thresholds: legacyThresholds });
+    } else {
+      clearLegacyThresholds();
+    }
+  } catch (e) {
+    console.warn("后台设置加载失败，暂用浏览器本地阈值", e);
+    appSettings = normalizeBackendSettings({ monitor: { thresholds: legacyThresholds } });
+  }
+}
+
 async function loadChannels() {
   try {
     const res = await fetch("/api/channels");
@@ -353,18 +441,27 @@ async function loadChannels() {
     channels = await res.json();
     renderChannelsList();
     renderChannelCount();
+    // 首次启动时渠道列表与额度请求并发，若额度响应先回来，卡片可能先用 fallback
+    // 元信息渲染；渠道列表到达后补一次轻量重绘，确保管理链接、名称和趋势选择器
+    // 立即与最新配置一致。
+    if (dashboardLoadedOnce) renderDashboard();
   } catch (e) {
     toast(t("toast.loadChannelsFailed", { msg: e.message }), "err");
   }
 }
 
 async function refreshQuotas(force = false) {
+  const revision = ++quotaRequestRevision;
+  if (quotaAbortController) quotaAbortController.abort();
+  const controller = new AbortController();
+  quotaAbortController = controller;
   const btn = $("#btnRefresh");
   btn.classList.add("spinning");
   btn.setAttribute("aria-busy", "true");
   try {
     const url = force ? "/api/quotas?force=1" : "/api/quotas";
-    const data = await fetchQuotas(url);
+    const data = await fetchQuotas(url, controller.signal);
+    if (revision !== quotaRequestRevision || controller.signal.aborted) return;
     quotas = data.channels;
     dashboardLoadedOnce = true;
     renderDashboard();
@@ -373,19 +470,23 @@ async function refreshQuotas(force = false) {
     $("#lastUpdated").textContent = t("card.lastUpdated", { time: ts, cached: data.cached ? t("card.cachedSuffix") : "" });
     saveSnapshot({ channels: data.channels, lastUpdated: ts });
   } catch (e) {
+    if (e?.name === "AbortError" || revision !== quotaRequestRevision) return;
     toast(t("toast.refreshFailed", { ctx: dashboardLoadedOnce ? t("toast.refreshCtxKept") : "", msg: e.message }), "err");
     if (!dashboardLoadedOnce) {
       // 从未成功加载过：给出明确的错误态，不能伪装成"还没配置渠道"的空状态
       renderFatalDashboardError(e.message);
     }
   } finally {
-    btn.classList.remove("spinning");
-    btn.removeAttribute("aria-busy");
+    if (revision === quotaRequestRevision) {
+      quotaAbortController = null;
+      btn.classList.remove("spinning");
+      btn.removeAttribute("aria-busy");
+    }
   }
 }
 
-async function fetchQuotas(url) {
-  const res = await fetch(url);
+async function fetchQuotas(url, signal) {
+  const res = await fetch(url, signal ? { signal } : undefined);
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
     try {
@@ -488,7 +589,10 @@ function restoreSnapshot() {
     if (!snap || typeof snap !== "object") return false;
     let restored = false;
     if (Array.isArray(snap.channels) && snap.channels.length) {
-      quotas = snap.channels;
+      quotas = snap.channels.map((q) => ({
+        ...q,
+        cache: { ...(q.cache || {}), hit: true, source: "snapshot" },
+      }));
       dashboardLoadedOnce = true;
       renderDashboard();
       if (snap.lastUpdated) {
@@ -687,7 +791,7 @@ function renderCard(q) {
     footTitle = q.source ? `${footText}\n${t("card.source")}: ${q.source}` : footText;
     footCls = "msg";
   }
-  const time = q.updated_at ? fmtTime(q.updated_at) : "";
+  const time = freshnessText(q);
 
   const showRefresh = !isDisabled;
   const actions = `
@@ -1192,7 +1296,7 @@ function renderDynamicFields(existing = null) {
           </button>
           <span class="file-upload-name" id="fCodexAuthName">${t("codex.noFile")}</span>
         </div>
-        <div class="field-hint">${t("codex.authJsonHint", { current: cur })}</div>
+        <div class="field-hint">${t("codex.authJsonHint", { current: esc(cur) })}</div>
       </div>`;
   }
 
@@ -1457,6 +1561,16 @@ function fmtTime(ms) {
   return d.toLocaleTimeString(getLang() === "zh-CN" ? "zh-CN" : "en-US", { hour12: false, hour: "2-digit", minute: "2-digit" });
 }
 
+function freshnessText(q) {
+  if (q.status === "disabled") return t("card.notQueried");
+  if (!q.updated_at) return "";
+  const age = fmtTime(q.updated_at);
+  if (q.cache?.source === "snapshot") return `${t("card.snapshotData")} · ${age}`;
+  if (q.cache?.stale) return `${t("card.staleData")} · ${age}`;
+  if (q.cache?.hit) return `${t("card.cacheData")} · ${age}`;
+  return `${t("card.liveData")} · ${age}`;
+}
+
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -1533,11 +1647,14 @@ function applyLang() {
 
 /* ── 设置弹窗 ─────────────────────────────────────────── */
 
-function openSettingsModal() {
+async function openSettingsModal() {
   $("#settingsModal").classList.remove("hidden");
   renderThemeOptions();
   renderRefreshOptions();
+  renderMonitoringForm();
+  renderMonitorStatus();
   renderThresholdList();
+  await loadMonitorStatus();
 }
 
 function closeSettingsModal() {
@@ -1586,23 +1703,151 @@ function renderRefreshOptions() {
   });
 }
 
+function ensureSelectValue(select, value) {
+  const stringValue = String(value);
+  if (![...select.options].some((o) => o.value === stringValue)) {
+    const option = document.createElement("option");
+    option.value = stringValue;
+    option.textContent = stringValue;
+    select.appendChild(option);
+  }
+  select.value = stringValue;
+}
+
+function renderMonitoringForm() {
+  const monitor = appSettings.monitor;
+  $("#monitorEnabled").checked = Boolean(monitor.enabled);
+  $("#monitorDesktop").checked = Boolean(monitor.desktop_notifications);
+  $("#monitorWebhook").value = monitor.webhook_url || "";
+  ensureSelectValue($("#monitorInterval"), monitor.interval_seconds);
+  ensureSelectValue($("#monitorCooldown"), monitor.cooldown_seconds);
+  ensureSelectValue($("#monitorRetention"), monitor.retention_days);
+}
+
+function formatStatusTime(value, fallbackKey) {
+  if (!value) return t(fallbackKey);
+  return new Date(value).toLocaleString(getLang() === "zh-CN" ? "zh-CN" : "en-US", {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+  });
+}
+
+function renderMonitorStatus() {
+  const panel = $("#monitorStatusPanel");
+  if (!panel) return;
+  const status = monitorStatus || {};
+  const enabled = status.enabled ?? appSettings.monitor.enabled;
+  const running = Boolean(status.running);
+  const stateText = running ? t("settings.monitorRunning") : (enabled ? t("settings.monitorEnabled") : t("settings.monitorDisabled"));
+  const alerts = Array.isArray(status.active_alerts) ? status.active_alerts.length : (status.last_result?.active_alerts || 0);
+  panel.innerHTML = `
+    <div class="monitor-status-card"><span class="k">${t("settings.monitorTitle")}</span><span class="v ${enabled ? "ok" : ""}">${esc(stateText)}</span></div>
+    <div class="monitor-status-card"><span class="k">${t("settings.lastRun")}</span><span class="v">${esc(formatStatusTime(status.last_finished_at, "settings.neverRun"))}</span></div>
+    <div class="monitor-status-card"><span class="k">${t("settings.nextRun")}</span><span class="v">${esc(formatStatusTime(status.next_run_at, "settings.noScheduledRun"))}</span></div>
+    <div class="monitor-status-card"><span class="k">${t("settings.activeAlerts")}</span><span class="v ${alerts ? "warn" : "ok"}">${alerts}</span></div>
+    ${status.last_error ? `<div class="monitor-status-error"><b>${t("settings.monitorError")}：</b>${esc(status.last_error)}</div>` : ""}`;
+}
+
+async function loadMonitorStatus() {
+  const revision = ++monitorStatusRequestRevision;
+  if (monitorStatusAbortController) monitorStatusAbortController.abort();
+  const controller = new AbortController();
+  monitorStatusAbortController = controller;
+  try {
+    const res = await fetch("/api/monitor/status", { cache: "no-store", signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (revision !== monitorStatusRequestRevision || controller.signal.aborted) return;
+    monitorStatus = data;
+  } catch (e) {
+    if (e?.name === "AbortError" || revision !== monitorStatusRequestRevision) return;
+    monitorStatus = { enabled: appSettings.monitor.enabled, last_error: e.message };
+  } finally {
+    if (revision === monitorStatusRequestRevision) monitorStatusAbortController = null;
+  }
+  renderMonitorStatus();
+}
+
+async function saveMonitoringSettings() {
+  const btn = $("#btnSaveMonitor");
+  btn.disabled = true;
+  if (thresholdSaveTimer !== null) {
+    clearTimeout(thresholdSaveTimer);
+    thresholdSaveTimer = null;
+  }
+  try {
+    await saveMonitorPatch({
+      enabled: $("#monitorEnabled").checked,
+      interval_seconds: Number($("#monitorInterval").value),
+      desktop_notifications: $("#monitorDesktop").checked,
+      webhook_url: $("#monitorWebhook").value.trim(),
+      cooldown_seconds: Number($("#monitorCooldown").value),
+      retention_days: Number($("#monitorRetention").value),
+      thresholds: getThresholds(),
+    });
+    toast(t("toast.monitorSaved"), "ok");
+    await loadMonitorStatus();
+  } catch (e) {
+    toast(t("toast.monitorSaveFailed", { msg: e.message }), "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function runMonitorNow() {
+  const btn = $("#btnRunMonitor");
+  btn.disabled = true;
+  monitorStatus = { ...(monitorStatus || {}), running: true };
+  renderMonitorStatus();
+  try {
+    const res = await fetch("/api/monitor/run?force=true", { method: "POST" });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try { detail = (await res.json()).detail || detail; } catch {}
+      throw new Error(detail);
+    }
+    const data = await res.json();
+    monitorStatus = data.status;
+    toast(t("toast.monitorRunDone", { alerts: data.result.active_alerts || 0 }), "ok");
+    await refreshQuotas(false);
+  } catch (e) {
+    toast(t("toast.monitorRunFailed", { msg: e.message }), "err");
+    await loadMonitorStatus();
+  } finally {
+    btn.disabled = false;
+    renderMonitorStatus();
+  }
+}
+
 /* ── 低余额阈值告警 ─────────────────────────────────────── */
 
 const DEFAULT_THRESHOLD = 20; // 默认剩余百分比阈值
+let thresholdSaveTimer = null;
+let thresholdPersistRevision = 0;
 
 function getThresholds() {
-  return loadPrefs().thresholds || {};
+  return appSettings.monitor.thresholds || {};
 }
 
-function setThreshold(channelId, value) {
-  const thresholds = getThresholds();
-  if (value === null || value === "" || isNaN(value)) {
-    delete thresholds[channelId];
-  } else {
-    thresholds[channelId] = Math.max(0, Math.min(100, Number(value)));
+async function persistThresholds() {
+  const revision = ++thresholdPersistRevision;
+  const thresholds = { ...getThresholds() };
+  try {
+    await saveMonitorPatch({ thresholds });
+  } catch (e) {
+    if (revision !== thresholdPersistRevision) return;
+    await loadSettings();
+    renderSummaryChips(quotas);
+    toast(t("toast.thresholdSaveFailed", { msg: e.message }), "err");
+    renderThresholdList();
   }
-  savePrefs({ thresholds });
-  renderSummaryChips(quotas); // 阈值变化立即更新汇总徽章
+}
+
+function scheduleThresholdSave() {
+  if (thresholdSaveTimer !== null) clearTimeout(thresholdSaveTimer);
+  thresholdSaveTimer = setTimeout(() => {
+    thresholdSaveTimer = null;
+    void persistThresholds();
+  }, 400);
 }
 
 function renderThresholdList() {
@@ -1625,15 +1870,30 @@ function renderThresholdList() {
           </div>
           <div class="threshold-input-wrap">
             <span class="threshold-suffix">${t("settings.thresholdSuffix")}</span>
-            <input type="number" min="0" max="100" placeholder="${DEFAULT_THRESHOLD}" value="${val}" data-threshold-id="${esc(ch.id)}">
+            <input type="number" min="0" max="100" placeholder="${DEFAULT_THRESHOLD}" value="${val}" data-threshold-id="${esc(ch.id)}" aria-label="${esc(t("settings.thresholdInputAria", { name: ch.name }))}">
             <span class="threshold-suffix">${t("settings.thresholdAlert")}</span>
           </div>
         </div>`;
     })
     .join("");
   container.querySelectorAll("[data-threshold-id]").forEach((input) => {
-    input.addEventListener("change", () => {
-      setThreshold(input.dataset.thresholdId, input.value);
+    input.addEventListener("input", () => {
+      const thresholds = { ...getThresholds() };
+      const value = input.value;
+      if (value === "" || isNaN(value)) delete thresholds[input.dataset.thresholdId];
+      else thresholds[input.dataset.thresholdId] = Math.max(0, Math.min(100, Number(value)));
+      appSettings.monitor.thresholds = thresholds;
+      renderSummaryChips(quotas);
+      scheduleThresholdSave();
+    });
+    input.addEventListener("change", async () => {
+      if (thresholdSaveTimer !== null) {
+        clearTimeout(thresholdSaveTimer);
+        thresholdSaveTimer = null;
+      }
+      input.disabled = true;
+      await persistThresholds();
+      input.disabled = false;
     });
   });
 }
@@ -1711,6 +1971,8 @@ async function onImportFileSelected(e) {
 /* ── 历史趋势 ─────────────────────────────────────────── */
 
 let historyCache = null;
+let historyRequestRevision = 0;
+let historyAbortController = null;
 
 function openHistoryModal() {
   $("#historyModal").classList.remove("hidden");
@@ -1726,22 +1988,39 @@ function openHistoryModal() {
 }
 
 function closeHistoryModal() {
+  historyRequestRevision += 1;
+  if (historyAbortController) {
+    historyAbortController.abort();
+    historyAbortController = null;
+  }
   $("#historyModal").classList.add("hidden");
 }
 
 async function loadHistory() {
+  const revision = ++historyRequestRevision;
+  if (historyAbortController) historyAbortController.abort();
+  const controller = new AbortController();
+  historyAbortController = controller;
   const days = $("#historyDays").value;
   const cid = $("#historyChannel").value;
   const container = $("#historyContent");
   container.innerHTML = `<div class="history-loading">${t("history.loading")}</div>`;
   try {
     const url = `/api/history?days=${days}${cid ? `&ids=${encodeURIComponent(cid)}` : ""}`;
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    historyCache = await res.json();
+    const data = await res.json();
+    // 用户快速切换渠道/时间范围时，旧请求可能比新请求晚返回；旧响应不能覆盖
+    // 当前选择，也不能在用户已关闭弹窗后重新写入 DOM。
+    if (revision !== historyRequestRevision || controller.signal.aborted) return;
+    historyCache = data;
     renderHistory(historyCache, Number(days));
   } catch (e) {
-    container.innerHTML = `<div class="empty-state error-state"><div class="empty-icon">⚠️</div><p>${t("history.loadFailed", { msg: e.message })}</p></div>`;
+    if (e?.name === "AbortError" || revision !== historyRequestRevision) return;
+    // 历史接口错误可能包含上游/网络返回文本，先转义再放进 innerHTML，避免 DOM 注入。
+    container.innerHTML = `<div class="empty-state error-state"><div class="empty-icon">⚠️</div><p>${t("history.loadFailed", { msg: esc(e.message) })}</p></div>`;
+  } finally {
+    if (revision === historyRequestRevision) historyAbortController = null;
   }
 }
 
@@ -1875,5 +2154,10 @@ function setQuotas(list) {
   renderDashboard();
 }
 window.__quotax = { renderDashboard, setQuotas };
+// usage.js（独立 ES module）需要复用本模块的 toast / esc / fmtTime：ES module 的
+// 顶层声明不会自动挂到 window，不显式暴露的话 usage.js 的兜底分支永远拿不到。
+window.toast = toast;
+window.esc = esc;
+window.fmtTime = fmtTime;
 
 init();

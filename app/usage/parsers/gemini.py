@@ -18,6 +18,7 @@ import json
 import logging
 from pathlib import Path
 
+from ...models import to_ts
 from .. import store
 from . import BaseParser, CollectResult, NormalizedRecord
 
@@ -27,10 +28,13 @@ GEMINI_CHATS_DIR = Path.home() / ".gemini" / "tmp"
 
 
 def _safe_int(v, default=0) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
+    if isinstance(v, bool):
         return default
+    try:
+        converted = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0, converted)
 
 
 class GeminiParser(BaseParser):
@@ -60,7 +64,14 @@ class GeminiParser(BaseParser):
         stat = file_path.stat()
         mtime_ns = stat.st_mtime_ns
         cursor = store.get_cursor(self.source, str(file_path))
-        if cursor and cursor.get("last_modified_ns") == mtime_ns:
+        # Gemini 文件不是追加式 JSONL，仍用文件大小辅助 mtime 判断。某些文件系统
+        # 的 mtime 精度较粗，文件被追加/重写后 mtime 可能暂时不变；旧游标为 0
+        # 或大小发生变化时必须重新解析。
+        if (
+            cursor
+            and cursor.get("last_modified_ns") == mtime_ns
+            and cursor.get("last_line_offset") == stat.st_size
+        ):
             return
 
         # 单 JSON 文件，mtime 变则整体重解析
@@ -73,7 +84,7 @@ class GeminiParser(BaseParser):
             return
 
         records: list[NormalizedRecord] = []
-        for msg in messages:
+        for message_index, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 continue
             if msg.get("role") != "model":  # Gemini 用 role=model 表示 assistant
@@ -97,7 +108,9 @@ class GeminiParser(BaseParser):
 
             records.append(
                 NormalizedRecord(
-                    uuid=f"{session_id}:{ts_ms}",
+                    # 同一 session 的两条消息可能共享时间戳；消息索引保证稳定去重键
+                    # 不发生碰撞。
+                    uuid=f"{session_id}:{ts_ms}:{message_index}",
                     timestamp_ms=ts_ms,
                     model=str(msg.get("model") or "gemini"),
                     session_id=session_id,
@@ -108,19 +121,14 @@ class GeminiParser(BaseParser):
                 )
             )
 
-        store.set_cursor(self.source, str(file_path), last_modified_ns=mtime_ns, last_line_offset=0)
+        store.set_cursor(
+            self.source,
+            str(file_path),
+            last_modified_ns=mtime_ns,
+            last_line_offset=stat.st_size,
+        )
         result.records.extend(records)
 
 
 def _parse_ts(value) -> int | None:
-    if isinstance(value, (int, float)):
-        v = int(value)
-        return v if v > 1_000_000_000_000 else v * 1000
-    if isinstance(value, str):
-        from datetime import datetime
-
-        try:
-            return int(datetime.fromisoformat(value).timestamp() * 1000)
-        except ValueError:
-            return None
-    return None
+    return to_ts(value)

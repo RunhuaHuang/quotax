@@ -18,6 +18,10 @@ config.json.corrupted.*
 # 手动导出的配置（GET /api/config/export?include_secrets=true 含明文密钥）
 config-export*.json
 
+# 后台监控告警/冷却运行状态（含渠道名和通知结果，属于本机运行数据）
+monitor-state.json
+.monitor-state.json.*.tmp
+
 # 历史趋势数据（个人用量记录）
 history/
 
@@ -36,6 +40,10 @@ credentials/
 usage.db
 usage.db-shm
 usage.db-wal
+
+# 后台启动日志及单份轮转备份
+quotax.log
+quotax.log.1
 
 # 无关目录
 kitesurf-bench/

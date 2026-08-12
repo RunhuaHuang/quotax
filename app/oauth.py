@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import secrets
@@ -110,11 +111,17 @@ class _PendingFlow:
 
 _FLOWS: dict[str, _PendingFlow] = {}
 _FLOW_TTL = 600  # 秒
+_FLOW_MAX = 32  # 本地 WebUI 同时最多保留的授权流程数
 
 
 def store_flow(state: str, code_verifier: str) -> None:
     """记录一次发起的 OAuth 流程（state + verifier）。"""
     _purge_expired()
+    # 端点只在本机监听，但浏览器扩展/恶意本地页面仍可能反复触发 start。
+    # 限制未完成流程数量，避免单纯发起请求就能让内存无界增长。
+    while len(_FLOWS) >= _FLOW_MAX:
+        oldest_state = min(_FLOWS, key=lambda key: _FLOWS[key].created_at)
+        _FLOWS.pop(oldest_state, None)
     _FLOWS[state] = _PendingFlow(state=state, code_verifier=code_verifier, created_at=time.time())
 
 
@@ -158,7 +165,7 @@ def parse_id_token(id_token: str) -> dict:
         # JWT payload 是 base64url 无 padding，补齐后 decode
         payload += "=" * (-len(payload) % 4)
         claims = json.loads(base64.urlsafe_b64decode(payload))
-    except (ValueError, json.JSONDecodeError):
+    except (binascii.Error, UnicodeDecodeError, TypeError, ValueError):
         return {"account_id": "", "email": "", "plan_type": ""}
     if not isinstance(claims, dict):
         return {"account_id": "", "email": "", "plan_type": ""}

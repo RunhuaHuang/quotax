@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 from dataclasses import dataclass
@@ -54,9 +55,17 @@ def _run_security(args: list[str]) -> str | None:
 
 def _expired(ts: float | None) -> bool:
     """毫秒/秒时间戳是否已过期。"""
-    if not ts:
+    if ts in (None, "", 0, 0.0):
         return False
-    ms = ts * 1000 if ts < 10_000_000_000 else ts
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        # 某些 CLI 版本会把 expiry 字段序列化成非数字文本；不能让一个坏的
+        # 可选过期字段把整个凭据探测打成 500，按“未知过期时间”继续解析 token。
+        return False
+    if not math.isfinite(value) or value <= 0:
+        return False
+    ms = value * 1000 if value < 10_000_000_000 else value
     return ms < datetime.now(UTC).timestamp() * 1000
 
 

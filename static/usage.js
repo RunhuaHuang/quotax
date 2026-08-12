@@ -5,7 +5,7 @@
 // 本文件是独立 ES module（与 app.js 作用域隔离），自带 $ / esc / fmtTime 等工具，
 // 不依赖 app.js 暴露全局变量——避免加载顺序耦合。
 
-import { t, getLang } from "./i18n.js?v=7";
+import { t, getLang } from "./i18n.js?v=9";
 
 const $ = (sel) => document.querySelector(sel);
 const USAGE_DAYS_KEY = "quotaboard_prefs.usage_days";
@@ -18,10 +18,38 @@ let usageState = {
   overview: null,
   trend: [],
   models: [],
-  log: null,
+  log: { rows: [], limit: 200, offset: 0, has_more: false },
   filters: { sources: [], models: [] },
   collecting: false,
 };
+let usageRequestRevision = 0;
+let usageAbortController = null;
+
+function beginUsageRequest() {
+  usageRequestRevision += 1;
+  if (usageAbortController) usageAbortController.abort();
+  const controller = new AbortController();
+  usageAbortController = controller;
+  return {
+    revision: usageRequestRevision,
+    signal: controller.signal,
+    days: usageState.days,
+    source: usageState.source,
+    model: usageState.model,
+    metric: usageState.metric,
+  };
+}
+
+function isCurrentUsageRequest(ctx) {
+  return Boolean(ctx) && ctx.revision === usageRequestRevision && !ctx.signal.aborted;
+}
+
+function usageParams(ctx, extra = {}) {
+  const p = new URLSearchParams({ days: ctx.days, ...extra });
+  if (ctx.source) p.set("source", ctx.source);
+  if (ctx.model) p.set("model", ctx.model);
+  return p;
+}
 
 function loadUsagePrefs() {
   try {
@@ -55,103 +83,117 @@ window.addEventListener("quotax:usage-lang-change", () => {
 });
 
 async function loadAll() {
+  const ctx = beginUsageRequest();
   renderUsageSkeleton();
   await Promise.all([
-    loadOverview(),
-    loadTrend(),
-    loadModels(),
-    loadLog(),
-    loadFilters(),
+    loadOverview(ctx),
+    loadTrend(ctx),
+    loadModels(ctx),
+    loadLog({}, ctx),
+    loadFilters(ctx),
   ]);
+  if (!isCurrentUsageRequest(ctx)) return;
   // 首次加载如果发现没数据，自动触发一次采集（可能服务刚启动、采集还在后台
   // 跑，或本机 CLI 日志还没被扫过）。采集是幂等的，重复跑不会产生重复记录。
   const ov = usageState.overview;
   if (ov && !ov.total_tokens && !ov.requests) {
     await collectNow();
-    await Promise.all([
-      loadOverview(),
-      loadTrend(),
-      loadModels(),
-      loadLog(),
-      loadFilters(),
-    ]);
+    return;
   }
   usageState.loaded = true;
   renderUsage();
 }
 
-async function loadOverview() {
+async function loadOverview(ctx = beginUsageRequest()) {
   try {
-    const p = new URLSearchParams({ days: usageState.days });
-    if (usageState.source) p.set("source", usageState.source);
-    if (usageState.model) p.set("model", usageState.model);
-    const res = await fetch(`/api/usage/overview?${p}`);
+    const p = usageParams(ctx);
+    const res = await fetch(`/api/usage/overview?${p}`, { signal: ctx.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    usageState.overview = await res.json();
-  } catch (e) { usageState.overview = null; }
+    const data = await res.json();
+    if (isCurrentUsageRequest(ctx)) usageState.overview = data;
+  } catch (e) {
+    if (e?.name !== "AbortError" && isCurrentUsageRequest(ctx)) usageState.overview = null;
+  }
 }
 
-async function loadTrend() {
+async function loadTrend(ctx = beginUsageRequest()) {
   try {
-    const p = new URLSearchParams({ days: usageState.days });
-    if (usageState.source) p.set("source", usageState.source);
-    if (usageState.model) p.set("model", usageState.model);
-    const res = await fetch(`/api/usage/trend?${p}`);
+    const p = usageParams(ctx);
+    const res = await fetch(`/api/usage/trend?${p}`, { signal: ctx.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    usageState.trend = await res.json();
-  } catch { usageState.trend = []; }
+    const data = await res.json();
+    if (isCurrentUsageRequest(ctx)) usageState.trend = data;
+  } catch (e) {
+    if (e?.name !== "AbortError" && isCurrentUsageRequest(ctx)) usageState.trend = [];
+  }
 }
 
-async function loadModels() {
+async function loadModels(ctx = beginUsageRequest()) {
   try {
-    const p = new URLSearchParams({ days: usageState.days, metric: usageState.metric });
-    if (usageState.source) p.set("source", usageState.source);
-    const res = await fetch(`/api/usage/models?${p}`);
+    const p = usageParams(ctx, { metric: ctx.metric });
+    const res = await fetch(`/api/usage/models?${p}`, { signal: ctx.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    usageState.models = await res.json();
-  } catch { usageState.models = []; }
+    const data = await res.json();
+    if (isCurrentUsageRequest(ctx)) usageState.models = data;
+  } catch (e) {
+    if (e?.name !== "AbortError" && isCurrentUsageRequest(ctx)) usageState.models = [];
+  }
 }
 
-async function loadLog() {
+async function loadLog({ append = false } = {}, ctx = beginUsageRequest()) {
   try {
-    const p = new URLSearchParams({ days: usageState.days, limit: "200" });
-    if (usageState.source) p.set("source", usageState.source);
-    if (usageState.model) p.set("model", usageState.model);
-    const res = await fetch(`/api/usage/log?${p}`);
+    const currentRows = usageState.log?.rows || [];
+    const offset = append ? currentRows.length : 0;
+    const p = usageParams(ctx, { limit: "200", offset: String(offset) });
+    const res = await fetch(`/api/usage/log?${p}`, { signal: ctx.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    usageState.log = await res.json();
-  } catch { usageState.log = { rows: [] }; }
+    const page = await res.json();
+    if (!isCurrentUsageRequest(ctx)) return;
+    usageState.log = append
+      ? { ...page, rows: [...currentRows, ...(page.rows || [])], offset: offset }
+      : page;
+  } catch (e) {
+    if (e?.name !== "AbortError" && !append && isCurrentUsageRequest(ctx)) {
+      usageState.log = { rows: [], limit: 200, offset: 0, has_more: false };
+    }
+  }
 }
 
-async function loadFilters() {
+async function loadFilters(ctx = beginUsageRequest()) {
   try {
-    const res = await fetch(`/api/usage/filters?days=${usageState.days}`);
+    const res = await fetch(`/api/usage/filters?days=${ctx.days}`, { signal: ctx.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    usageState.filters = await res.json();
-  } catch { usageState.filters = { sources: [], models: [] }; }
+    const data = await res.json();
+    if (isCurrentUsageRequest(ctx)) usageState.filters = data;
+  } catch (e) {
+    if (e?.name !== "AbortError" && isCurrentUsageRequest(ctx)) {
+      usageState.filters = { sources: [], models: [] };
+    }
+  }
 }
 
 async function collectNow() {
   if (usageState.collecting) return;
   usageState.collecting = true;
+  const ctx = beginUsageRequest();
   const btn = $("#usageCollectBtn");
   if (btn) { btn.disabled = true; btn.textContent = t("usage.collecting"); }
   try {
-    const res = await fetch("/api/usage/collect", { method: "POST" });
+    const res = await fetch("/api/usage/collect", { method: "POST", signal: ctx.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    await Promise.all([loadOverview(), loadTrend(), loadModels(), loadLog(), loadFilters()]);
-    renderUsage();
+    if (!isCurrentUsageRequest(ctx)) return;
+    await reloadAll();
   } catch (e) {
-    toast(t("usage.collectFailed", { msg: e.message }), "err");
+    if (e?.name !== "AbortError") toast(t("usage.collectFailed", { msg: e.message }), "err");
   } finally {
     usageState.collecting = false;
     if (btn) { btn.disabled = false; btn.textContent = t("usage.collect"); }
   }
 }
 
-function toast(msg) {
-  // 复用 app.js 的 toast（如果存在），否则简单 console
-  if (typeof window.toast === "function") window.toast(msg);
+function toast(msg, kind) {
+  // 复用 app.js 的 toast（如果存在），否则简单 console；透传 kind 让错误样式生效
+  if (typeof window.toast === "function") window.toast(msg, kind);
   else console.warn(msg);
 }
 
@@ -396,6 +438,7 @@ function renderRequestLog() {
           <tbody>${body}</tbody>
         </table>
       </div>
+      ${usageState.log?.has_more ? `<div class="usage-load-more-wrap"><button class="btn btn-ghost" id="usageLogMoreBtn">${t("usage.loadMore")}</button></div>` : ""}
     </div>`;
 }
 
@@ -448,7 +491,7 @@ function bindUsageEvents() {
   document.querySelectorAll(".usage-metric-toggle button").forEach((btn) => {
     btn.addEventListener("click", () => {
       usageState.metric = btn.dataset.metric;
-      loadModels().then(renderUsage);
+      reloadAll();
     });
   });
   // 定价操作
@@ -458,10 +501,27 @@ function bindUsageEvents() {
   if (rebill) rebill.addEventListener("click", doRebill);
   const pricing = $("#usagePricingBtn");
   if (pricing) pricing.addEventListener("click", togglePricingPanel);
+  const more = $("#usageLogMoreBtn");
+  if (more) more.addEventListener("click", async () => {
+    more.disabled = true;
+    more.textContent = t("usage.loadingMore");
+    const ctx = beginUsageRequest();
+    await loadLog({ append: true }, ctx);
+    if (isCurrentUsageRequest(ctx)) renderUsage();
+  });
 }
 
 async function reloadAll() {
-  await Promise.all([loadOverview(), loadTrend(), loadModels(), loadLog()]);
+  const ctx = beginUsageRequest();
+  await Promise.all([
+    loadOverview(ctx),
+    loadTrend(ctx),
+    loadModels(ctx),
+    loadLog({}, ctx),
+    loadFilters(ctx),
+  ]);
+  if (!isCurrentUsageRequest(ctx)) return;
+  usageState.loaded = true;
   renderUsage();
 }
 
@@ -507,7 +567,8 @@ async function togglePricingPanel() {
     const data = await res.json();
     renderPricingTable(panel, data.entries || []);
   } catch (e) {
-    panel.innerHTML = `<div class="usage-empty">${t("usage.pricingLoadFailed", { msg: e.message })}</div>`;
+    // 错误信息可能来自网络/上游响应，不能未经转义直接拼进 innerHTML。
+    panel.innerHTML = `<div class="usage-empty">${t("usage.pricingLoadFailed", { msg: esc(e.message) })}</div>`;
   }
 }
 
@@ -523,7 +584,9 @@ function renderPricingTable(container, entries) {
       <td class="num">${e.output_per_million}</td>
       <td class="num">${e.cache_read_per_million}</td>
       <td class="num">${e.cache_creation_per_million}</td>
-      <td>${e.is_builtin ? "" : `<button class="btn btn-ghost btn-sm" data-del="${esc(e.model_key)}">${t("usage.pricingDelete")}</button>`}</td>
+      <td>${e.can_restore_default
+        ? `<button class="btn btn-ghost btn-sm" data-restore="${esc(e.model_key)}">${t("usage.pricingRestore")}</button>`
+        : (e.is_builtin ? "" : `<button class="btn btn-ghost btn-sm" data-del="${esc(e.model_key)}">${t("usage.pricingDelete")}</button>`)}</td>
     </tr>`).join("");
   container.innerHTML = `
     <div class="usage-table-wrap">
@@ -552,6 +615,15 @@ function renderPricingTable(container, entries) {
       const key = btn.dataset.del;
       await fetch(`/api/usage/pricing/${encodeURIComponent(key)}`, { method: "DELETE" });
       togglePricingPanel(); togglePricingPanel(); // 重新加载
+    });
+  });
+  container.querySelectorAll("[data-restore]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const key = btn.dataset.restore;
+      const res = await fetch(`/api/usage/pricing/${encodeURIComponent(key)}/restore`, { method: "POST" });
+      if (!res.ok) { toast(t("usage.pricingSaveFailed")); return; }
+      toast(t("usage.pricingRestore"));
+      togglePricingPanel(); togglePricingPanel();
     });
   });
   // 新增 / 覆盖

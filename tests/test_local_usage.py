@@ -11,6 +11,7 @@ messages 语义错误、days 硬编码、message 级时间过滤不精确。
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
@@ -54,6 +55,24 @@ def test_parse_message_data_skips_user_role():
 def test_parse_message_data_handles_bad_json():
     assert local_usage._parse_message_data("not json") is None
     assert local_usage._parse_message_data(None) is None
+
+
+def test_parse_message_data_rejects_nonfinite_cost_and_malformed_token_shapes():
+    data = {
+        "role": "assistant",
+        "cost": float("nan"),
+        "tokens": {"input": float("inf"), "cache": []},
+        "modelID": "m1",
+        "time": {"created": "1785741028621"},
+    }
+    parsed = local_usage._parse_message_data(json.dumps(data, allow_nan=True))
+    assert parsed is not None
+    assert parsed["cost"] is None
+    assert parsed["input"] == 0
+    assert parsed["cache_read"] == 0
+    assert parsed["created"] == 1785741028621
+    # 不能把非有限数带进任何返回 JSON。
+    json.dumps(parsed, allow_nan=False)
 
 
 # ── Claude Code transcript 聚合 ──────────────────────────────────
@@ -359,3 +378,35 @@ def test_get_local_usage_shape(tmp_path, monkeypatch):
         assert source["available"] is False
         assert source["model_stats"] == []
         assert source["totals"] == {}
+
+
+def test_opencode_usage_ignores_nonfinite_cost_in_old_schema(tmp_path, monkeypatch):
+    db_path, conn = _make_db(tmp_path)
+    now_ms = int(time.time() * 1000)
+    conn.execute("CREATE TABLE session (id TEXT PRIMARY KEY, time_updated INTEGER)")
+    conn.execute("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT)")
+    conn.execute("INSERT INTO session VALUES ('s1', ?)", (now_ms,))
+    conn.execute(
+        "INSERT INTO message VALUES ('m1', 's1', ?)",
+        (
+            json.dumps(
+                {
+                    "role": "assistant",
+                    "cost": float("inf"),
+                    "tokens": {"input": 10, "output": 5},
+                    "modelID": "m1",
+                    "time": {"created": now_ms},
+                },
+                allow_nan=True,
+            ),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("OPENCODE_DB", str(db_path))
+
+    result = local_usage.get_opencode_usage(days=14)
+    assert result["available"] is True
+    assert result["totals"]["cost"] == 0.0
+    assert result["totals"]["has_cost"] is False
+    assert math.isfinite(result["totals"]["cost"])

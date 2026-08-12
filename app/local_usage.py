@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -44,10 +45,50 @@ def _safe_int(value, default: int = 0) -> int:
     坏行连累所有数据源（Claude + OpenCode）都拿不到统计。这里吞掉转换异常，
     把畸形字段当 0 处理（与 None/缺失一致），保证统计永远能给出一个数。
     """
-    try:
-        return int(value)
-    except (TypeError, ValueError):
+    if isinstance(value, bool):
         return default
+    try:
+        converted = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0, converted)
+
+
+def _safe_cost(value) -> float | None:
+    """把本地成本字段归一成有限、非负浮点数。
+
+    SQLite/JSON 都可能保存 NaN、Infinity、字符串或负数。它们一旦进入聚合，
+    就会污染总成本、排序和 JSON 响应；异常成本也不应让整个本地用量端点返回
+    500。无法确认的成本返回 None，调用方会把该条记录视为“无费用字段”。
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return max(0.0, number)
+
+
+def _safe_timestamp_ms(value) -> int | None:
+    """把 OpenCode message.time.created 归一为 epoch 毫秒。
+
+    新版通常写毫秒整数，但旧版本/导入数据也可能写秒、数字字符串或非有限
+    数值。无法解析时返回 None，聚合层会保留原有“无时间戳不做额外过滤”的
+    兼容行为，同时不会因比较字符串与整数而崩溃。
+    """
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    integer = int(number)
+    return integer * 1000 if integer < 10_000_000_000 else integer
 
 
 def _unavailable(key: str, label: str, message: str, path: str | None = None) -> dict:
@@ -243,18 +284,24 @@ def _parse_message_data(data_json: str | None) -> dict | None:
         return None
     if not isinstance(data, dict) or data.get("role") != "assistant":
         return None
-    tokens = data.get("tokens") or {}
-    cache = tokens.get("cache") or {}
-    cost = data.get("cost")
+    tokens = data.get("tokens")
+    if not isinstance(tokens, dict):
+        tokens = {}
+    cache = tokens.get("cache")
+    if not isinstance(cache, dict):
+        cache = {}
+    cost = _safe_cost(data.get("cost")) if "cost" in data else None
+    time_obj = data.get("time")
+    created_raw = time_obj.get("created") if isinstance(time_obj, dict) else None
     return {
         "input": _safe_int(tokens.get("input")),
         "output": _safe_int(tokens.get("output")),
         "reasoning": _safe_int(tokens.get("reasoning")),
         "cache_read": _safe_int(cache.get("read")),
         "cache_write": _safe_int(cache.get("write")),
-        "cost": float(cost) if isinstance(cost, (int, float)) else None,
+        "cost": cost,
         "model": str(data.get("modelID") or "unknown"),
-        "created": (data.get("time") or {}).get("created") if isinstance(data.get("time"), dict) else None,
+        "created": _safe_timestamp_ms(created_raw),
     }
 
 
@@ -378,7 +425,7 @@ def _aggregate_from_session(cur, since_ms: int, has_message_table: bool) -> dict
             "reasoning": int(r[4]),
             "cache_read": int(r[5]),
             "cache_write": int(r[6]),
-            "cost": round(float(r[7]), 4),
+            "cost": round(_safe_cost(r[7]) or 0.0, 4),
         }
         for r in rows
     ]
@@ -389,7 +436,7 @@ def _aggregate_from_session(cur, since_ms: int, has_message_table: bool) -> dict
         "output": sum(m["output"] for m in model_stats),
         "cache_read": sum(m["cache_read"] for m in model_stats),
         "cache_write": sum(m["cache_write"] for m in model_stats),
-        "cost": round(sum(m["cost"] for m in model_stats), 4),
+            "cost": round(sum(m["cost"] for m in model_stats), 4),
         "has_cost": any(m["cost"] > 0 for m in model_stats),
     }
     return {

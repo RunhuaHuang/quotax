@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import time
 
@@ -143,6 +144,32 @@ def test_delete_channel_history_removes_file():
     assert path.exists()
     history.delete_channel_history("ch_test")
     assert not path.exists()
+
+
+def test_unsafe_channel_ids_use_distinct_history_files():
+    """a/b 与 ab 不能因旧 sanitize 规则共用一份趋势数据。"""
+    result = _result()
+    history.record_result("a/b", result)
+    history.record_result("ab", result)
+    assert history._channel_history_path("a/b") != history._channel_history_path("ab")
+    assert history._channel_history_path("a/b").exists()
+    assert history._channel_history_path("ab").exists()
+
+
+def test_concurrent_same_day_history_writes_do_not_lose_records(monkeypatch):
+    """并发记录同一渠道时，固定临时文件/读改写竞态不能造成异常或空文件。"""
+    original = history._write_channel_history
+
+    def slow_write(path, records):
+        time.sleep(0.01)
+        original(path, records)
+
+    monkeypatch.setattr(history, "_write_channel_history", slow_write)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda i: history.record_result("ch_test", _result(amount_value=float(i))), range(8)))
+    records = history.get_history(["ch_test"], days=30)["channels"]["ch_test"]
+    assert len(records) == 1
+    assert records[0]["amount"]["value"] in {float(i) for i in range(8)}
 
 
 def test_record_result_failure_does_not_raise():

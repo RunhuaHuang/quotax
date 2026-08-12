@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
 from pathlib import Path
 
+from ...models import to_ts
 from .. import store
 from . import BaseParser, CollectResult, NormalizedRecord
 
@@ -30,19 +30,17 @@ CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
 def _safe_int(v, default: int = 0) -> int:
     """安全转 int（transcript 可能含畸形字段，详见 local_usage.py 的同名牌）。"""
-    try:
-        return int(v)
-    except (TypeError, ValueError):
+    if isinstance(v, bool):
         return default
+    try:
+        converted = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0, converted)
 
 
 def _parse_ts(value) -> int | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        return int(datetime.fromisoformat(value).timestamp() * 1000)
-    except ValueError:
-        return None
+    return to_ts(value)
 
 
 class ClaudeParser(BaseParser):
@@ -77,18 +75,34 @@ class ClaudeParser(BaseParser):
         mtime_ns = stat.st_mtime_ns
         cursor = store.get_cursor(self.source, str(file_path))
 
-        # mtime 未变且游标存在：跳过（无新内容）
-        if cursor and cursor.get("last_modified_ns") == mtime_ns:
-            return
-
         offset = cursor.get("last_line_offset", 0) if cursor else 0
+        rewound = offset < 0 or offset > stat.st_size
+        # 文件被截断/重写后，旧游标可能落在新文件 EOF 之后；必须从头扫描，
+        # 否则后续追加内容会一直从越界 offset 读取不到而永久丢失。主键去重
+        # 会吸收重新扫描旧行带来的重复。
+        if rewound:
+            offset = 0
+        # mtime 未变且文件大小仍等于游标：跳过（无新内容）。某些文件系统的
+        # mtime 精度较粗，追加内容可能暂时保持同一 mtime；此时必须比较大小，
+        # 否则新行会被永久跳过。
+        if (
+            cursor
+            and cursor.get("last_modified_ns") == mtime_ns
+            and not rewound
+            and stat.st_size == offset
+        ):
+            return
         records: list[NormalizedRecord] = []
         truncated = False
 
         with file_path.open("r", encoding="utf-8", errors="replace") as f:
             if offset > 0:
                 f.seek(offset)
-            for raw_line in f:
+            while True:
+                line_offset = f.tell()
+                raw_line = f.readline()
+                if not raw_line:
+                    break
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -119,7 +133,10 @@ class ClaudeParser(BaseParser):
 
                 msg_id = message.get("id")
                 uuid = f"claude:{msg_id}" if isinstance(msg_id, str) and msg_id else (
-                    f"claude:{ts_ms}:{model}:{usage.get('output_tokens')}"
+                    # Some older transcripts omit message.id. Include the
+                    # stable byte offset so two replies in the same millisecond
+                    # cannot collapse into one database row.
+                    f"claude:{session_id}:{ts_ms}:{line_offset}:{model}:{usage.get('output_tokens')}"
                 )
 
                 records.append(

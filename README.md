@@ -20,10 +20,10 @@
 - **订阅渠道免填密钥 + 自动探测**：自动读取本机 CLI 的登录凭据（Claude / Gemini / Grok / Codex / Copilot），**不刷新、不写入**，与你的 agent 共享同一份登录态。服务启动时自动探测本机已登录的 CLI 并创建对应渠道，无需手动添加。
 - **用量统计看板（深度分析）**：独立 Tab，基于 SQLite 持久化的增量采集，提供四桶 token 总览、缓存命中率、按天趋势曲线、模型分布、逐请求日志、成本估算（LiteLLM 单价表 + rebill 回填）。
 - **Codex OAuth 在线授权**：ChatGPT 订阅支持在 WebUI 点一下「通过 ChatGPT 登录」完成 OAuth 授权，自动获取凭据并创建渠道。
-- **按渠道 id 独立缓存 + 请求合并**：成功 60s / 失败 15s，同一渠道并发查询只打一次上游。
+- **按渠道 id 独立缓存 + 请求合并**：成功 5 分钟 / 失败 15 分钟，同一渠道并发查询只打一次上游；手动刷新可立即绕过缓存。
 - **拖拽排序**：卡片可拖拽自定义顺序，顺序持久化到浏览器 `localStorage`。
 - **历史趋势**：每次成功查询自动记录一条趋势点，用 SVG 折线图展示余额 / 剩余百分比随时间的变化。
-- **低余额告警**：为每个渠道设置剩余百分比阈值，低于阈值时卡片标橙、顶栏汇总计数。
+- **浏览器无关的后台告警**：阈值持久化到后端；可按周期持续检查，支持桌面通知、Webhook、重复告警冷却和恢复通知，关闭浏览器后仍可运行（默认关闭，需显式开启）。
 - **中 / 英双语**：界面支持简体中文与 English 一键切换。
 - **深 / 浅色主题**：跟随系统或手动切换。
 - **CLI 终端工具**：`quotaboard quota --brief` 单行摘要，适合 tmux statusbar / shell prompt。
@@ -57,7 +57,7 @@ irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
 >   ```powershell
 >   $env:QUOTAX_MIRROR='https://ghfast.top'; irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
 >   ```
-> - **升级**：重新跑一次同样的命令即可，`config.json` / `usage.db` / `history/` 等个人数据会自动保留。
+> - **升级**：重新跑一次同样的命令即可，`config.json` / `monitor-state.json` / `usage.db` / `history/` 等个人数据会自动保留。
 
 ### 后续打开
 
@@ -151,14 +151,16 @@ OAuth 实现参考 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)�
 | 数据源 | 路径 | 格式 | 说明 |
 | --- | --- | --- | --- |
 | Claude Code | `~/.claude/projects/*/*.jsonl` | JSONL | `type=assistant` 行的 `message.usage`，按 `message.id` 去重 |
-| Codex | `~/.codex/sessions/**/*.jsonl` + `archived_sessions/*.jsonl` | JSONL | `token_count` 事件；token 是累计值需算 delta；input 含 cache 需归一化 |
+| Codex | `~/.codex/sessions/**/*.jsonl` + `archived_sessions/*.jsonl` | JSONL | `token_count` 事件的 `last_token_usage` 是本轮增量；input 含 cache 需归一化 |
 | Gemini CLI | `~/.gemini/tmp/<hash>/chats/session-*.json` | 单 JSON | `role=model` 消息；input 含 cache；output 含 thoughts |
 | Grok CLI | `~/.grok/sessions/<cwd>/<uuid>/updates.jsonl` | JSONL (JSON-RPC) | `turn_completed` 事件的 `usage`；input 含 cache |
 | OpenCode | `~/.local/share/opencode/opencode.db` | SQLite | 新版读 session 聚合列，老版解析 message.data JSON |
 
 **cache-inclusive 归一化**：Codex / Gemini / Grok 的 input 字段都包含缓存命中的部分，解析时会统一减去 `cache_read` 得到"新鲜输入"，与 Claude Code 的口径对齐。
 
-**增量采集**：JSONL 源记录每个文件的 `(mtime, line_offset)` 游标，只读游标之后的新行；遇到被并发写入的截断行时保留旧游标，下次重读。SQLite 源（opencode）记录水位线。重复采集幂等（`INSERT OR IGNORE` 按主键去重），不会产生重复记录。
+**增量采集**：JSONL 源记录每个文件的 `(mtime, line_offset)` 游标，只读游标之后的新行；Codex 还保存增量起点的模型上下文。遇到被并发写入的截断行时保留旧游标，下次重读。SQLite 源（OpenCode）优先按 rowid 增量，新版可变 session 聚合会重读最后一行并更新已有记录；旧游标会先迁移到 rowid 语义。重复采集幂等（按主键去重或更新聚合记录），不会产生重复记录。
+
+用量看板的总览、趋势、模型分布、请求日志和模型筛选统一按 **UTC 自然日** 计算；选择 14 天时包含今天及之前 13 个自然日，避免不同区块因滚动 24 小时窗口产生口径差异。
 
 ### 前端看板
 
@@ -199,14 +201,20 @@ OAuth 实现参考 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)�
 
 ![设置弹窗](docs/settings-modal.png)
 
-在设置弹窗里为每个渠道设置「剩余百分比阈值」。低于阈值时：卡片边框标橙、状态点变红；顶栏汇总栏出现「低额度」计数。阈值只存在浏览器本地，不影响后端查询。
+在设置弹窗里为每个渠道设置「剩余百分比阈值」。阈值会同步写入本机 `config.json`，旧版本浏览器 `localStorage` 中的阈值会自动迁移一次。低于阈值时：卡片边框标橙、状态点变红；顶栏汇总栏出现「低额度」计数。
+
+「后台持续监控」默认关闭。显式开启后，QuotaX 服务会按设定间隔复用现有缓存/请求合并机制检查额度，即使浏览器已关闭也能工作。可启用系统桌面通知、填写可选 Webhook，并设置重复告警冷却时间；额度恢复到阈值以上时也会发送恢复事件。告警活动状态和冷却水位保存在 `monitor-state.json`，服务重启后不会立刻重复轰炸。
+
+Webhook 接收 `{"source":"QuotaX","version":1,"event":{...}}` JSON；`event.type` 为 `alert` 或 `recovered`。Webhook 地址可能包含签名，因此脱敏导出会自动清空它。
+
+同一设置页还可配置本地用量历史保留天数。QuotaX 每天最多清理一次过期 `usage.db` 记录和已不存在日志文件的扫描游标。
 
 ## 配置导入 / 导出
 
 配置弹窗底部：
 
-- **导出配置（含密钥）**：导出完整的 `config.json`（含明文 API Key），用于个人备份 / 换机迁移。请妥善保管。
-- **导出（脱敏）**：导出不含密钥的渠道结构（类型 / 名称 / base_url 等），可安全分享给他人参考你的渠道配置。
+- **导出配置（含密钥）**：导出完整配置（含明文 API Key 与 Webhook URL），用于个人备份 / 换机迁移。请妥善保管。
+- **导出（脱敏）**：导出不含密钥和 Webhook URL 的渠道/监控结构，可安全分享给他人参考配置。
 - **导入配置**：导入时会弹窗选择**合并**（追加到现有配置，同 id 覆盖，更安全推荐）或**替换**（清空现有全部渠道后替换）。
 
 ## 不抢登录的设计
@@ -230,12 +238,22 @@ uv run quotaboard cost --days 7          # 本地已用 token 统计
 
 ## 缓存
 
-为避免频繁打扰上游接口，每个渠道的查询结果在进程内有独立缓存：**成功缓存 60 秒，失败缓存 15 秒**。同一渠道在缓存有效期内的并发查询会合并成一次上游请求（请求去重 / in-flight 复用）。点顶栏「刷新」按钮可强制绕过缓存立即真查。
+为避免频繁打扰上游接口，每个渠道的查询结果在进程内有独立缓存：**成功缓存 5 分钟，失败缓存 15 分钟**。较长的失败冷却时间主要用于避免 429/临时网络错误被自动刷新反复放大；同一渠道的并发查询会合并成一次上游请求（请求去重 / in-flight 复用）。点顶栏「刷新」按钮可强制绕过缓存立即真查。
+
+每张卡片会明确显示「实时 / 缓存 / 数据陈旧 / 缓存快照」及数据年龄；这比只在整页顶部显示一次“命中缓存”更准确，混合命中时也能看出每个渠道的数据来源。
+
+## 运行诊断
+
+- `GET /api/health`：版本、配置状态、SQLite 大小/记录数、最近采集和后台监控状态；
+- `GET /api/monitor/status`：后台调度、上/下次检查、活动告警和最近错误；
+- `POST /api/monitor/run`：立即执行一轮（默认强制刷新）；
+- `GET /api/usage/status` / `POST /api/usage/cleanup`：本地用量采集与保留清理诊断。
 
 ## 安全说明
 
 - 服务**只监听 `127.0.0.1`**，不对外暴露。
-- 所有凭据（API Key / AK·SK / Cookie）只存在本地 `config.json`（权限 `600`），不发送到任何第三方。
+- API Key / AK·SK / Cookie 仅保存在本地 `config.json`（权限 `600`）；上传或 OAuth 生成的 Codex `auth.json` 保存在同目录 `credentials/`（目录 `700`、文件 `600`）。查询时凭据只发送给用户配置的对应服务商，不经过 QuotaX 自有服务器。
+- 后台监控默认关闭；只有用户显式启用的桌面通知或 Webhook 才会接收告警。Webhook URL 在脱敏导出中会被删除。
 - 订阅渠道只读本机 CLI 凭据，不刷新不写入。
 - 默认不跟随重定向（`follow_redirects: false`），防止恶意 base_url 3xx 跳转泄露 Authorization 头。
 - DNS rebinding 防护：校验请求 Host 头白名单，防止恶意网页跨域读取本机接口。
@@ -246,7 +264,7 @@ uv run quotaboard cost --days 7          # 本地已用 token 统计
 git clone https://github.com/RunhuaHuang/quotax.git
 cd quotax
 uv sync                      # 安装依赖（复用本机 Python 3.11+）
-uv run pytest                # 跑测试（249 用例）
+uv run pytest                # 跑全部后端测试
 uv run uvicorn app.main:app --port 8900   # 启动开发服务
 ```
 

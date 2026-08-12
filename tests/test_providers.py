@@ -9,7 +9,7 @@ import asyncio
 
 from app.config import Channel
 from app.models import window as make_window
-from app.providers import coding_plans, volcengine
+from app.providers import coding_plans, mimo, volcengine
 from app.providers._common import _require
 from app.providers.subscriptions import (
     _classify_gemini_model,
@@ -28,6 +28,40 @@ def _base():
         "name": "GLM",
         "category": "coding_plan",
     }
+
+
+def test_deepseek_rejects_non_object_response_without_attribute_error(monkeypatch):
+    from app.config import Channel
+    from app.providers import balances
+
+    async def fake_request_json(*args, **kwargs):
+        return ["unexpected", "payload"]
+
+    monkeypatch.setattr(balances, "request_json", fake_request_json)
+    result = asyncio.run(
+        balances.query_deepseek(Channel(id="deepseek-1", type="deepseek", name="DeepSeek", api_key="sk-test"))
+    )
+    assert result.status == "error"
+    assert "余额" in result.message
+
+
+def test_kimi_coding_skips_malformed_window_detail(monkeypatch):
+    from app.providers import coding_plans
+
+    async def fake_request_json(*args, **kwargs):
+        return {
+            "usage": {"remaining": 80, "used": 20},
+            "limits": [{"detail": {"remaining": 50, "used": 50, "limit": 100, "window": []}}],
+        }
+
+    monkeypatch.setattr(coding_plans, "request_json", fake_request_json)
+    result = asyncio.run(
+        coding_plans.query_kimi_coding(
+            Channel(id="kimi-1", type="kimi_coding", name="Kimi", api_key="sk-test")
+        )
+    )
+    assert result.status == "ok"
+    assert len(result.windows) == 2
 
 
 def test_parse_zhipu_data_success_with_five_hour_and_weekly():
@@ -85,6 +119,14 @@ def test_parse_zhipu_data_no_limits_is_error():
     data = {"success": True, "code": 200, "data": {"limits": []}}
     result = coding_plans._parse_zhipu_data(data, "GLM Coding Plan", _base())
     assert result.status == "error"
+
+
+def test_parse_zhipu_data_rejects_malformed_nested_payload():
+    result = coding_plans._parse_zhipu_data(
+        {"success": True, "code": 200, "data": []}, "GLM Coding Plan", _base()
+    )
+    assert result.status == "error"
+    assert "data" in result.message
 
 
 # ── 火山 _parse_afp_tiers / _parse_coding_plan_tiers ────────────
@@ -275,6 +317,35 @@ def test_query_volcengine_one_plan_error_keeps_other(monkeypatch):
     assert "NotSubscribed" in result.message
 
 
+def test_query_volcengine_one_plan_network_error_keeps_other(monkeypatch):
+    """一个 plan 的底层网络请求失败（DNS/连接超时等 httpx 异常）时不能让异常逃逸、
+    导致整张卡 error——另一个正常的 plan 数据必须保留。回归窄 except
+    (ResponseError, ParseError) 漏掉 httpx.ConnectError/ReadTimeout 的缺陷：这类
+    异常会逃逸出 query_volcengine 被 query_channel 顶层兜底成整张卡 error。"""
+    import asyncio
+
+    import httpx
+
+    from app.config import Channel
+    from app.providers import volcengine
+
+    async def fake_openapi(region, ak, sk, action):
+        if action == "GetCodingPlanUsage":
+            # 模拟 request_text → client.stream 抛出的底层网络异常（不是 ResponseError）
+            raise httpx.ConnectError("连接被拒绝")
+        return _AFP_RESP  # Agent Plan 正常
+
+    monkeypatch.setattr(volcengine, "_openapi_call", fake_openapi)
+    channel = Channel(id="ch_v", type="volcengine", name="火山", ak="ak-1", sk="sk-1")
+    result = asyncio.run(volcengine.query_volcengine(channel))
+    # Agent Plan 数据必须保留，不能因 Coding Plan 网络错误就整张卡 error
+    assert result.status == "ok"
+    assert any(w.label.startswith("Agent ") for w in result.windows)
+    # Coding Plan 的网络错误应翻译成中文 soft error 附在 message 上
+    assert "Coding Plan" in result.message
+    assert "网络" in result.message
+
+
 def test_query_volcengine_neither_plan(monkeypatch):
     result = _run_volcengine(
         monkeypatch,
@@ -445,6 +516,25 @@ def test_query_mimo_missing_cookie_is_reported_clearly(monkeypatch):
     result = asyncio.run(mimo.query_mimo(Channel(id="ch_m", type="mimo", name="MiMo")))
     assert result.status == "error"
     assert "Cookie" in result.message
+
+
+def test_query_mimo_non_object_usage_response_is_error(monkeypatch):
+    async def fake_request_json(method, url, *, headers=None, json_body=None):
+        return ["unexpected"]
+
+    monkeypatch.setattr(mimo, "request_json", fake_request_json)
+    result = asyncio.run(mimo.query_mimo(Channel(id="ch_m", type="mimo", name="MiMo", api_key="session=abc")))
+    assert result.status == "error"
+    assert "格式" in result.message
+
+
+def test_query_volcengine_non_object_response_is_error(monkeypatch):
+    result = _run_volcengine(
+        monkeypatch,
+        {"GetAFPUsage": ["unexpected"], "GetCodingPlanUsage": ["unexpected"]},
+    )
+    assert result.status == "error"
+    assert "响应" in result.message
 
 
 # ── MiniMax query_minimax ────────────────────────────────────
@@ -960,3 +1050,61 @@ def test_claude_utilization_partial(monkeypatch):
     assert by_label["每 5 小时"].remaining_percent == 65.0
     assert by_label["每周额度"].used_percent == 67.5
     assert by_label["每周额度"].remaining_percent == 32.5
+
+
+# ── Provider 统一返回契约 ───────────────────────────────────────
+
+
+def test_all_registered_providers_return_valid_channel_result_without_network(monkeypatch):
+    """每个已注册 provider 在无凭据场景下都必须返回统一 ChannelResult，不得抛异常。
+
+    订阅凭据读取和全部网络函数都显式替换，测试完全离线，也不会读取用户真实登录态。
+    """
+    from app import config as config_store
+    from app.credentials import CRED_NOT_FOUND, Credential
+    from app.models import ChannelResult
+    from app.providers import REGISTRY, balances, coding_plans, mimo, opencode, query_channel, subscriptions, volcengine
+
+    assert set(REGISTRY) == set(config_store.PROVIDERS)
+
+    missing = lambda *_args, **_kwargs: Credential("", CRED_NOT_FOUND, "test", "测试中未提供凭据")
+    for name in (
+        "read_claude_credentials",
+        "read_gemini_credentials",
+        "read_grok_credentials",
+        "read_codex_credentials",
+        "read_codex_credentials_from_file",
+        "read_copilot_credentials",
+    ):
+        monkeypatch.setattr(subscriptions, name, missing)
+
+    async def network_forbidden(*_args, **_kwargs):
+        raise AssertionError("无凭据契约测试不应发起网络请求")
+
+    for module, name in (
+        (balances, "request_json"),
+        (coding_plans, "request_json"),
+        (mimo, "request_json"),
+        (opencode, "request_text"),
+        (subscriptions, "request_json"),
+        (volcengine, "request_text"),
+    ):
+        monkeypatch.setattr(module, name, network_forbidden)
+
+    allowed_statuses = {"ok", "info", "expired", "not_found", "error", "disabled"}
+    for provider_type, provider_meta in config_store.PROVIDERS.items():
+        channel = Channel(id=f"contract_{provider_type}", type=provider_type, name=provider_meta["label"])
+        result = asyncio.run(query_channel(channel))
+        assert isinstance(result, ChannelResult), provider_type
+        assert result.id == channel.id
+        assert result.type == provider_type
+        assert result.name == channel.name
+        assert result.category == provider_meta["category"]
+        assert result.status in allowed_statuses
+        assert isinstance(result.updated_at, int) and result.updated_at > 1_000_000_000_000
+        for quota_window in result.windows:
+            for percentage in (quota_window.used_percent, quota_window.remaining_percent):
+                assert percentage is None or 0 <= percentage <= 100
+            assert quota_window.reset_at is None or quota_window.reset_at > 1_000_000_000_000
+        if result.status == "ok":
+            assert result.amount or result.windows or result.message

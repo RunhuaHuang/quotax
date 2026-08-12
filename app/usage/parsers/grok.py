@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
 from pathlib import Path
 
+from ...models import to_ts
 from .. import store
 from . import BaseParser, CollectResult, NormalizedRecord
 
@@ -33,10 +33,13 @@ GROK_ARCHIVED_DIR = Path.home() / ".grok" / "archived_sessions"
 
 
 def _safe_int(v, default=0) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
+    if isinstance(v, bool):
         return default
+    try:
+        converted = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0, converted)
 
 
 def _parse_ts(value) -> int | None:
@@ -46,15 +49,7 @@ def _parse_ts(value) -> int | None:
     Python 认作 UTC），再取 timestamp。naive 的 strptime 分支按本地时区算会偏移，
     这里不再用。
     """
-    if isinstance(value, (int, float)):
-        v = int(value)
-        return v if v > 1_000_000_000_000 else v * 1000
-    if isinstance(value, str):
-        try:
-            return int(datetime.fromisoformat(value).timestamp() * 1000)
-        except ValueError:
-            return None
-    return None
+    return to_ts(value)
 
 
 class GrokParser(BaseParser):
@@ -90,9 +85,19 @@ class GrokParser(BaseParser):
         stat = file_path.stat()
         mtime_ns = stat.st_mtime_ns
         cursor = store.get_cursor(self.source, str(file_path))
-        if cursor and cursor.get("last_modified_ns") == mtime_ns:
-            return
         offset = cursor.get("last_line_offset", 0) if cursor else 0
+        rewound = offset < 0 or offset > stat.st_size
+        if rewound:
+            offset = 0
+        # mtime 精度较粗时，追加内容可能暂时保持同一 mtime；文件大小变化仍应
+        # 触发增量扫描，不能只看 mtime。
+        if (
+            cursor
+            and cursor.get("last_modified_ns") == mtime_ns
+            and not rewound
+            and stat.st_size == offset
+        ):
+            return
 
         # 先从 summary.json 取当前模型名（若存在）
         model = self._read_model(file_path.parent)
@@ -102,7 +107,11 @@ class GrokParser(BaseParser):
         with file_path.open("r", encoding="utf-8", errors="replace") as f:
             if offset > 0:
                 f.seek(offset)
-            for raw_line in f:
+            while True:
+                line_offset = f.tell()
+                raw_line = f.readline()
+                if not raw_line:
+                    break
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -133,7 +142,11 @@ class GrokParser(BaseParser):
                 output = _safe_int(usage.get("outputTokens"))
                 fresh_input = max(0, input_total - cached)
 
-                uuid = f"{session_id}:{prompt_id}" if prompt_id else f"{session_id}:{ts_ms}"
+                uuid = (
+                    f"{session_id}:{prompt_id}"
+                    if prompt_id
+                    else f"{session_id}:{ts_ms}:{line_offset}"
+                )
                 records.append(
                     NormalizedRecord(
                         uuid=uuid,

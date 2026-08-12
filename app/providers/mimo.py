@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from ..config import Channel
-from ..models import ChannelResult, fail, ok, to_ts, window
+from ..models import ChannelResult, fail, finite_float, ok, to_ts, window
 from ..net import ParseError, ResponseError, request_json
 from ._common import _require
 
@@ -81,7 +81,9 @@ async def query_mimo(channel: Channel) -> ChannelResult:
         data = await request_json("GET", f"{BASE_URL}/tokenPlan/usage", headers=headers)
     except Exception as e:
         return _error_result(base, e)
-    if not isinstance(data, dict) or data.get("code") not in (None, 0):
+    if not isinstance(data, dict):
+        return fail("error", "MiMo 用量响应格式错误", **base)
+    if data.get("code") not in (None, 0):
         return fail("error", str(data.get("message") or "MiMo 用量查询失败"), **base)
 
     windows: list = []
@@ -91,8 +93,9 @@ async def query_mimo(channel: Channel) -> ChannelResult:
         if not isinstance(group, dict):
             continue
         percent = group.get("percent")
-        if isinstance(percent, (int, float)):
-            used_pct = max(0.0, min(100.0, float(percent)))
+        used_pct = finite_float(percent, None)
+        if used_pct is not None:
+            used_pct = max(0.0, min(100.0, used_pct))
             windows.append(
                 window(
                     "monthly" if key == "monthUsage" else "custom",
@@ -111,13 +114,18 @@ async def query_mimo(channel: Channel) -> ChannelResult:
             used = item.get("used")
             limit = item.get("limit")
             item_pct = item.get("percent")
-            if item_pct is None and isinstance(used, (int, float)) and isinstance(limit, (int, float)) and limit > 0:
-                item_pct = float(used) / float(limit) * 100
+            used_value = finite_float(used, None)
+            limit_value = finite_float(limit, None)
+            if item_pct is None and used_value is not None and limit_value and limit_value > 0:
+                item_pct = used_value / limit_value * 100
             if item_pct is None:
                 continue
-            item_pct = max(0.0, min(100.0, float(item_pct)))
-            used_label = f"{float(used):,.0f}" if isinstance(used, (int, float)) else None
-            max_label = f"{float(limit):,.0f}" if isinstance(limit, (int, float)) else None
+            item_pct = finite_float(item_pct, None)
+            if item_pct is None:
+                continue
+            item_pct = max(0.0, min(100.0, item_pct))
+            used_label = f"{used_value:,.0f}" if used_value is not None else None
+            max_label = f"{limit_value:,.0f}" if limit_value is not None else None
             windows.append(
                 window(
                     "custom",

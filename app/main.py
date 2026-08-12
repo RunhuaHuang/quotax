@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Literal
 
@@ -21,7 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 from . import config as config_store
 from . import credentials as credentials_store
 from . import history as history_store
-from . import local_usage
+from . import local_usage, monitoring
 from . import oauth as oauth_store
 from .credentials import CRED_NO_TOKEN, CRED_OK
 from .models import ChannelResult, fail
@@ -31,14 +34,19 @@ from .usage import collect as usage_collect
 from .usage import pricing as usage_pricing
 from .usage import store as usage_store
 
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+# 源码仓库直接读取顶层 static/；构建 wheel 时 setuptools 把同一目录映射为
+# quotax_static/ 包。双路径探测让“git clone 后运行”和“标准 wheel 安装”都可用。
+_SOURCE_STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+_PACKAGED_STATIC_DIR = Path(__file__).resolve().parent.parent / "quotax_static"
+STATIC_DIR = _SOURCE_STATIC_DIR if _SOURCE_STATIC_DIR.is_dir() else _PACKAGED_STATIC_DIR
+logger = logging.getLogger(__name__)
 
 # 火山渠道在后端 /api/quotas 里被拆成 <id>_agent / <id>_coding 两张卡展示（前端
 # 拿到的 channel id 带后缀），但 config / 缓存 / 历史都按原始 id（不带后缀）存取。
 # 前端"刷新此渠道"/"停用"按钮发的 ids 会带后缀，必须归一化回 config id 才能匹配
 # 到渠道。create_or_update_channel / get_channel_secret / history 四处都复用
 # 下面同一个 _canonical_channel_id，逻辑必须完全一致，不能有的端点归一有的不归一。
-_VOLC_PLAN_SUFFIXES = ("_agent", "_coding")
+_VOLC_PLAN_SUFFIXES = config_store.VOLC_PLAN_SUFFIXES
 
 
 def _canonical_channel_id(channel_id: str) -> str:
@@ -65,15 +73,7 @@ def _canonical_channel_id(channel_id: str) -> str:
     3. 两步都找不到，原样返回原始 id——大概率是一个确实不存在的 id，交给调用方
        走各自"渠道不存在"的正常错误路径（404 / 静默忽略等），不在这里瞎猜。
     """
-    if config_store.get_channel(channel_id) is not None:
-        return channel_id
-    for suffix in _VOLC_PLAN_SUFFIXES:
-        if channel_id.endswith(suffix):
-            base_id = channel_id[: -len(suffix)]
-            base_channel = config_store.get_channel(base_id)
-            if base_channel is not None and base_channel.type == "volcengine":
-                return base_id
-    return channel_id
+    return config_store.canonical_channel_id(channel_id)
 
 
 # 结果缓存：按渠道 id 分别缓存，成功 5 分钟 / 失败 15 分钟。
@@ -84,6 +84,7 @@ def _canonical_channel_id(channel_id: str) -> str:
 # 绕过缓存）即可。
 QUOTA_CACHE_TTL_MS = 300_000
 QUOTA_ERROR_CACHE_TTL_MS = 900_000
+DATA_STALE_AFTER_MS = 600_000
 _cache: dict[str, tuple[float, dict]] = {}
 # 在飞的查询 task，按渠道 id 登记。值是 (task, 发起时的配置代际)——复用一个仍在
 # 运行的 task 前必须比对代际：若期间发生过 import_config / 编辑渠道（_generation
@@ -102,7 +103,7 @@ _cache_lock = asyncio.Lock()
 # 专门针对 import_config 的一个微妙竞态：导入覆盖某渠道密钥的瞬间，该渠道恰好有
 # 一次 in-flight 查询。编辑渠道走 _invalidate_cache 会摘掉已完成的 task，但仍在
 # 运行的 task 被 asyncio.shield 保护、无法摘除（摘了会孤立正在等它的其它调用者）。
-# 这条用旧密钥发起的 task 跑完后原本会把旧密钥结果写回 _cache，TTL 60s 内展示
+# 这条用旧密钥发起的 task 跑完后原本会把旧密钥结果写回 _cache，TTL 5 分钟内展示
 # 旧额度。代际校验让它在写缓存时发现自己已经"过时"，优雅地丢弃结果——既不取消
 # 正在运行的 task（不影响其它 awaiter），也不会用旧结果污染缓存。
 #
@@ -118,6 +119,11 @@ _generation = 0
 # 未完成的任务也会被取消。这里集中持有，add_done_callback 完成后自动移除。
 _bg_tasks: set[asyncio.Task] = set()
 
+try:
+    APP_VERSION = version("quota-board")
+except PackageNotFoundError:
+    APP_VERSION = "0.1.0"
+
 
 def _spawn_background(coro) -> None:
     """提交一个后台任务并持有强引用，防止被 GC；完成后自动从集合移除。"""
@@ -126,27 +132,72 @@ def _spawn_background(coro) -> None:
     task.add_done_callback(_bg_tasks.discard)
 
 
+async def _cancel_inflight_queries() -> None:
+    """应用退出时终止被 shield 保护的共享上游查询，避免关闭 HTTP 客户端后仍运行。"""
+    async with _cache_lock:
+        tasks = list({entry[0] for entry in _inflight.values() if not entry[0].done()})
+        _inflight.clear()
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # 启动时自动探测本机已登录的订阅 CLI（Claude / Gemini / Grok / Codex /
     # Copilot），为尚未配置的类型自动创建渠道——订阅渠道不需要填密钥，用户不该
-    # 为了「看到已登录的 CLI」还要手动到配置弹窗里逐个添加。探测在后台线程跑，
-    # 不阻塞服务启动；探测失败（如 Keychain 不可用）静默忽略。
+    # 为了「看到已登录的 CLI」还要手动到配置弹窗里逐个添加。探测在线程里跑，
+    # 避免阻塞事件循环；这里仍等待它完成再开放服务，保证首屏第一次查询就能看到
+    # 自动发现的渠道。单个凭据源的失败已在探测函数内部隔离，外层异常写日志。
     try:
         await asyncio.to_thread(_auto_detect_subscription_channels)
     except Exception:
-        pass
+        logger.exception("启动时自动探测订阅渠道失败")
+
     # 启动时自动采集一次用量统计——读取本机各 CLI（Claude Code / Codex /
     # Gemini / Grok / OpenCode）的日志文件，增量入库。这样全新安装后第一次
     # 打开「用量统计」Tab 就能看到数据，不用用户手动点「采集」。采集是幂等的
-    # （INSERT OR IGNORE 去重），单个 parser 异常不影响其它源。后台线程跑，
-    # 不阻塞服务启动。
+    # （INSERT OR IGNORE 去重），单个 parser 异常不影响其它源。扫描大量历史日志
+    # 可能耗时数秒，因此作为受跟踪的后台任务启动，不把 WebUI 可用时间绑在扫描
+    # 完成时间上；用量页本身在空库时也会补触发一次采集，而 collect_all 有串行锁，
+    # 多次触发不会并发争用游标。
+    async def _collect_usage_on_startup() -> None:
+        try:
+            await asyncio.to_thread(usage_collect.collect_all)
+        except Exception:
+            logger.exception("启动时自动采集用量统计失败")
+        try:
+            retention_days = config_store.get_settings()["monitor"]["retention_days"]
+            await asyncio.to_thread(usage_store.cleanup_old_records, retention_days)
+        except Exception:
+            logger.exception("启动时清理过期用量记录失败")
+
+    async def _usage_maintenance_loop() -> None:
+        # 首次清理由上面的启动采集任务负责；之后每 6 小时检查一次，存储层自身保证
+        # 24 小时内最多真正执行一次，长期运行也不会让历史库无限增长。
+        while True:
+            await asyncio.sleep(21_600)
+            try:
+                retention_days = config_store.get_settings()["monitor"]["retention_days"]
+                await asyncio.to_thread(usage_store.cleanup_old_records, retention_days)
+            except Exception:
+                logger.exception("定期清理过期用量记录失败")
+
+    _spawn_background(_collect_usage_on_startup())
+    _spawn_background(_usage_maintenance_loop())
+    await monitor_service.start()
     try:
-        await asyncio.to_thread(usage_collect.collect_all)
-    except Exception:
-        pass
-    yield
-    await aclose()
+        yield
+    finally:
+        await monitor_service.stop()
+        await _cancel_inflight_queries()
+        pending = [task for task in _bg_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await aclose()
 
 
 app = FastAPI(title="QuotaX", lifespan=lifespan)
@@ -278,9 +329,80 @@ class ChannelPayload(BaseModel):
         return v
 
 
+class MonitorSettingsPayload(BaseModel):
+    enabled: bool | None = None
+    interval_seconds: int | None = None
+    desktop_notifications: bool | None = None
+    webhook_url: str | None = None
+    cooldown_seconds: int | None = None
+    retention_days: int | None = None
+    thresholds: dict[str, float] | None = None
+
+
+class SettingsPayload(BaseModel):
+    monitor: MonitorSettingsPayload | None = None
+
+
 @app.get("/api/health")
 async def health():
-    return {"ok": True}
+    try:
+        channel_count = len(await asyncio.to_thread(config_store.list_channels))
+        config_health = {
+            "ok": True,
+            "exists": config_store.CONFIG_PATH.exists(),
+            "configured_channels": channel_count,
+        }
+    except Exception as e:
+        config_health = {"ok": False, "error": str(e)}
+    try:
+        database_health = await asyncio.to_thread(usage_store.get_database_status)
+    except Exception as e:
+        database_health = {"ok": False, "error": str(e)}
+    try:
+        monitor_health = await monitor_service.status()
+    except Exception as e:
+        monitor_health = {"enabled": False, "running": False, "last_error": str(e)}
+    return {
+        "ok": bool(config_health["ok"] and database_health["ok"]),
+        "version": APP_VERSION,
+        "config": config_health,
+        "database": database_health,
+        "usage_collection": usage_collect.get_status(),
+        "monitor": monitor_health,
+    }
+
+
+@app.get("/api/settings")
+async def get_settings():
+    """读取后端持久化设置。Webhook URL 可能含签名，禁止浏览器缓存响应。"""
+    data = await asyncio.to_thread(config_store.get_settings)
+    return JSONResponse(content=data, headers={"Cache-Control": "no-store"})
+
+
+@app.put("/api/settings")
+async def put_settings(payload: SettingsPayload):
+    patch = payload.model_dump(exclude_unset=True)
+    try:
+        data = await asyncio.to_thread(config_store.update_settings, patch)
+    except config_store.SettingsValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    monitor_service.reconfigure()
+    return JSONResponse(content=data, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/monitor/status")
+async def monitor_status():
+    return await monitor_service.status()
+
+
+@app.post("/api/monitor/run")
+async def monitor_run(force: bool = True):
+    """手动立即检查；即使后台总开关关闭也可运行，默认绕过额度缓存。"""
+    try:
+        result = await monitor_service.run_once(force=force, reason="manual")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"监控检查失败: {friendly_error(e)}") from e
+    return {"result": result, "status": await monitor_service.status()}
 
 
 @app.get("/api/providers")
@@ -398,7 +520,7 @@ async def create_or_update_channel(payload: ChannelPayload):
         # 空值"）。比如前端启用/停用开关只发 {"id","type","enabled"}，name/
         # base_url 等字段不该被这次更新清空——见 config_store.upsert_channel。
         channel = config_store.upsert_channel(data, provided_fields=payload.model_fields_set)
-    except ValueError as e:
+    except (TypeError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     await _invalidate_cache(channel.id)
     return channel.to_dict(secret=False)
@@ -406,12 +528,28 @@ async def create_or_update_channel(payload: ChannelPayload):
 
 @app.delete("/api/channels/{channel_id}")
 async def remove_channel(channel_id: str):
+    # 前端展示的火山 Agent/Coding 子卡带有后缀；删除入口虽然当前配置列表传的是
+    # 原始 ID，但 API 也应与编辑、停用、密钥读取和历史查询保持一致。普通渠道若
+    # 真实 ID 恰好以 _agent/_coding 结尾，canonical_channel_id 会优先保留原 ID。
+    channel_id = _canonical_channel_id(channel_id)
     # 删除渠道前先拿到它关联的上传凭据文件，渠道删掉后就查不到了
     channel = config_store.get_channel(channel_id)
     if not config_store.delete_channel(channel_id):
         raise HTTPException(status_code=404, detail="渠道不存在")
     await _invalidate_cache(channel_id)
     history_store.delete_channel_history(channel_id)
+    try:
+        settings = config_store.get_settings()
+        thresholds = dict(settings["monitor"].get("thresholds") or {})
+        if channel_id in thresholds:
+            thresholds.pop(channel_id, None)
+            config_store.update_settings({"monitor": {"thresholds": thresholds}})
+    except Exception:
+        logger.exception("删除渠道后清理监控阈值失败")
+    try:
+        await monitor_service.clear_channel(channel_id)
+    except Exception:
+        logger.exception("删除渠道后清理监控告警状态失败")
     if channel and (channel.extra or {}).get("codex_auth_file"):
         # 清理上传的 Codex 凭据文件（私有文件，渠道删除后没有保留的必要）。
         # codex_auth_file 经 resolve_codex_auth_file 校验——extra 是用户可自由设置
@@ -439,7 +577,10 @@ async def get_channel_secret(channel_id: str):
         v = getattr(channel, k, None)
         if v:
             secret[k] = v
-    return {"id": base_id, "secret": secret}
+    return JSONResponse(
+        content={"id": base_id, "secret": secret},
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 # ── Codex auth.json 上传（多账号） ──────────────────────────────
@@ -477,14 +618,12 @@ async def upload_codex_credentials(channel_id: str, payload: CodexCredentialPayl
     if cred.status != CRED_OK:
         raise HTTPException(status_code=400, detail=f"凭据文件无效: {cred.message or cred.status}")
 
-    cred_dir = config_store.CONFIG_PATH.parent / "credentials"
-    cred_dir.mkdir(parents=True, exist_ok=True)
-    rel_path = f"credentials/codex_{channel_id}.json"
-    path = cred_dir / f"codex_{channel_id}.json"
-    fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
+        path, rel_path = config_store.codex_credentials_path(channel.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    try:
+        _write_private_text_atomic(path, content)
     except BaseException:
         try:
             os.unlink(str(path))
@@ -499,7 +638,11 @@ async def upload_codex_credentials(channel_id: str, payload: CodexCredentialPayl
             {"id": channel.id, "type": channel.type, "extra": extra},
             provided_fields={"id", "type", "extra"},
         )
-    except ValueError as e:
+    except (TypeError, ValueError) as e:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise HTTPException(status_code=400, detail=str(e)) from e
     await _invalidate_cache(channel_id)
     return {"ok": True, "source": str(path), "account_id": cred.extra.get("account_id")}
@@ -513,7 +656,51 @@ async def upload_codex_credentials(channel_id: str, payload: CodexCredentialPayl
 # Codex CLI / cliproxyapi 的做法一致）。服务器在 OAuth 完成（或超时）后关闭。
 
 # OAuth 回调结果暂存：1455 回调服务器写入、/api/auth/codex/poll 读出（按 state）。
+# 结果不是长期状态：轮询取出后立即删除，超时结果也必须自动淘汰。否则本机上
+# 反复触发回调（尤其是恶意/异常 state）会让这个 dict 无界增长。
 _OAUTH_RESULTS: dict[str, dict] = {}
+_OAUTH_RESULT_CREATED: dict[str, float] = {}
+_OAUTH_RESULT_TTL = 600
+_OAUTH_RESULT_MAX = 32
+_OAUTH_RESULT_LOCK = threading.Lock()
+
+
+def _purge_oauth_results(now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    cutoff = now - _OAUTH_RESULT_TTL
+    expired = [
+        state
+        for state, created_at in _OAUTH_RESULT_CREATED.items()
+        if created_at < cutoff or state not in _OAUTH_RESULTS
+    ]
+    for state in expired:
+        _OAUTH_RESULT_CREATED.pop(state, None)
+        _OAUTH_RESULTS.pop(state, None)
+
+
+def _store_oauth_result(state: str, result: dict) -> None:
+    """仅保存已通过流程校验的 state，并限制结果缓存容量和生命周期。"""
+    if not state:
+        return
+    now = time.time()
+    with _OAUTH_RESULT_LOCK:
+        _purge_oauth_results(now)
+        _OAUTH_RESULTS[state] = result
+        _OAUTH_RESULT_CREATED[state] = now
+        while len(_OAUTH_RESULTS) > _OAUTH_RESULT_MAX:
+            oldest_state = min(
+                _OAUTH_RESULT_CREATED,
+                key=lambda key: _OAUTH_RESULT_CREATED[key],
+            )
+            _OAUTH_RESULTS.pop(oldest_state, None)
+            _OAUTH_RESULT_CREATED.pop(oldest_state, None)
+
+
+def _take_oauth_result(state: str) -> dict | None:
+    with _OAUTH_RESULT_LOCK:
+        _purge_oauth_results()
+        _OAUTH_RESULT_CREATED.pop(state, None)
+        return _OAUTH_RESULTS.pop(state, None)
 
 
 def _build_oauth_result_html(title: str, message: str) -> str:
@@ -550,6 +737,32 @@ def _esc_html(s: str) -> str:
     )
 
 
+def _write_private_text_atomic(path: Path, content: str) -> None:
+    """以 0600 权限原子写入凭据，避免中断留下半个 auth.json。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 文件本身是 0600，但父目录若沿用默认 0755，其他本机用户仍可枚举文件名。
+    # 这是本地单用户工具的敏感凭据目录，显式收紧到 0700；Windows 上 chmod 由
+    # Python 尽力映射，真正的 ACL 仍交给安装器/系统账户权限管理。
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    tmp_path = path.with_name(f".{path.name}.{os.urandom(8).hex()}.tmp")
+    fd = os.open(str(tmp_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp_path), str(path))
+    except BaseException:
+        try:
+            os.unlink(str(tmp_path))
+        except OSError:
+            pass
+        raise
+
+
 # 活跃的 OAuth 回调服务器引用：同一时刻只允许一个 1455 端口服务器（端口唯一，
 # 第二次 start 时若上一个还在跑会端口冲突）。新流程开始前先关掉旧的。
 _oauth_server_lock = asyncio.Lock()
@@ -564,69 +777,102 @@ async def _process_oauth_callback(code: str | None, state: str | None, error: st
     """
     base_state = state or ""
 
-    if error:
-        _OAUTH_RESULTS[base_state] = {"status": "error", "message": f"OpenAI 授权失败: {error}"}
-        return _build_oauth_result_html("授权失败", f"OpenAI 返回错误: {_esc_html(error)}")
-
-    if not code or not state:
-        _OAUTH_RESULTS[base_state] = {"status": "error", "message": "回调缺少 code 或 state 参数"}
+    # state 缺失或明显超长时直接返回错误，不把攻击者提供的任意字符串写入结果
+    # 缓存。只有已经登记并成功取出 verifier 的流程，才允许产生可轮询结果。
+    if not state or len(state) > 128 or any(ord(ch) < 32 for ch in state):
         return _build_oauth_result_html("授权失败", "回调缺少必要参数")
 
     # 取回 code_verifier（同时校验 state——take_flow 内置 pop，state 不匹配返回 None）
     verifier = oauth_store.take_flow(base_state)
     if verifier is None:
-        _OAUTH_RESULTS[base_state] = {
-            "status": "error",
-            "message": "OAuth 状态已过期或不匹配（state 校验失败），请重新发起授权",
-        }
         return _build_oauth_result_html("授权失败", "授权状态已过期，请回到 QuotaX 重新点击登录")
+
+    if error:
+        error_text = str(error)[:512]
+        _store_oauth_result(base_state, {"status": "error", "message": f"OpenAI 授权失败: {error_text}"})
+        return _build_oauth_result_html("授权失败", f"OpenAI 返回错误: {_esc_html(error_text)}")
+
+    if not code:
+        _store_oauth_result(base_state, {"status": "error", "message": "回调缺少 code 或 state 参数"})
+        return _build_oauth_result_html("授权失败", "回调缺少必要参数")
+    if len(code) > 4096 or any(ord(ch) < 32 for ch in code):
+        _store_oauth_result(base_state, {"status": "error", "message": "OAuth 授权码格式不合法"})
+        return _build_oauth_result_html("授权失败", "OAuth 授权码格式不合法")
+
+    created_channel_id: str | None = None
+    credential_path: Path | None = None
+    association_committed = False
+
+    def _rollback_created_channel() -> None:
+        """OAuth 中途失败时清理已创建的空渠道和凭据文件。
+
+        OAuth 是“先建渠道、再写文件、最后关联 extra”的多步流程；任一步磁盘或
+        配置写入失败，都不能留下一个看似可用、实际永远查不到额度的孤儿渠道。
+        清理本身尽力而为，失败只记日志，不覆盖原始异常。
+        """
+        if credential_path is not None:
+            try:
+                credential_path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("OAuth 失败后清理凭据文件失败")
+        if created_channel_id is not None and not association_committed:
+            try:
+                config_store.delete_channel(created_channel_id)
+            except Exception:
+                logger.exception("OAuth 失败后清理孤儿渠道失败")
 
     try:
         tokens = await oauth_store.exchange_code(code, verifier)
-    except oauth_store.OAuthError as e:
-        _OAUTH_RESULTS[base_state] = {"status": "error", "message": str(e)}
-        return _build_oauth_result_html("授权失败", _esc_html(str(e)))
-
-    # 生成 auth.json 并新建 codex 渠道（复用上传凭据的存储/查询链路）
-    auth_content = oauth_store.tokens_to_auth_json(tokens)
-    name = f"Codex ({tokens.email})" if tokens.email else "Codex (OAuth)"
-    channel = config_store.upsert_channel(
-        {"type": "codex_subscription", "name": name, "enabled": True},
-        provided_fields={"type", "name", "enabled"},
-    )
-    cred_dir = config_store.CONFIG_PATH.parent / "credentials"
-    cred_dir.mkdir(parents=True, exist_ok=True)
-    rel_path = f"credentials/codex_{channel.id}.json"
-    cred_path = cred_dir / f"codex_{channel.id}.json"
-    fd = os.open(str(cred_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(auth_content)
-    except BaseException:
+        # 生成 auth.json 并新建 codex 渠道（复用上传凭据的存储/查询链路）
+        auth_content = oauth_store.tokens_to_auth_json(tokens)
+        name = f"Codex ({tokens.email})" if tokens.email else "Codex (OAuth)"
+        channel = config_store.upsert_channel(
+            {"type": "codex_subscription", "name": name, "enabled": True},
+            provided_fields={"type", "name", "enabled"},
+        )
+        created_channel_id = channel.id
+        credential_path, rel_path = config_store.codex_credentials_path(channel.id)
         try:
-            os.unlink(str(cred_path))
-        except OSError:
-            pass
-        raise
-    extra = dict(channel.extra)
-    extra["codex_auth_file"] = rel_path
-    config_store.upsert_channel(
-        {"id": channel.id, "type": channel.type, "extra": extra},
-        provided_fields={"id", "type", "extra"},
-    )
-    await _invalidate_cache(channel.id)
+            _write_private_text_atomic(credential_path, auth_content)
+        except BaseException:
+            _rollback_created_channel()
+            raise
+        extra = dict(channel.extra)
+        extra["codex_auth_file"] = rel_path
+        try:
+            config_store.upsert_channel(
+                {"id": channel.id, "type": channel.type, "extra": extra},
+                provided_fields={"id", "type", "extra"},
+            )
+        except BaseException:
+            _rollback_created_channel()
+            raise
+        association_committed = True
+        await _invalidate_cache(channel.id)
 
-    _OAUTH_RESULTS[base_state] = {
-        "status": "ok",
-        "channel": channel.to_dict(secret=False),
-        "account_id": tokens.account_id,
-        "email": tokens.email,
-    }
-    account_info = f"（{_esc_html(tokens.email)}）" if tokens.email else ""
-    return _build_oauth_result_html(
-        "授权成功",
-        f"已自动添加 Codex 渠道{account_info}，可以关闭此窗口回到 QuotaX。",
-    )
+        _store_oauth_result(base_state, {
+            "status": "ok",
+            "channel": channel.to_dict(secret=False),
+            "account_id": tokens.account_id,
+            "email": tokens.email,
+        })
+        account_info = f"（{_esc_html(tokens.email)}）" if tokens.email else ""
+        return _build_oauth_result_html(
+            "授权成功",
+            f"已自动添加 Codex 渠道{account_info}，可以关闭此窗口回到 QuotaX。",
+        )
+    except oauth_store.OAuthError as e:
+        _store_oauth_result(base_state, {"status": "error", "message": str(e)})
+        return _build_oauth_result_html("授权失败", _esc_html(str(e)))
+    except Exception:
+        if created_channel_id is not None and not association_committed:
+            _rollback_created_channel()
+        logger.exception("OAuth 回调处理失败")
+        _store_oauth_result(base_state, {
+            "status": "error",
+            "message": "授权处理失败，请检查本地配置和磁盘权限后重试",
+        })
+        return _build_oauth_result_html("授权失败", "授权处理失败，请回到 QuotaX 重试")
 
 
 def _start_callback_server(loop: object) -> None:
@@ -654,7 +900,12 @@ def _start_callback_server(loop: object) -> None:
                 self.send_response(404)
                 self.end_headers()
                 return
-            qs = parse_qs(parsed.query)
+            try:
+                qs = parse_qs(parsed.query, max_num_fields=16)
+            except ValueError:
+                self.send_response(400)
+                self.end_headers()
+                return
             code = qs.get("code", [None])[0]
             state = qs.get("state", [None])[0]
             error = qs.get("error", [None])[0]
@@ -672,7 +923,9 @@ def _start_callback_server(loop: object) -> None:
             self.end_headers()
             self.wfile.write(html.encode("utf-8"))
             # 处理完即停服务器（回调是一次性的），释放 1455 端口给下一次 OAuth
-            _stop_callback_server()
+            # HTTPServer.shutdown() 必须从 serve_forever() 所在线程之外调用；Handler
+            # 正运行在服务线程里，如果直接调用会自锁死，端口也无法正常释放。
+            _schedule_callback_server_stop()
 
     def _run():
         try:
@@ -699,6 +952,13 @@ def _stop_callback_server() -> None:
             httpd.server_close()
         except OSError:
             pass
+
+
+def _schedule_callback_server_stop() -> None:
+    """从独立线程关闭回调服务器，避免 Handler 在线程内自调用 shutdown 死锁。"""
+    import threading
+
+    threading.Thread(target=_stop_callback_server, daemon=True, name="quotax-oauth-stop").start()
 
 
 @app.post("/api/auth/codex/start")
@@ -743,7 +1003,9 @@ async def codex_oauth_poll(state: str):
     1455 回调服务器在 token 交换成功后把结果暂存进 _OAUTH_RESULTS，前端用 state
     轮询这里拿结果（成功则拿到新渠道，失败则拿到错误）。未完成返回 pending。
     """
-    result = _OAUTH_RESULTS.pop(state, None)
+    if not state or len(state) > 128 or any(ord(ch) < 32 for ch in state):
+        raise HTTPException(status_code=400, detail="OAuth state 格式不合法")
+    result = _take_oauth_result(state)
     if result is None:
         return {"status": "pending"}
     return result
@@ -843,7 +1105,7 @@ async def _query_and_cache(channel: config_store.Channel, gen: int) -> dict:
 
 
 async def _get_channel_result(channel: config_store.Channel, force: bool) -> tuple[dict, bool]:
-    """单渠道查询：按 id 分别缓存（成功 60s / 失败 15s），并做请求合并——同一
+    """单渠道查询：按 id 分别缓存（成功 5 分钟 / 失败 15 分钟），并做请求合并——同一
     渠道正在查询时，后来的调用者等待同一个结果，而不是重复发起、并发打上游
     （比如多标签页同时打开时各自触发一次刷新）。
 
@@ -951,6 +1213,23 @@ async def quotas(force: bool = False, ids: str | None = None):
             all_from_cache = False
         else:
             payload, from_cache = item
+            # 不修改 _cache 中共享的 payload：每次响应复制一层后附加本次请求自己的
+            # 命中信息。updated_at 是 provider 实际抓取时间，用它计算数据年龄；即使
+            # 顶层 cached=False（有任一渠道未命中），每张卡仍有自己的精确来源。
+            payload = dict(payload)
+            updated_at = payload.get("updated_at")
+            response_now = int(time.time() * 1000)
+            age_ms = (
+                max(0, response_now - int(updated_at))
+                if isinstance(updated_at, (int, float)) and not isinstance(updated_at, bool)
+                else None
+            )
+            payload["cache"] = {
+                "hit": from_cache,
+                "source": "cache" if from_cache else "live",
+                "age_ms": age_ms,
+                "stale": age_ms is None or age_ms > DATA_STALE_AFTER_MS,
+            }
             by_id[channel.id] = payload
             all_from_cache = all_from_cache and from_cache
 
@@ -971,6 +1250,17 @@ async def quotas(force: bool = False, ids: str | None = None):
         result_channels.extend(split_multi_plan_result(c, res))
 
     return {"cached": bool(enabled) and all_from_cache, "channels": result_channels}
+
+
+async def _monitor_query_results(force: bool) -> list[dict]:
+    """后台监控复用 /api/quotas 的缓存、in-flight 合并和多套餐拆分语义。"""
+    response = await quotas(force=force, ids=None)
+    return response["channels"]
+
+
+# lifespan 和前面的设置端点都在应用真正启动/收到请求时才解析这个全局名字；模块
+# 导入完成前不会调用，因此可以放在 quotas 定义之后，确保查询回调已存在。
+monitor_service = monitoring.MonitorService(_monitor_query_results)
 
 
 # ── 本地已用统计 ─────────────────────────────────────────────
@@ -1007,6 +1297,23 @@ async def usage_collect_endpoint():
     采集在 to_thread 里跑（文件 / SQLite I/O 是同步阻塞）。
     """
     return await asyncio.to_thread(usage_collect.collect_all)
+
+
+@app.get("/api/usage/status")
+async def usage_status_endpoint():
+    """本地日志采集与 SQLite 存储的诊断状态。"""
+    try:
+        database = await asyncio.to_thread(usage_store.get_database_status)
+    except Exception as e:
+        database = {"ok": False, "error": str(e)}
+    return {"collection": usage_collect.get_status(), "database": database}
+
+
+@app.post("/api/usage/cleanup")
+async def usage_cleanup_endpoint(force: bool = True):
+    """按设置中的保留天数清理旧记录；手动调用默认立即执行。"""
+    retention_days = config_store.get_settings()["monitor"]["retention_days"]
+    return await asyncio.to_thread(usage_store.cleanup_old_records, retention_days, force=force)
 
 
 @app.get("/api/usage/overview")
@@ -1087,36 +1394,46 @@ async def usage_pricing_put(payload: dict):
 
     写入后落盘持久化。空字段视为 0（不计费）。
     """
-    model_key = (payload.get("model_key") or "").strip()
-    if not model_key:
-        raise HTTPException(status_code=400, detail="model_key 不能为空")
     book = usage_collect.get_book()
-    book.upsert(
-        model_key,
-        payload.get("input_per_million") or 0,
-        payload.get("output_per_million") or 0,
-        payload.get("cache_read_per_million") or 0,
-        payload.get("cache_creation_per_million") or 0,
-        is_builtin=False,
-    )
+    try:
+        book.upsert(
+            payload.get("model_key"),
+            payload.get("input_per_million"),
+            payload.get("output_per_million"),
+            payload.get("cache_read_per_million"),
+            payload.get("cache_creation_per_million"),
+            is_builtin=False,
+        )
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     await asyncio.to_thread(usage_store.save_pricing, book)
     return {"ok": True, "entries": book.entries()}
 
 
 @app.delete("/api/usage/pricing/{model_key}")
 async def usage_pricing_delete(model_key: str):
-    """删除一个自定义单价项。内置价不允许删（返回 400）。"""
+    """删除自定义单价；内置模型若被覆盖则恢复默认。"""
     book = usage_collect.get_book()
     # 找原始条目判断是否内置
     entries = {e["model_key"]: e for e in book.entries()}
     target = entries.get(usage_pricing.normalize_key(model_key))
     if target is None:
         raise HTTPException(status_code=404, detail="单价项不存在")
-    if target["is_builtin"]:
-        raise HTTPException(status_code=400, detail="内置价格不可删除，可编辑覆盖")
+    if target["is_builtin"] and not target.get("is_overridden"):
+        raise HTTPException(status_code=400, detail="当前已经是内置默认价格，无需删除")
     book.remove(model_key)
     await asyncio.to_thread(usage_store.save_pricing, book)
     return {"ok": True}
+
+
+@app.post("/api/usage/pricing/{model_key}/restore")
+async def usage_pricing_restore(model_key: str):
+    """恢复指定内置模型的默认价格。"""
+    book = usage_collect.get_book()
+    if not book.restore_default(model_key):
+        raise HTTPException(status_code=400, detail="该模型没有可恢复的内置默认价格")
+    await asyncio.to_thread(usage_store.save_pricing, book)
+    return {"ok": True, "entries": book.entries()}
 
 
 @app.post("/api/usage/pricing/litellm")
@@ -1169,7 +1486,7 @@ async def import_config(payload: dict, mode: Literal["merge", "replace"] = "merg
     # 导入后全量失效缓存（渠道可能新增/替换/删除，逐个失效不如清一次干净）。
     # bump _generation：导入前已在飞的查询 task（用旧配置/旧密钥发起）完成后会
     # 发现代际已变，丢弃结果不写缓存——否则这些旧 task 跑完会把旧密钥查到的额度
-    # 写回 _cache，TTL 60s 内展示的是导入前的旧数据。仍在运行的 task 这里仍然不
+    # 写回 _cache，TTL 5 分钟内展示的是导入前的旧数据。仍在运行的 task 这里仍然不
     # 取消（取消会孤立正在 await 它的其它调用者），靠代际校验让它的结果自然失效。
     # 同时摘除 _inflight 里已完成的残留 task，避免导入后复用旧 task。仍在运行的
     # 旧代际 task 不摘（取消会孤立 awaiter）——它们的代际已落后，下次复用判断时
@@ -1180,6 +1497,7 @@ async def import_config(payload: dict, mode: Literal["merge", "replace"] = "merg
         _cache.clear()
         for cid in [cid for cid, (t, _g) in _inflight.items() if t.done()]:
             _inflight.pop(cid, None)
+    monitor_service.reconfigure()
     return result
 
 

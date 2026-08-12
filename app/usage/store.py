@@ -2,11 +2,12 @@
 
 参考 Buktal/VaultOne 的 db 层设计（schema.rs / store_reads.rs），但做了简化：
 - 单设备（无 device_id 维度——本面板是单机本地工具，不需要多机合并）；
-- 增量游标只存 JSONL 源的 (mtime, line_offset)，SQLite 源（opencode）记水位线；
+- 增量游标保存 JSONL 源的 (mtime, line_offset, last_model)，SQLite 源（opencode）保存
+  时间戳兼容值和 rowid 水位；
 - 聚合全部实时 GROUP BY，不预计算 rollup 表（数据量级远小于 VaultOne 的多端场景）。
 
 主键用 (source, uuid)：uuid 是各解析器产出的稳定去重 id（如 claude 用 message.id，
-opencode 用 session_id:created），同一来源内 uuid 唯一即可。重复解析同一文件不会
+OpenCode 老版消息还会加入 rowid），同一来源内 uuid 唯一即可。重复解析同一文件不会
 产生重复行（INSERT OR IGNORE）。
 
 成本列以 TEXT 存 Decimal（与 VaultOne 一致，避免浮点精度问题），读取时转回 Decimal。
@@ -105,6 +106,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             last_modified_ns  INTEGER,
             last_line_offset  INTEGER,
             watermark_ms      INTEGER,
+            watermark_rowid   INTEGER,
+            last_model        TEXT,
             PRIMARY KEY (source, file_path)
         );
 
@@ -118,8 +121,21 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             is_builtin             INTEGER NOT NULL DEFAULT 0,
             updated_at             INTEGER NOT NULL DEFAULT 0
         );
+
+        -- 低频维护任务的运行水位（例如历史保留清理），避免每次 API 请求都重复做。
+        CREATE TABLE IF NOT EXISTS app_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """
     )
+    # Existing installations were created before rowid/model-aware cursors
+    # existed. CREATE TABLE IF NOT EXISTS does not migrate those tables, so
+    # add nullable columns explicitly while keeping old databases usable.
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(scan_progress)")}
+    for column, definition in (("watermark_rowid", "INTEGER"), ("last_model", "TEXT")):
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE scan_progress ADD COLUMN {column} {definition}")
     conn.commit()
 
 
@@ -139,8 +155,12 @@ def _day_from_ts(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000, tz=UTC).strftime("%Y-%m-%d")
 
 
-def upsert_records(source: str, records: list[dict]) -> int:
-    """批量入库解析记录。按 (source, uuid) 主键去重（INSERT OR IGNORE）。
+def upsert_records(source: str, records: list[dict], *, update_existing: bool = False) -> int:
+    """批量入库解析记录。
+
+    默认按 (source, uuid) 主键去重（INSERT OR IGNORE）。对于 OpenCode 新版 session
+    表，token 列是同一 session 的当前聚合值而不是不可变事件；调用方可传
+    ``update_existing=True`` 让后续扫描覆盖旧聚合值。
 
     records 每项字段：
         uuid, timestamp_ms, model, pricing_model, session_id,
@@ -148,8 +168,8 @@ def upsert_records(source: str, records: list[dict]) -> int:
         input_cost_usd, output_cost_usd, cache_read_cost, cache_create_cost,
         total_cost_usd, has_cost, stop_reason
 
-    返回实际新插入的行数（被忽略的重复行不计）。已在库里的同 uuid 不会更新——
-    增量游标保证我们只解析新内容，重复入库说明游标失效，此时保持旧值更安全。
+    返回 SQLite 报告的受影响行数。默认模式下重复行不计；更新模式下同 UUID 的
+    新聚合值会计为一次受影响操作。
     """
     if not records:
         return 0
@@ -180,16 +200,38 @@ def upsert_records(source: str, records: list[dict]) -> int:
             )
         )
     with _lock:
-        cur = conn.executemany(
-            """INSERT OR IGNORE INTO usage_records
+        statement = """INSERT INTO usage_records
                (source, uuid, timestamp_ms, day, model, pricing_model, session_id,
                 input_tokens, output_tokens, cache_creation, cache_read,
                 input_cost_usd, output_cost_usd, cache_read_cost, cache_create_cost,
                 total_cost_usd, has_cost, stop_reason)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            rows,
-        )
-        conn.commit()
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+        if update_existing:
+            statement += """ ON CONFLICT(source, uuid) DO UPDATE SET
+                timestamp_ms=excluded.timestamp_ms,
+                day=excluded.day,
+                model=excluded.model,
+                pricing_model=excluded.pricing_model,
+                session_id=excluded.session_id,
+                input_tokens=excluded.input_tokens,
+                output_tokens=excluded.output_tokens,
+                cache_creation=excluded.cache_creation,
+                cache_read=excluded.cache_read,
+                input_cost_usd=excluded.input_cost_usd,
+                output_cost_usd=excluded.output_cost_usd,
+                cache_read_cost=excluded.cache_read_cost,
+                cache_create_cost=excluded.cache_create_cost,
+                total_cost_usd=excluded.total_cost_usd,
+                has_cost=excluded.has_cost,
+                stop_reason=excluded.stop_reason"""
+        else:
+            statement = statement.replace("INSERT INTO", "INSERT OR IGNORE INTO", 1)
+        try:
+            cur = conn.executemany(statement, rows)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         return cur.rowcount
 
 
@@ -200,7 +242,8 @@ def get_cursor(source: str, file_path: str) -> dict | None:
     conn = get_conn()
     with _lock:
         row = conn.execute(
-            "SELECT last_modified_ns, last_line_offset, watermark_ms "
+            "SELECT last_modified_ns, last_line_offset, watermark_ms, "
+            "watermark_rowid, last_model "
             "FROM scan_progress WHERE source=? AND file_path=?",
             (source, file_path),
         ).fetchone()
@@ -210,6 +253,8 @@ def get_cursor(source: str, file_path: str) -> dict | None:
         "last_modified_ns": row["last_modified_ns"],
         "last_line_offset": row["last_line_offset"],
         "watermark_ms": row["watermark_ms"],
+        "watermark_rowid": row["watermark_rowid"],
+        "last_model": row["last_model"],
     }
 
 
@@ -219,18 +264,31 @@ def set_cursor(
     last_modified_ns: int | None = None,
     last_line_offset: int | None = None,
     watermark_ms: int | None = None,
+    watermark_rowid: int | None = None,
+    last_model: str | None = None,
 ) -> None:
     conn = get_conn()
     with _lock:
         conn.execute(
             """INSERT INTO scan_progress
-               (source, file_path, last_modified_ns, last_line_offset, watermark_ms)
-               VALUES (?,?,?,?,?)
+               (source, file_path, last_modified_ns, last_line_offset, watermark_ms,
+                watermark_rowid, last_model)
+               VALUES (?,?,?,?,?,?,?)
                ON CONFLICT(source, file_path) DO UPDATE SET
-                 last_modified_ns=excluded.last_modified_ns,
-                 last_line_offset=excluded.last_line_offset,
-                 watermark_ms=excluded.watermark_ms""",
-            (source, file_path, last_modified_ns, last_line_offset, watermark_ms),
+                 last_modified_ns=COALESCE(excluded.last_modified_ns, scan_progress.last_modified_ns),
+                 last_line_offset=COALESCE(excluded.last_line_offset, scan_progress.last_line_offset),
+                 watermark_ms=COALESCE(excluded.watermark_ms, scan_progress.watermark_ms),
+                 watermark_rowid=COALESCE(excluded.watermark_rowid, scan_progress.watermark_rowid),
+                 last_model=COALESCE(excluded.last_model, scan_progress.last_model)""",
+            (
+                source,
+                file_path,
+                last_modified_ns,
+                last_line_offset,
+                watermark_ms,
+                watermark_rowid,
+                last_model,
+            ),
         )
         conn.commit()
 
@@ -239,11 +297,128 @@ def list_cursors(source: str) -> list[dict]:
     conn = get_conn()
     with _lock:
         rows = conn.execute(
-            "SELECT file_path, last_modified_ns, last_line_offset, watermark_ms "
+            "SELECT file_path, last_modified_ns, last_line_offset, watermark_ms, "
+            "watermark_rowid, last_model "
             "FROM scan_progress WHERE source=?",
             (source,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def delete_cursor(source: str, file_path: str) -> None:
+    """删除一个增量游标，用于采集落库失败后的回滚。"""
+    conn = get_conn()
+    with _lock:
+        conn.execute(
+            "DELETE FROM scan_progress WHERE source=? AND file_path=?",
+            (source, file_path),
+        )
+        conn.commit()
+
+
+# ── 健康诊断与历史保留清理 ──────────────────────────────────────
+
+
+def _database_size_bytes() -> int:
+    """统计 SQLite 主文件和 WAL/SHM 辅助文件的实际磁盘占用。"""
+    total = 0
+    for path in (DB_PATH, Path(f"{DB_PATH}-wal"), Path(f"{DB_PATH}-shm")):
+        try:
+            total += path.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def get_database_status() -> dict:
+    """轻量数据库诊断，不修改任何数据。"""
+    if _conn is None and not DB_PATH.exists():
+        return {
+            "ok": True,
+            "exists": False,
+            "path": str(DB_PATH),
+            "size_bytes": 0,
+            "records": 0,
+            "cursors": 0,
+            "oldest_record_at": None,
+            "newest_record_at": None,
+            "last_cleanup_at": None,
+        }
+    conn = get_conn()
+    with _lock:
+        row = conn.execute(
+            "SELECT COUNT(*) AS records, MIN(timestamp_ms) AS oldest, MAX(timestamp_ms) AS newest "
+            "FROM usage_records"
+        ).fetchone()
+        cursors = conn.execute("SELECT COUNT(*) AS n FROM scan_progress").fetchone()["n"]
+        cleanup_row = conn.execute("SELECT value FROM app_state WHERE key='usage_cleanup_at'").fetchone()
+    return {
+        "ok": True,
+        "exists": True,
+        "path": str(DB_PATH),
+        "size_bytes": _database_size_bytes(),
+        "records": int(row["records"]),
+        "cursors": int(cursors),
+        "oldest_record_at": int(row["oldest"]) if row["oldest"] is not None else None,
+        "newest_record_at": int(row["newest"]) if row["newest"] is not None else None,
+        "last_cleanup_at": int(cleanup_row["value"]) if cleanup_row else None,
+    }
+
+
+def cleanup_old_records(retention_days: int, *, force: bool = False, now_ms: int | None = None) -> dict:
+    """删除保留期之外的用量记录和已不存在文件的游标。
+
+    默认 24 小时内最多实际执行一次；force=True 供显式维护端点和测试使用。
+    不主动 VACUUM，避免大库清理时长时间锁表；WAL 会在后续 checkpoint 中复用空间。
+    """
+    retention_days = min(max(int(retention_days), 1), 3650)
+    current_ms = int(now_ms if now_ms is not None else datetime.now(UTC).timestamp() * 1000)
+    conn = get_conn()
+    with _lock:
+        last_row = conn.execute("SELECT value FROM app_state WHERE key='usage_cleanup_at'").fetchone()
+        last_cleanup_at = int(last_row["value"]) if last_row else None
+        if not force and last_cleanup_at is not None and current_ms - last_cleanup_at < 86_400_000:
+            return {
+                "skipped": True,
+                "reason": "24 小时内已执行过清理",
+                "last_cleanup_at": last_cleanup_at,
+                "deleted_records": 0,
+                "deleted_cursors": 0,
+                "size_bytes": _database_size_bytes(),
+            }
+
+        cutoff_ms = current_ms - retention_days * 86_400_000
+        deleted_records = conn.execute(
+            "DELETE FROM usage_records WHERE timestamp_ms < ?", (cutoff_ms,)
+        ).rowcount
+
+        cursor_rows = conn.execute("SELECT source, file_path FROM scan_progress").fetchall()
+        stale_cursors = []
+        for row in cursor_rows:
+            path = Path(row["file_path"])
+            # 解析器目前都存绝对路径；只清理明确的绝对路径，避免未来新增的逻辑游标
+            # 名称被 Path.exists() 误判后删除。
+            if path.is_absolute() and not path.exists():
+                stale_cursors.append((row["source"], row["file_path"]))
+        if stale_cursors:
+            conn.executemany("DELETE FROM scan_progress WHERE source=? AND file_path=?", stale_cursors)
+
+        conn.execute(
+            "INSERT INTO app_state(key,value) VALUES('usage_cleanup_at',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(current_ms),),
+        )
+        conn.commit()
+
+    return {
+        "skipped": False,
+        "retention_days": retention_days,
+        "cutoff_at": cutoff_ms,
+        "last_cleanup_at": current_ms,
+        "deleted_records": int(deleted_records),
+        "deleted_cursors": len(stale_cursors),
+        "size_bytes": _database_size_bytes(),
+    }
 
 
 # ── 定价表持久化 ────────────────────────────────────────────────
@@ -282,6 +457,8 @@ def load_pricing(book) -> None:
     book 先在 __init__ 里加载内置价，这里把库里的（可能是用户改过的 / LiteLLM 拉过的）
     覆盖上去——库里的 is_builtin 标记保留，这样前端能区分"这是我改的"vs"内置默认"。
     """
+    from . import pricing
+
     conn = get_conn()
     with _lock:
         rows = conn.execute(
@@ -289,14 +466,35 @@ def load_pricing(book) -> None:
             "cache_read_per_million, cache_creation_per_million, is_builtin FROM model_pricing"
         ).fetchall()
     for r in rows:
-        book.upsert(
-            r["model_key"],
-            r["input_per_million"],
-            r["output_per_million"],
-            r["cache_read_per_million"],
-            r["cache_creation_per_million"],
-            is_builtin=bool(r["is_builtin"]),
-        )
+        try:
+            key = r["model_key"]
+            normalized = pricing.normalize_key(key)
+            persisted_builtin = bool(r["is_builtin"])
+            # 旧版本曾把“手动覆盖内置模型”错误保存成 is_builtin=1。若持久化值
+            # 与当前源码默认值不同，按覆盖项迁移，恢复按钮才不会被永久隐藏。
+            if persisted_builtin and normalized in pricing.BUILTIN_PRICES:
+                defaults = pricing.BUILTIN_PRICES[normalized]
+                persisted_values = tuple(
+                    pricing._to_decimal(r[field])
+                    for field in (
+                        "input_per_million",
+                        "output_per_million",
+                        "cache_read_per_million",
+                        "cache_creation_per_million",
+                    )
+                )
+                if persisted_values != tuple(pricing._to_decimal(v) for v in defaults):
+                    persisted_builtin = False
+            book.upsert(
+                key,
+                r["input_per_million"],
+                r["output_per_million"],
+                r["cache_read_per_million"],
+                r["cache_creation_per_million"],
+                is_builtin=persisted_builtin,
+            )
+        except (TypeError, ValueError) as e:
+            logger.warning("忽略无效的持久化模型单价 %r: %s", r["model_key"], e)
 
 
 # ── rebill：只补 0 成本记录 ─────────────────────────────────────
@@ -389,13 +587,20 @@ def _build_where(from_ts: int | None, to_ts: int | None, source: str | None, mod
     return where, params
 
 
+def _calendar_window_start_ms(days: int) -> int:
+    """返回包含今天在内的最近 ``days`` 个 UTC 自然日的起点。"""
+    day_count = max(int(days), 1)
+    start = datetime.now(UTC).date() - timedelta(days=day_count - 1)
+    return int(datetime.combine(start, datetime.min.time(), tzinfo=UTC).timestamp() * 1000)
+
+
 def query_overview(days: int = 14, source: str | None = None, model: str | None = None) -> dict:
     """总览：四桶 token 总量 + 总成本 + 缓存命中率 + 请求数 + 会话数。
 
     缓存命中率口径与 VaultOne 一致：cache_read / (input + cache_creation + cache_read)，
     output 不进分母（输出不占缓存池）。分母 ≤ 0 时返回 0。
     """
-    since_ms = int((datetime.now(UTC) - timedelta(days=days)).timestamp() * 1000)
+    since_ms = _calendar_window_start_ms(days)
     conn = get_conn()
     where, params = _build_where(since_ms, None, source, model)
     with _lock:
@@ -438,7 +643,9 @@ def query_trend(days: int = 14, source: str | None = None, model: str | None = N
 
     补零：窗口内缺失的日期填 0，保证前端曲线连续。返回按 day 升序的数组。
     """
-    since_ms = int((datetime.now(UTC) - timedelta(days=days)).timestamp() * 1000)
+    today = datetime.now(UTC).date()
+    start = today - timedelta(days=max(days, 1) - 1)
+    since_ms = int(datetime.combine(start, datetime.min.time(), tzinfo=UTC).timestamp() * 1000)
     conn = get_conn()
     where, params = _build_where(since_ms, None, source, model)
     with _lock:
@@ -456,8 +663,6 @@ def query_trend(days: int = 14, source: str | None = None, model: str | None = N
     by_day = {r["day"]: r for r in rows}
     # 补零：从 since 当天到今天，逐天填
     out: list[dict] = []
-    today = datetime.now(UTC).date()
-    start = (datetime.now(UTC) - timedelta(days=days)).date()
     d = start
     while d <= today:
         key = d.strftime("%Y-%m-%d")
@@ -486,7 +691,7 @@ def query_model_breakdown(
 
     返回 Top N + "其他"汇总（N=8）。每项含 model / tokens / cost / requests / pct。
     """
-    since_ms = int((datetime.now(UTC) - timedelta(days=days)).timestamp() * 1000)
+    since_ms = _calendar_window_start_ms(days)
     conn = get_conn()
     where, params = _build_where(since_ms, None, source, None)
     order = "tot_cost DESC" if metric == "cost" else "tot_tokens DESC"
@@ -548,7 +753,7 @@ def query_request_log(
     offset: int = 0,
 ) -> dict:
     """逐请求日志（分页）。按时间倒序，最近 limit 条。"""
-    since_ms = int((datetime.now(UTC) - timedelta(days=days)).timestamp() * 1000)
+    since_ms = _calendar_window_start_ms(days)
     conn = get_conn()
     where, params = _build_where(since_ms, None, source, model)
     with _lock:
@@ -558,11 +763,14 @@ def query_request_log(
                 CAST(total_cost_usd AS REAL) AS cost, has_cost, stop_reason
                 FROM usage_records{where}
                 ORDER BY timestamp_ms DESC LIMIT ? OFFSET ?""",
-            (*params, limit, offset),
+            (*params, limit + 1, offset),
         ).fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
     return {
         "limit": limit,
         "offset": offset,
+        "has_more": has_more,
         "rows": [
             {
                 "source": r["source"],
@@ -605,7 +813,7 @@ def query_sources() -> list[dict]:
 
 def query_models(days: int = 14) -> list[str]:
     """窗口内出现过的模型名列表（去重，按出现频次降序），供前端模型筛选下拉。"""
-    since_ms = int((datetime.now(UTC) - timedelta(days=days)).timestamp() * 1000)
+    since_ms = _calendar_window_start_ms(days)
     conn = get_conn()
     with _lock:
         rows = conn.execute(

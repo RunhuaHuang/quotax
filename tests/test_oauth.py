@@ -112,6 +112,15 @@ def test_store_flow_overwrites_same_state():
     assert oauth.take_flow("s") == "v2"
 
 
+def test_store_flow_has_capacity_bound():
+    oauth._FLOWS.clear()
+    for index in range(oauth._FLOW_MAX + 5):
+        oauth.store_flow(f"capacity_{index}", f"v{index}")
+    assert len(oauth._FLOWS) == oauth._FLOW_MAX
+    assert oauth.take_flow("capacity_0") is None
+    oauth._FLOWS.clear()
+
+
 # ── id_token 解析 ─────────────────────────────────────────────
 
 

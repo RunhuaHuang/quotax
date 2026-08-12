@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,6 +24,8 @@ def client(isolated_config, monkeypatch):
     # 测试开始前清空，避免相互干扰。
     app_main._cache.clear()
     app_main._inflight.clear()
+    app_main._OAUTH_RESULTS.clear()
+    app_main._OAUTH_RESULT_CREATED.clear()
     # config_store.HISTORY_DIR 是模块级全局，在 app/config.py 导入时基于
     # CONFIG_PATH 计算一次；isolated_config 只替换了 CONFIG_PATH，不会连带更新
     # 它。如果某个测试触发一次真正成功（status=="ok"）的查询，_query_and_cache
@@ -30,13 +33,124 @@ def client(isolated_config, monkeypatch):
     # 项目根目录真实的 history/ 目录，污染用户数据。这里和 test_history.py 的
     # isolated_history fixture 做同样的隔离。
     monkeypatch.setattr(config_store, "HISTORY_DIR", isolated_config.parent / "history")
-    return TestClient(app_main.app)
+    monkeypatch.setattr(app_main.usage_store, "DB_PATH", isolated_config.parent / "usage.db")
+    app_main.usage_store.reset_for_test()
+    yield TestClient(app_main.app)
+    app_main.usage_store.reset_for_test()
 
 
 def test_health(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
-    assert resp.json() == {"ok": True}
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["version"]
+    assert body["config"]["ok"] is True
+    assert body["database"]["ok"] is True
+    assert "usage_collection" in body
+    assert "monitor" in body
+
+
+def test_settings_endpoint_persists_monitor_configuration(client):
+    initial = client.get("/api/settings")
+    assert initial.status_code == 200
+    assert initial.headers["cache-control"] == "no-store"
+    assert initial.json()["monitor"]["enabled"] is False
+
+    updated = client.put(
+        "/api/settings",
+        json={"monitor": {"enabled": True, "interval_seconds": 600, "thresholds": {"ch_a": 15}}},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["monitor"]["enabled"] is True
+    assert updated.json()["monitor"]["thresholds"] == {"ch_a": 15.0}
+    assert client.get("/api/settings").json() == updated.json()
+
+
+def test_settings_endpoint_rejects_too_frequent_background_polling(client):
+    resp = client.put("/api/settings", json={"monitor": {"interval_seconds": 10}})
+    assert resp.status_code == 400
+    assert "interval_seconds" in resp.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("model_key", 123),
+        ("input_per_million", -1),
+        ("output_per_million", "NaN"),
+        ("cache_read_per_million", "Infinity"),
+        ("cache_creation_per_million", 1_000_001),
+    ],
+)
+def test_pricing_endpoint_rejects_invalid_rates(client, field, value):
+    payload = {
+        "model_key": "custom-model",
+        "input_per_million": 0,
+        "output_per_million": 0,
+        "cache_read_per_million": 0,
+        "cache_creation_per_million": 0,
+    }
+    payload[field] = value
+    resp = client.put("/api/usage/pricing", json=payload)
+    assert resp.status_code == 400
+    assert field in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_does_not_wait_for_usage_collection(monkeypatch):
+    """历史日志扫描可以在后台继续，但不能拖住 Web 服务开放。"""
+    collection_started = threading.Event()
+    release_collection = threading.Event()
+
+    monkeypatch.setattr(app_main, "_auto_detect_subscription_channels", lambda: {"added": [], "skipped": []})
+
+    def slow_collect():
+        collection_started.set()
+        assert release_collection.wait(timeout=2)
+        return {"sources": [], "total_new": 0}
+
+    async def no_close():
+        return None
+
+    async def no_monitor_lifecycle():
+        return None
+
+    monkeypatch.setattr(app_main.usage_collect, "collect_all", slow_collect)
+    monkeypatch.setattr(app_main.usage_store, "cleanup_old_records", lambda _days: {"skipped": True})
+    monkeypatch.setattr(app_main.config_store, "get_settings", lambda: {"monitor": {"retention_days": 365}})
+    monkeypatch.setattr(app_main.monitor_service, "start", no_monitor_lifecycle)
+    monkeypatch.setattr(app_main.monitor_service, "stop", no_monitor_lifecycle)
+    monkeypatch.setattr(app_main, "aclose", no_close)
+
+    async with app_main.lifespan(app_main.app):
+        # 能进入上下文就说明 lifespan 已 yield；此时采集线程仍被我们故意阻塞。
+        assert await asyncio.to_thread(collection_started.wait, 1)
+        assert not release_collection.is_set()
+        release_collection.set()
+
+    # 让后台任务有机会完成并从强引用集合移除，避免影响后续测试。
+    for _ in range(20):
+        if not app_main._bg_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert not app_main._bg_tasks
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_shielded_inflight_queries():
+    started = asyncio.Event()
+
+    async def never_finishes():
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(never_finishes())
+    app_main._inflight["ch_shutdown"] = (task, app_main._generation)
+    await started.wait()
+    await app_main._cancel_inflight_queries()
+    assert task.cancelled()
+    assert app_main._inflight == {}
 
 
 def test_providers_endpoint_lists_newapi_with_user_id_field(client):
@@ -110,6 +224,35 @@ def test_quotas_empty_when_no_channels(client):
     assert resp.json() == {"cached": False, "channels": []}
 
 
+def test_quota_response_exposes_per_channel_freshness(client, monkeypatch):
+    created = client.post(
+        "/api/channels",
+        json={"type": "deepseek", "name": "Freshness", "api_key": "sk-test"},
+    ).json()
+
+    async def query(channel):
+        return ok(
+            id=channel.id,
+            type=channel.type,
+            name=channel.name,
+            category="balance",
+            windows=[window("balance", "余额", remaining_percent=80)],
+        )
+
+    monkeypatch.setattr(app_main, "query_channel", query)
+    live = client.get(f"/api/quotas?ids={created['id']}&force=true").json()["channels"][0]
+    assert live["cache"]["hit"] is False
+    assert live["cache"]["source"] == "live"
+    assert live["cache"]["stale"] is False
+    assert live["cache"]["age_ms"] >= 0
+
+    cached_response = client.get(f"/api/quotas?ids={created['id']}").json()
+    assert cached_response["cached"] is True
+    cached = cached_response["channels"][0]
+    assert cached["cache"]["hit"] is True
+    assert cached["cache"]["source"] == "cache"
+
+
 def test_quotas_disabled_channel_short_circuits_without_network(client):
     created = client.post(
         "/api/channels",
@@ -172,6 +315,17 @@ def test_quotas_ids_strips_volcengine_plan_suffix(client):
     # 停用渠道返回的 id 是原始 config id（无后缀）
     assert body["channels"][0]["id"] == created["id"]
     assert body["channels"][0]["status"] == "disabled"
+
+
+def test_delete_volcengine_plan_suffix_removes_base_channel(client):
+    """删除展示层火山子卡 ID 时，应删除底层共享的原始渠道。"""
+    created = client.post(
+        "/api/channels",
+        json={"type": "volcengine", "name": "火山", "ak": "ak-x", "sk": "sk-x", "enabled": False},
+    ).json()
+    resp = client.delete(f"/api/channels/{created['id']}_coding")
+    assert resp.status_code == 200
+    assert client.get("/api/channels").json() == []
 
 
 def test_quotas_no_ids_param_returns_everything(client):
@@ -321,12 +475,26 @@ def test_upload_codex_credentials_writes_file_and_links_channel(client, isolated
     # 凭据文件真实写入 config 同目录 credentials/ 下，且权限 600
     path = isolated_config.parent / "credentials" / f"codex_{ch['id']}.json"
     assert path.exists()
+    assert (path.parent.stat().st_mode & 0o777) == 0o700
     assert (path.stat().st_mode & 0o777) == 0o600
     assert "eyJtest-token-123" in path.read_text(encoding="utf-8")
 
     # 渠道 extra 已关联相对路径
     channel = config_store.get_channel(ch["id"])
     assert channel.extra["codex_auth_file"] == f"credentials/codex_{ch['id']}.json"
+
+
+def test_upload_codex_credentials_rejects_credentials_symlink_outside_config(client, isolated_config):
+    outside = isolated_config.parent.parent / f"{isolated_config.parent.name}-outside-cred"
+    outside.mkdir()
+    try:
+        (isolated_config.parent / "credentials").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("当前平台不允许创建目录符号链接")
+    ch = _make_codex_channel(client)
+    resp = client.post(f"/api/channels/{ch['id']}/codex-credentials", json={"content": VALID_AUTH_JSON})
+    assert resp.status_code == 400
+    assert "credentials" in resp.json()["detail"]
 
 
 def test_upload_codex_credentials_rejects_invalid_json(client):
@@ -869,6 +1037,23 @@ def test_codex_oauth_start_returns_authorize_url(client, monkeypatch):
     assert len(body["state"]) == 32
 
 
+def test_oauth_callback_server_stop_is_scheduled_off_handler_thread(monkeypatch):
+    """HTTPServer.shutdown 不能在 serve_forever 所在线程内直接调用。"""
+    stopped = threading.Event()
+    caller_thread = threading.get_ident()
+    stop_thread_ids = []
+
+    def fake_stop():
+        stop_thread_ids.append(threading.get_ident())
+        stopped.set()
+
+    monkeypatch.setattr(app_main, "_stop_callback_server", fake_stop)
+    app_main._schedule_callback_server_stop()
+    assert stopped.wait(timeout=1)
+    assert len(stop_thread_ids) == 1
+    assert stop_thread_ids[0] != caller_thread
+
+
 def test_codex_oauth_callback_creates_channel(client, monkeypatch):
     """OAuth 回调核心逻辑：mock token 交换成功 → 自动创建 codex 渠道 + 写凭据文件。
 
@@ -907,6 +1092,13 @@ def test_codex_oauth_callback_rejects_unknown_state(client, monkeypatch):
     html = asyncio.run(app_main._process_oauth_callback("c", "nonexistent_state", None))
     assert "授权失败" in html
     assert client.get("/api/channels").json() == []
+    assert "nonexistent_state" not in app_main._OAUTH_RESULTS
+
+
+def test_codex_oauth_poll_rejects_oversized_state(client):
+    state = "x" * 129
+    resp = client.get(f"/api/auth/codex/poll?state={state}")
+    assert resp.status_code == 400
 
 
 def test_codex_oauth_callback_handles_openai_error(client):
@@ -925,6 +1117,23 @@ def test_codex_oauth_callback_token_exchange_failure(client, monkeypatch):
 
     monkeypatch.setattr(oauth, "exchange_code", fail_exchange)
     state = "test_state_fail"
+    oauth.store_flow(state, "v")
+    html = asyncio.run(app_main._process_oauth_callback("c", state, None))
+    assert "授权失败" in html
+    assert client.get("/api/channels").json() == []
+
+
+def test_codex_oauth_callback_rolls_back_channel_when_credential_write_fails(client, monkeypatch):
+    """凭据文件写入失败时不能留下没有 auth.json 的孤儿 Codex 渠道。"""
+    from app import oauth
+
+    monkeypatch.setattr(oauth, "exchange_code", _fake_exchange_ok)
+
+    def fail_write(_path, _content):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(app_main, "_write_private_text_atomic", fail_write)
+    state = "test_state_write_failure"
     oauth.store_flow(state, "v")
     html = asyncio.run(app_main._process_oauth_callback("c", state, None))
     assert "授权失败" in html

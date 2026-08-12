@@ -1,0 +1,1 @@
+"""Bundled QuotaX web fonts."""

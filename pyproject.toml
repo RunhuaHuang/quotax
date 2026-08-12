@@ -23,8 +23,23 @@ package = true
 
 [tool.setuptools]
 # flat-layout 下 setuptools 会把 static/ 等非包目录误判为顶层包，显式声明
-# 包列表（scripts 入口只需要 app 包）。
-packages = ["app", "app.providers"]
+# 包列表。app.usage / parsers 也是 Web 后端运行时依赖；quotax_static 把现有
+# 顶层 static/ 映射进 wheel，避免源码运行正常但安装包缺前端资源。
+packages = [
+    "app",
+    "app.providers",
+    "app.usage",
+    "app.usage.parsers",
+    "quotax_static",
+    "quotax_static.fonts",
+    "quotax_static.icons",
+]
+
+[tool.setuptools.package-dir]
+quotax_static = "static"
+
+[tool.setuptools.package-data]
+quotax_static = ["*.html", "*.js", "*.css", "fonts/*", "icons/*"]
 
 [dependency-groups]
 dev = [

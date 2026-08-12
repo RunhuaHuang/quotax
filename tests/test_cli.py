@@ -115,6 +115,33 @@ def test_quota_json_splits_volcengine_dual_plan(monkeypatch, capsys, isolated_co
     assert all((w["key"] or "").startswith("coding_") for w in coding["windows"])
 
 
+def test_quota_ids_accepts_volcengine_plan_suffix(monkeypatch, capsys, isolated_config):
+    """从 Web/JSON 输出复制火山子卡 ID 给 CLI 时，必须仍能命中原始渠道。"""
+    _make_channel(id="ch_volc", type="volcengine", name="火山", ak="AK", sk="SK")
+    queried = []
+
+    async def dual_plan(channel):
+        queried.append(channel.id)
+        return ok(
+            id=channel.id,
+            type=channel.type,
+            name=channel.name,
+            category="coding_plan",
+            windows=[
+                window("agent_five_hour", "Agent 5h", remaining_percent=80),
+                window("coding_five_hour", "Coding 5h", remaining_percent=50),
+            ],
+            extra={"agent_plan_name": "Agent", "coding_plan_name": "Coding"},
+        )
+
+    code, out, _ = _run(monkeypatch, capsys, ["quota", "--json", "--ids", "ch_volc_agent"], query=dual_plan)
+    assert code == 0
+    assert queried == ["ch_volc"]
+    import json
+
+    assert [c["id"] for c in json.loads(out)["channels"]] == ["ch_volc_agent", "ch_volc_coding"]
+
+
 def test_quota_brief_single_line(monkeypatch, capsys, isolated_config):
     _make_channel()
     _make_channel(id="ch2", name="另一个渠道", type="claude_subscription")

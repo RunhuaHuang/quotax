@@ -995,9 +995,31 @@ select option { background: var(--popover); color: var(--foreground); }
 .config-io { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
 
 /* 设置弹窗 */
-/* 内容较多（主题+刷新+阈值列表），覆盖 modal-sm 用标准宽度，避免分段按钮被挤换行 */
-#settingsModal .modal { max-width: 640px; }
+/* 内容较多（主题、后台监控、阈值列表），覆盖 modal-sm 并保持移动端可滚动。 */
+#settingsModal .modal { max-width: 720px; }
+.setting-section {
+  padding-bottom: 22px;
+  margin-bottom: 22px;
+  border-bottom: 1px solid var(--border);
+}
+.setting-section:last-child { padding-bottom: 0; margin-bottom: 0; border-bottom: none; }
+.setting-section-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--foreground);
+  letter-spacing: 0.01em;
+  margin-bottom: 14px;
+}
+.setting-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 16px;
+}
+.setting-section-head .setting-section-title { margin-bottom: 4px; }
 .setting-row { display: flex; flex-direction: column; gap: 8px; margin-bottom: 20px; }
+.setting-row:last-child { margin-bottom: 0; }
 .setting-row-stretch { margin-bottom: 10px; }
 .setting-label { font-size: 13px; font-weight: 600; color: var(--foreground); }
 .setting-desc { font-size: 12px; color: var(--muted-foreground); font-weight: 400; line-height: 1.6; margin-top: 4px; }
@@ -1033,6 +1055,70 @@ select option { background: var(--popover); color: var(--foreground); }
   box-shadow: 0 4px 12px -2px color-mix(in srgb, var(--primary) 40%, transparent);
 }
 .seg-btn.dim { opacity: 0.55; }
+
+/* 后台监控表单与状态 */
+.monitor-section {
+  padding: 18px;
+  margin-left: -4px;
+  margin-right: -4px;
+  border: 1px solid color-mix(in srgb, var(--brand) 18%, var(--border));
+  border-radius: var(--radius-xl);
+  background: color-mix(in srgb, var(--brand) 3%, var(--card));
+}
+.monitor-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+.monitor-form-grid label, .monitor-webhook-field { margin: 0 !important; }
+.monitor-toggle-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 62px;
+  padding: 0 12px;
+  border: 1px solid var(--input);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+.monitor-field-label { font-size: 12.5px; color: var(--muted-foreground); font-weight: 600; }
+.monitor-webhook-field { display: block; margin-top: 14px !important; }
+.monitor-status {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 16px;
+}
+.monitor-status-card {
+  padding: 10px 12px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--muted) 54%, transparent);
+  min-width: 0;
+}
+.monitor-status-card .k { display: block; font-size: 10.5px; color: var(--muted-foreground); margin-bottom: 4px; }
+.monitor-status-card .v {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.monitor-status-card .v.ok { color: var(--green); }
+.monitor-status-card .v.warn { color: var(--amber); }
+.monitor-status-error {
+  grid-column: 1 / -1;
+  padding: 9px 12px;
+  font-size: 11.5px;
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 7%, transparent);
+  border: 1px solid color-mix(in srgb, var(--red) 18%, var(--border));
+  border-radius: var(--radius-lg);
+  overflow-wrap: anywhere;
+}
+.monitor-actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
 
 /* 阈值行 */
 .threshold-list { display: flex; flex-direction: column; gap: 8px; }
@@ -1191,10 +1277,47 @@ select option { background: var(--popover); color: var(--foreground); }
 @media (max-width: 720px) {
   main { padding: 24px 16px 48px; }
   .grid { grid-template-columns: 1fr; }
+  .section-head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+  }
+  .section-head .section-note {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
   .form-row { flex-direction: column; }
   .form-dynamic { grid-template-columns: 1fr; }
+  .channel-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px 10px;
+    padding: 10px 12px;
+  }
+  .channel-row .row-name .t,
+  .channel-row .row-name .ty { overflow-wrap: anywhere; }
+  .channel-row .row-key {
+    grid-column: 2 / -1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .channel-row .row-actions {
+    grid-column: 3;
+    grid-row: 1;
+  }
   .footer { flex-direction: column; gap: 4px; text-align: center; padding: 20px 16px; }
   .topbar-actions { width: 100%; justify-content: flex-end; }
+  .modal-overlay { padding: 14px 10px 28px; }
+  #settingsModal .modal-body { padding: 18px 16px 22px; }
+  #refreshOptions { grid-template-columns: repeat(2, 1fr); }
+  .monitor-form-grid { grid-template-columns: 1fr; }
+  .monitor-status { grid-template-columns: 1fr 1fr; }
+  .threshold-row { align-items: flex-start; flex-wrap: wrap; }
+  .threshold-input-wrap { width: 100%; justify-content: flex-end; }
 }
 
 @media (prefers-reduced-motion: reduce) {

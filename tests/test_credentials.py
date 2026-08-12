@@ -36,6 +36,13 @@ def test_claude_expired_when_expires_at_in_past():
     assert cred.status == CRED_EXPIRED
 
 
+def test_malformed_optional_expiry_does_not_crash_credential_parsing():
+    content = json.dumps({"claudeAiOauth": {"accessToken": "token", "expiresAt": "unknown"}})
+    cred = _parse_claude_json(content, "test")
+    assert cred.status == CRED_OK
+    assert cred.token == "token"
+
+
 def test_claude_no_token_real_world_diagnosis_case():
     """诊断出的真实钥匙串结构：已登录（有 subscriptionType 等元信息），但
     accessToken/refreshToken 是空字符串——这不是"未登录"，必须是 CRED_NO_TOKEN

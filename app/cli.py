@@ -114,7 +114,12 @@ async def _fetch_quotas(ids: set[str] | None) -> list[dict]:
     """
     channels = config_store.list_channels()
     if ids:
-        channels = [c for c in channels if c.id in ids]
+        # Web 端允许按火山展示子卡（<id>_agent / <id>_coding）刷新；CLI 的
+        # --ids 也必须归一到配置层原始 ID，否则用户从 `quota --json` 复制卡片
+        # ID 后再查询会静默得到空结果。canonical_channel_id 先精确匹配，普通渠道
+        # 自身以这些后缀结尾时不会被误改写。
+        wanted = {config_store.canonical_channel_id(raw) for raw in ids}
+        channels = [c for c in channels if c.id in wanted]
 
     async def one(channel: config_store.Channel) -> list[dict]:
         if not channel.enabled:
@@ -125,7 +130,7 @@ async def _fetch_quotas(ids: set[str] | None) -> list[dict]:
             return [
                 fail(
                     "error",
-                    str(e) or e.__class__.__name__,
+                    net.friendly_error(e),
                     id=channel.id,
                     type=channel.type,
                     name=channel.name,

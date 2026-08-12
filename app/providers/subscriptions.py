@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
 
 from ..config import Channel, resolve_codex_auth_file
 from ..credentials import (
@@ -23,7 +22,7 @@ from ..credentials import (
     read_gemini_credentials,
     read_grok_credentials,
 )
-from ..models import ChannelResult, fail, ok, to_ts, window
+from ..models import ChannelResult, fail, finite_float, ok, to_ts, window
 from ..net import ParseError, ResponseError, request_json
 
 USER_AGENT = "quota-board/1.0 (macOS; read-only usage checker)"
@@ -41,39 +40,45 @@ def _try_pty_usage(base: dict) -> ChannelResult | None:
     from ..claude_pty import fetch_usage_via_pty
 
     usage = fetch_usage_via_pty()
-    if usage is None or usage.session_percent_left is None:
+    session_left = finite_float(getattr(usage, "session_percent_left", None), None) if usage else None
+    if usage is None or session_left is None:
         # PTY 不可用，或 CLI 未登录（/usage 只返回本地统计，没有订阅用量标签）
         return None
 
     windows = []
     # session_percent_left 是「剩余百分比」，转成 used_percent
-    session_used = 100 - usage.session_percent_left
+    session_left = max(0.0, min(100.0, session_left))
+    session_used = 100 - session_left
     windows.append(
         window(
             "five_hour",
             "每 5 小时",
             used_percent=float(session_used),
-            remaining_percent=float(usage.session_percent_left),
+            remaining_percent=session_left,
         )
     )
-    if usage.weekly_percent_left is not None:
-        weekly_used = 100 - usage.weekly_percent_left
+    weekly_left = finite_float(getattr(usage, "weekly_percent_left", None), None)
+    if weekly_left is not None:
+        weekly_left = max(0.0, min(100.0, weekly_left))
+        weekly_used = 100 - weekly_left
         windows.append(
             window(
                 "weekly",
                 "每周额度",
                 used_percent=float(weekly_used),
-                remaining_percent=float(usage.weekly_percent_left),
+            remaining_percent=weekly_left,
             )
         )
-    if usage.weekly_opus_percent_left is not None:
-        opus_used = 100 - usage.weekly_opus_percent_left
+    opus_left = finite_float(getattr(usage, "weekly_opus_percent_left", None), None)
+    if opus_left is not None:
+        opus_left = max(0.0, min(100.0, opus_left))
+        opus_used = 100 - opus_left
         windows.append(
             window(
                 "weekly",
                 "每周（Opus）",
                 used_percent=float(opus_used),
-                remaining_percent=float(usage.weekly_opus_percent_left),
+            remaining_percent=opus_left,
             )
         )
     return ChannelResult(
@@ -192,7 +197,10 @@ async def query_claude(channel: Channel) -> ChannelResult:
     ]:
         item = data.get(key)
         if isinstance(item, dict) and item.get("utilization") is not None:
-            used = max(0.0, min(100.0, float(item["utilization"])))
+            used = finite_float(item["utilization"], None)
+            if used is None:
+                continue
+            used = max(0.0, min(100.0, used))
             windows.append(
                 window(
                     win_key,
@@ -205,20 +213,20 @@ async def query_claude(channel: Channel) -> ChannelResult:
 
     extra_usage = data.get("extra_usage")
     if isinstance(extra_usage, dict) and extra_usage.get("is_enabled") is True:
-            limit = float(extra_usage.get("monthly_limit") or 0)
-            used_credits = float(extra_usage.get("used_credits") or 0)
-            if limit > 0:
-                windows.append(
-                    window(
-                        "monthly",
-                        "超额额度（本月）",
-                        used_percent=used_credits / limit * 100,
-                        remaining_percent=max(0.0, 100 - used_credits / limit * 100),
-                        used_label=f"${used_credits:,.2f}",
-                        max_label=f"${limit:,.2f}",
-                        reset_at=to_ts(extra_usage.get("reset_at")),
-                    )
+        limit = finite_float(extra_usage.get("monthly_limit"), 0.0) or 0.0
+        used_credits = finite_float(extra_usage.get("used_credits"), 0.0) or 0.0
+        if limit > 0:
+            windows.append(
+                window(
+                    "monthly",
+                    "超额额度（本月）",
+                    used_percent=used_credits / limit * 100,
+                    remaining_percent=max(0.0, 100 - used_credits / limit * 100),
+                    used_label=f"${used_credits:,.2f}",
+                    max_label=f"${limit:,.2f}",
+                    reset_at=to_ts(extra_usage.get("reset_at")),
                 )
+            )
 
     # plan_name 用 subscription_type（pro / max 等），不再拼"（超额：USD）"
     subscription_type = (cred.extra or {}).get("subscription_type")
@@ -277,13 +285,16 @@ async def query_gemini(channel: Channel) -> ChannelResult:
     # 按模型档位聚合（pro / flash / flash-lite），取各桶最小剩余比例
     # 同样兼容 camelCase（modelId/remainingFraction/resetTime）和 snake_case。
     buckets: list[dict] = data.get("buckets") or []
+    if not isinstance(buckets, list):
+        buckets = []
     categories: dict[str, dict] = {}
     for bucket in buckets:
         if not isinstance(bucket, dict):
             continue
         model_id = str(_pick(bucket, "modelId", "model_id", default="unknown"))
         category = _classify_gemini_model(model_id)
-        remaining = float(_pick(bucket, "remainingFraction", "remaining_fraction", default=1.0))
+        remaining = finite_float(_pick(bucket, "remainingFraction", "remaining_fraction", default=1.0), 1.0)
+        remaining = max(0.0, min(1.0, remaining if remaining is not None else 1.0))
         entry = categories.setdefault(category, {"remaining": 1.0, "reset": None, "models": set()})
         entry["models"].add(model_id)
         if remaining < entry["remaining"]:
@@ -353,10 +364,14 @@ async def query_grok(channel: Channel) -> ChannelResult:
         return fail("error", "Grok 账单响应格式错误", source=cred.source, **base)
 
     config = data.get("config") or {}
+    if not isinstance(config, dict):
+        config = {}
     windows = []
     if isinstance(config, dict):
         used_pct = config.get("creditUsagePercent")
-        if isinstance(used_pct, (int, float)):
+        used_pct = finite_float(used_pct, None)
+        if used_pct is not None:
+            used_pct = max(0.0, min(100.0, used_pct))
             period = config.get("currentPeriod") or {}
             period_type = str(period.get("type") or "") if isinstance(period, dict) else ""
             key = "monthly" if "MONTH" in period_type.upper() else "weekly"
@@ -367,16 +382,28 @@ async def query_grok(channel: Channel) -> ChannelResult:
                     label,
                     used_percent=float(used_pct),
                     remaining_percent=max(0.0, 100 - float(used_pct)),
-                    reset_at=to_ts(period.get("end")),
+                    reset_at=to_ts(period.get("end")) if isinstance(period, dict) else None,
                 )
             )
         # 产品维度分解
-        for product in config.get("productUsage") or []:
+        products = config.get("productUsage") or []
+        if not isinstance(products, list):
+            products = []
+        for product in products:
             if not isinstance(product, dict):
                 continue
             name = str(product.get("product") or product.get("name") or "其他")
-            pct = product.get("creditUsagePercent") or product.get("usagePercent") or product.get("usedPercent")
-            if isinstance(pct, (int, float)):
+            pct = next(
+                (
+                    product.get(key)
+                    for key in ("creditUsagePercent", "usagePercent", "usedPercent")
+                    if product.get(key) is not None
+                ),
+                None,
+            )
+            pct = finite_float(pct, None)
+            if pct is not None:
+                pct = max(0.0, min(100.0, pct))
                 windows.append(
                     window(
                         "custom",
@@ -388,21 +415,22 @@ async def query_grok(channel: Channel) -> ChannelResult:
         # 充值余额
         prepaid = config.get("prepaidBalance")
         if isinstance(prepaid, dict) and prepaid.get("val") is not None:
-            cents = float(prepaid["val"])
-            windows.append(
-                window(
-                    "credits",
-                    "充值余额 (Credits)",
-                    used_percent=None,
-                    remaining_percent=None,
-                    used_label=None,
-                    max_label=f"${cents / 100:,.2f}",
+            cents = finite_float(prepaid["val"], None)
+            if cents is not None:
+                windows.append(
+                    window(
+                        "credits",
+                        "充值余额 (Credits)",
+                        used_percent=None,
+                        remaining_percent=None,
+                        used_label=None,
+                        max_label=f"${cents / 100:,.2f}",
+                    )
                 )
-            )
         # 兼容遗留字段
         if not windows and config.get("monthlyLimit"):
-            limit = float(config["monthlyLimit"])
-            used = float(config.get("used") or 0)
+            limit = finite_float(config["monthlyLimit"], 0.0) or 0.0
+            used = finite_float(config.get("used"), 0.0) or 0.0
             windows.append(
                 window(
                     "monthly",
@@ -456,6 +484,8 @@ async def query_codex(channel: Channel) -> ChannelResult:
     if not isinstance(data, dict):
         return fail("error", "Codex 额度响应格式错误", source=cred.source, **base)
     rate_limit = data.get("rate_limit") or {}
+    if not isinstance(rate_limit, dict):
+        rate_limit = {}
     windows = []
     for key in ("primary_window", "secondary_window"):
         item = rate_limit.get(key)
@@ -465,8 +495,10 @@ async def query_codex(channel: Channel) -> ChannelResult:
         duration = item.get("limit_window_seconds")
         if used is None or not duration:
             continue
-        used = float(used)
-        duration = float(duration)
+        used = finite_float(used, None)
+        duration = finite_float(duration, None)
+        if used is None or duration is None:
+            continue
         if abs(duration - 5 * 3600) < 60:
             tier, label = "five_hour", "每 5 小时"
         elif abs(duration - 7 * 86400) < 60:
@@ -532,13 +564,11 @@ async def query_copilot(channel: Channel) -> ChannelResult:
     else:
         notes.append("响应中没有 quota_snapshots 字段（可能是企业版额度或接口已变更）")
 
-    reset_date = data.get("quota_reset_date")
-    reset_ts = None
-    if isinstance(reset_date, str):
-        try:
-            reset_ts = int(datetime.fromisoformat(reset_date).timestamp() * 1000)
-        except ValueError:
-            pass
+    # 用统一的 to_ts 归一：offset-less 串按 UTC 解释（与 volcengine 等其他 provider
+    # 一致），不能用 datetime.fromisoformat(...).timestamp()——后者对 naive 串按进程
+    # 本地时区解释，国内（UTC+8）部署会让重置倒计时偏移最多 8 小时。to_ts 对非法串
+    # 返回 None，语义与原 try/except ValueError 一致。
+    reset_ts = to_ts(data.get("quota_reset_date"))
     if reset_ts is not None:
         # quota_reset_date 是全局下一次重置时间，补到还没有各自 reset_at 的窗口上
         for w in windows:
@@ -606,23 +636,22 @@ def _parse_copilot_quota_snapshots(snapshots: dict, windows: list) -> None:
         percent_remaining = item.get("percent_remaining")
         entitlement = item.get("entitlement")
         remaining = item.get("remaining")
-        if percent_remaining is None and entitlement and remaining is not None:
-            try:
-                percent_remaining = float(remaining) / float(entitlement) * 100
-            except (TypeError, ValueError, ZeroDivisionError):
-                percent_remaining = None
+        entitlement_value = finite_float(entitlement, None)
+        remaining_value = finite_float(remaining, None)
+        if percent_remaining is None and entitlement_value and remaining_value is not None:
+            percent_remaining = remaining_value / entitlement_value * 100
         if percent_remaining is None:
             continue
-        percent_remaining = max(0.0, min(100.0, float(percent_remaining)))
+        percent_remaining = finite_float(percent_remaining, None)
+        if percent_remaining is None:
+            continue
+        percent_remaining = max(0.0, min(100.0, percent_remaining))
 
         used_label = max_label = None
-        if entitlement is not None and remaining is not None:
-            try:
-                used_count = float(entitlement) - float(remaining)
-                used_label = f"{used_count:,.0f}"
-                max_label = f"{float(entitlement):,.0f}"
-            except (TypeError, ValueError):
-                pass
+        if entitlement_value is not None and remaining_value is not None:
+            used_count = entitlement_value - remaining_value
+            used_label = f"{used_count:,.0f}"
+            max_label = f"{entitlement_value:,.0f}"
 
         windows.append(
             window(
@@ -641,8 +670,8 @@ def _merge_copilot_usage(usage: dict, windows: list) -> None:
         item = usage.get(tier)
         if not isinstance(item, dict):
             continue
-        used = item.get("total_requests") or 0
-        limit = item.get("limit") or 0
+        used = finite_float(item.get("total_requests"), 0.0) or 0.0
+        limit = finite_float(item.get("limit"), 0.0) or 0.0
         if limit:
             label = {
                 "chat": "Chat 请求",
@@ -654,9 +683,9 @@ def _merge_copilot_usage(usage: dict, windows: list) -> None:
                 window(
                     "custom",
                     label,
-                    used_percent=float(used) / float(limit) * 100,
-                    remaining_percent=(1 - float(used) / float(limit)) * 100,
-                    used_label=f"{used:,}",
-                    max_label=f"{limit:,}",
+                    used_percent=used / limit * 100,
+                    remaining_percent=(1 - used / limit) * 100,
+                    used_label=f"{used:,.0f}",
+                    max_label=f"{limit:,.0f}",
                 )
             )

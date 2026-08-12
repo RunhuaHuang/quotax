@@ -5,7 +5,7 @@ NormalizedRecord 列表（已去重、已 cache-inclusive 归一化），由 sto
 
 参考 Buktal/VaultOne 的 source_parser 设计：
 - JSONL 源记 (mtime, line_offset) 游标，只读游标之后的新行；
-- SQLite 源（opencode）记水位线，只查 time_updated > watermark 的行；
+- SQLite 源（opencode）优先按 SQLite rowid 增量；旧游标迁移时兼容时间戳水位线；
 - 各源 input 若含 cache（Codex / Gemini / Grok），解析时减去 cache_read 得真实 input。
 
 NormalizedRecord 字段与 store.upsert_records 的 records 项对齐（除 source 外）。

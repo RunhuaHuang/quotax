@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 
 
@@ -84,6 +85,96 @@ def test_claude_parser_incremental_skips_unchanged(monkeypatch, tmp_path):
     assert len(second.records) == 0
 
 
+def test_claude_parser_scans_append_when_mtime_is_unchanged(monkeypatch, tmp_path):
+    """文件系统 mtime 精度较粗时，追加的新行不能因 mtime 未变而漏采。"""
+    store = _setup_db(monkeypatch, tmp_path)
+    from app.usage.parsers import claude as claude_mod
+
+    proj = tmp_path / "p"
+    proj.mkdir()
+    session = proj / "s.jsonl"
+    first = {
+        "type": "assistant",
+        "timestamp": "2026-08-01T10:00:00.000Z",
+        "message": {"id": "m1", "model": "claude-sonnet-5", "usage": {"input_tokens": 10, "output_tokens": 5}},
+    }
+    second = {
+        "type": "assistant",
+        "timestamp": "2026-08-01T10:01:00.000Z",
+        "message": {"id": "m2", "model": "claude-sonnet-5", "usage": {"input_tokens": 20, "output_tokens": 6}},
+    }
+    session.write_text(json.dumps(first) + "\n", encoding="utf-8")
+    monkeypatch.setattr(claude_mod, "CLAUDE_PROJECTS_DIR", tmp_path)
+    parser = claude_mod.ClaudeParser()
+    assert len(parser.collect_incremental().records) == 1
+    cursor = store.get_cursor("claude_code", str(session))
+    assert cursor is not None
+
+    original_mtime = cursor["last_modified_ns"]
+    with session.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(second) + "\n")
+    # 模拟粗粒度 mtime：内容变长，但 mtime 与旧游标保持一致。
+    os.utime(session, ns=(original_mtime, original_mtime))
+
+    result = parser.collect_incremental()
+    assert [record.uuid for record in result.records] == ["claude:m2"]
+
+
+def test_claude_parser_rewinds_cursor_after_same_mtime_truncation(monkeypatch, tmp_path):
+    """日志被重写且 mtime 恰好未变时，越界游标也必须回到文件开头。"""
+    store = _setup_db(monkeypatch, tmp_path)
+    from app.usage.parsers import claude as claude_mod
+
+    proj = tmp_path / "p"
+    proj.mkdir()
+    session = proj / "s.jsonl"
+    first = {
+        "type": "assistant",
+        "timestamp": "2026-08-01T10:00:00.000Z",
+        "message": {"id": "old", "model": "m", "usage": {"input_tokens": 10, "output_tokens": 5}},
+        "padding": "x" * 500,
+    }
+    session.write_text(json.dumps(first) + "\n", encoding="utf-8")
+    monkeypatch.setattr(claude_mod, "CLAUDE_PROJECTS_DIR", tmp_path)
+    parser = claude_mod.ClaudeParser()
+    assert len(parser.collect_incremental().records) == 1
+    cursor = store.get_cursor("claude_code", str(session))
+    assert cursor is not None
+    original_mtime = cursor["last_modified_ns"]
+
+    rewritten = {
+        "type": "assistant",
+        "timestamp": "2026-08-01T10:01:00.000Z",
+        "message": {"id": "new", "model": "m", "usage": {"input_tokens": 20, "output_tokens": 6}},
+    }
+    session.write_text(json.dumps(rewritten) + "\n", encoding="utf-8")
+    os.utime(session, ns=(original_mtime, original_mtime))
+
+    result = parser.collect_incremental()
+    assert [r.uuid for r in result.records] == ["claude:new"]
+
+
+def test_claude_fallback_uuid_includes_line_offset(monkeypatch, tmp_path):
+    """旧版无 message.id 的同毫秒回复不能互相覆盖。"""
+    _setup_db(monkeypatch, tmp_path)
+    from app.usage.parsers import claude as claude_mod
+
+    project = tmp_path / "p"
+    project.mkdir()
+    session = project / "s.jsonl"
+    base = {
+        "type": "assistant",
+        "timestamp": "2026-08-01T10:00:00Z",
+        "message": {"model": "claude-sonnet-5", "usage": {"input_tokens": 1, "output_tokens": 2}},
+    }
+    session.write_text(json.dumps(base) + "\n" + json.dumps(base) + "\n", encoding="utf-8")
+    monkeypatch.setattr(claude_mod, "CLAUDE_PROJECTS_DIR", tmp_path)
+
+    records = claude_mod.ClaudeParser().collect_incremental().records
+    assert len(records) == 2
+    assert len({r.uuid for r in records}) == 2
+
+
 def test_codex_parser_event_msg_token_count(monkeypatch, tmp_path):
     """Codex：token 在 event_msg + payload.type=token_count 的 last_token_usage 里。
 
@@ -131,6 +222,50 @@ def test_codex_parser_event_msg_token_count(monkeypatch, tmp_path):
     assert rec.output_tokens == 353
 
 
+def test_codex_incremental_scan_restores_model_context(monkeypatch, tmp_path):
+    """追加 token_count 没有新的 turn_context 时仍沿用上一轮模型。"""
+    store = _setup_db(monkeypatch, tmp_path)
+    from app.usage.parsers import codex as codex_mod
+
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    f = sessions / "rollout-context.jsonl"
+
+    def token(ts: str, value: int) -> dict:
+        usage = {
+            "input_tokens": value,
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1,
+            "reasoning_output_tokens": 0,
+        }
+        return {
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"last_token_usage": usage}},
+        }
+
+    f.write_text(
+        json.dumps({"type": "turn_context", "payload": {"model": "provider::gpt-special"}})
+        + "\n"
+        + json.dumps(token("2026-08-01T10:00:00Z", 10))
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(codex_mod, "CODEX_SESSIONS_DIR", sessions)
+    monkeypatch.setattr(codex_mod, "CODEX_ARCHIVED_DIR", tmp_path / "archived")
+    parser = codex_mod.CodexParser()
+    assert parser.collect_incremental().records[0].model == "gpt-special"
+    cursor = store.get_cursor("codex", str(f))
+    assert cursor["last_model"] == "gpt-special"
+
+    with f.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(token("2026-08-01T10:00:01Z", 20)) + "\n")
+    appended = parser.collect_incremental().records
+    assert len(appended) == 1
+    assert appended[0].model == "gpt-special"
+
+
 def test_opencode_parser_from_session_table(monkeypatch, tmp_path):
     """OpenCode：新版 session 表带聚合列，按水位线增量。"""
     _setup_db(monkeypatch, tmp_path)
@@ -158,6 +293,75 @@ def test_opencode_parser_from_session_table(monkeypatch, tmp_path):
     assert rec.input_tokens == 100
     assert rec.cache_read == 50
     assert "llama" in rec.model
+
+
+def test_opencode_message_rowid_cursor_handles_same_timestamp_and_numeric_string(monkeypatch, tmp_path):
+    """旧 message.data 版本按 rowid 增量，不漏同毫秒新增消息。"""
+    store = _setup_db(monkeypatch, tmp_path)
+    from app.usage.parsers import opencode as oc_mod
+
+    db = tmp_path / "opencode-old.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE session (id TEXT PRIMARY KEY, time_updated TEXT);
+        CREATE TABLE message (session_id TEXT, data TEXT);
+        INSERT INTO session VALUES ('s1', '1722507600');
+        """
+    )
+    payload = {
+        "role": "assistant",
+        "modelID": "gpt-old",
+        "tokens": {"input": 10, "output": 2, "cache": {"read": 1, "write": 0}},
+        "time": {"created": "1722507600"},
+    }
+    conn.execute("INSERT INTO message VALUES (?, ?)", ("s1", json.dumps(payload)))
+    conn.execute("INSERT INTO message VALUES (?, ?)", ("s1", json.dumps(payload)))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(oc_mod, "_db_path", lambda: db)
+
+    parser = oc_mod.OpenCodeParser()
+    first = parser.collect_incremental().records
+    assert len(first) == 2
+    assert len({r.uuid for r in first}) == 2
+    assert first[0].timestamp_ms == 1722507600000
+    cursor = store.get_cursor("opencode", str(db))
+    assert cursor["watermark_rowid"] == 2
+
+    conn = sqlite3.connect(str(db))
+    conn.execute("INSERT INTO message VALUES (?, ?)", ("s1", json.dumps(payload)))
+    conn.commit()
+    conn.close()
+    second = parser.collect_incremental().records
+    assert len(second) == 1
+    assert second[0].uuid.endswith(":3")
+
+
+def test_grok_fallback_uuid_includes_line_offset(monkeypatch, tmp_path):
+    """旧版 Grok 事件缺 prompt_id 时，同时间戳记录也要分别保留。"""
+    _setup_db(monkeypatch, tmp_path)
+    from app.usage.parsers import grok as grok_mod
+
+    session_dir = tmp_path / "sessions" / "encoded-cwd" / "session-1"
+    session_dir.mkdir(parents=True)
+    (session_dir / "summary.json").write_text(json.dumps({"model": "grok-4"}), encoding="utf-8")
+    event = {
+        "method": "_x.ai/session/update",
+        "params": {
+            "sessionUpdate": "turn_completed",
+            "timestamp": "2026-08-01T10:00:00Z",
+            "usage": {"inputTokens": 10, "cachedReadTokens": 2, "outputTokens": 3},
+        },
+    }
+    updates = session_dir / "updates.jsonl"
+    updates.write_text(json.dumps(event) + "\n" + json.dumps(event) + "\n", encoding="utf-8")
+    monkeypatch.setattr(grok_mod, "GROK_SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(grok_mod, "GROK_ARCHIVED_DIR", tmp_path / "archived")
+
+    records = grok_mod.GrokParser().collect_incremental().records
+    assert len(records) == 2
+    assert len({r.uuid for r in records}) == 2
 
 
 def test_store_upsert_and_aggregate(monkeypatch, tmp_path):

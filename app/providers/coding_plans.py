@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from ..config import Channel
-from ..models import ChannelResult, fail, ok, to_ts, window
+from ..models import ChannelResult, fail, finite_float, ok, to_ts, window
 from ..net import ParseError, ResponseError, request_json
 from ._common import _require
 
 
 def _clamp(v: float) -> float:
-    return max(0.0, min(100.0, round(v, 1)))
+    safe = finite_float(v, 0.0) or 0.0
+    return max(0.0, min(100.0, round(safe, 1)))
 
 
 def _error_result(base: dict, e: Exception) -> ChannelResult:
@@ -57,9 +58,10 @@ async def query_kimi_coding(channel: Channel) -> ChannelResult:
     usage = data.get("usage") or {}
     if isinstance(usage, dict):
         remaining_raw = usage.get("remaining")
-        remaining = float(remaining_raw) if remaining_raw is not None else 0.0
+        remaining = finite_float(remaining_raw, 0.0) or 0.0
         used_raw = usage.get("used")
-        used = float(used_raw) if used_raw is not None else max(0.0, 100 - remaining)
+        used = finite_float(used_raw, max(0.0, 100 - remaining))
+        used = used if used is not None else max(0.0, 100 - remaining)
         windows.append(
             window(
                 "weekly",
@@ -70,21 +72,31 @@ async def query_kimi_coding(channel: Channel) -> ChannelResult:
             )
         )
 
-    for item in data.get("limits") or []:
+    limits = data.get("limits") or []
+    if not isinstance(limits, list):
+        limits = []
+    for item in limits:
+        if not isinstance(item, dict):
+            continue
         detail = item.get("detail") or {}
         if not isinstance(detail, dict):
             continue
         remaining_raw = detail.get("remaining")
-        remaining = float(remaining_raw) if remaining_raw is not None else 0.0
+        remaining = finite_float(remaining_raw, 0.0) or 0.0
         used_raw = detail.get("used")
-        used = float(used_raw) if used_raw is not None else max(0.0, 100 - remaining)
+        used = finite_float(used_raw, max(0.0, 100 - remaining))
+        used = used if used is not None else max(0.0, 100 - remaining)
         if remaining <= 1 and used <= 1:
             # 兼容绝对额度（limit/remaining 是请求数而非百分比）
-            limit = float(detail.get("limit") or 0)
+            limit = finite_float(detail.get("limit"), 0.0) or 0.0
             if limit > 0:
                 remaining = remaining / limit * 100
                 used = max(0.0, 100 - remaining)
         win_obj = item.get("window") or {}
+        if not isinstance(win_obj, dict):
+            # A malformed provider payload must become a skipped detail, not
+            # an AttributeError that masks all other valid quota windows.
+            win_obj = {}
         duration = win_obj.get("duration")
         unit = str(win_obj.get("timeUnit") or "")
         is_5h = (duration == 5 and unit == "TIME_UNIT_HOUR") or (duration == 300 and unit == "TIME_UNIT_MINUTE")
@@ -193,14 +205,19 @@ def _parse_zhipu_data(data, plan_name: str, base: dict) -> ChannelResult:
         return fail("error", "智谱响应格式错误", **base)
     if not data.get("success") or data.get("code") != 200:
         return fail("error", str(data.get("msg") or "智谱 Coding Plan 额度查询失败"), **base)
-    limits = (data.get("data") or {}).get("limits") or []
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        return fail("error", "智谱响应中的 data 格式错误", **base)
+    limits = payload.get("limits") or []
+    if not isinstance(limits, list):
+        return fail("error", "智谱响应中的 limits 格式错误", **base)
     windows = []
     token_limits = sorted(
-        [item for item in limits if item.get("type") == "TOKENS_LIMIT"],
+        [item for item in limits if isinstance(item, dict) and item.get("type") == "TOKENS_LIMIT"],
         key=lambda item: to_ts(item.get("nextResetTime")) or 0,
     )
     for i, item in enumerate(token_limits):
-        used = float(item.get("percentage") or 0)
+        used = finite_float(item.get("percentage"), 0.0) or 0.0
         unit = item.get("unit")
         if unit == 3 or (unit is None and i == 0):
             key, label = "five_hour", "每 5 小时"
@@ -249,13 +266,20 @@ async def query_minimax(channel: Channel) -> ChannelResult:
     if not isinstance(data, dict):
         return fail("error", "MiniMax 响应格式错误", **base)
     resp = data.get("base_resp") or {}
+    if not isinstance(resp, dict):
+        return fail("error", "MiniMax 响应中的 base_resp 格式错误", **base)
     if resp.get("status_code") not in (None, 0):
         return fail(
             "error",
             str(resp.get("status_msg") or "MiniMax Token Plan 额度查询失败"),
             **base,
         )
-    general = [item for item in (data.get("model_remains") or []) if item.get("model_name") == "general"]
+    model_remains = data.get("model_remains") or []
+    if not isinstance(model_remains, list):
+        model_remains = []
+    general = [
+        item for item in model_remains if isinstance(item, dict) and item.get("model_name") == "general"
+    ]
     if not general:
         return fail("error", "MiniMax Token Plan 未返回通用额度数据", **base)
     windows = []
@@ -263,7 +287,8 @@ async def query_minimax(channel: Channel) -> ChannelResult:
         # remaining_percent == 0（配额用尽）是有效值，绝不能用 `or 100` 兜底——
         # `0 or 100` 会求值成 100，把"已耗尽"误报成"完全没用过"。字段缺失才默认满额。
         interval_raw = item.get("current_interval_remaining_percent")
-        interval = float(interval_raw) if interval_raw is not None else 100.0
+        interval = finite_float(interval_raw, 100.0)
+        interval = interval if interval is not None else 100.0
         windows.append(
             window(
                 "five_hour",
@@ -281,7 +306,7 @@ async def query_minimax(channel: Channel) -> ChannelResult:
         # `or 100`——那会再次把 0（配额用尽）篡改成 100。月额度：上游目前只返回
         # 5 小时 + 每周两档，没有月字段。
         if item.get("current_weekly_remaining_percent") is not None:
-            weekly = float(item.get("current_weekly_remaining_percent"))
+            weekly = finite_float(item.get("current_weekly_remaining_percent"), 0.0) or 0.0
             windows.append(
                 window(
                     "weekly",
@@ -324,6 +349,8 @@ async def query_zenmux(channel: Channel) -> ChannelResult:
         message = (data or {}).get("message") if isinstance(data, dict) else ""
         return fail("error", f"ZenMux API 错误: {message or '未知'}", **base)
     info = data.get("data") or {}
+    if not isinstance(info, dict):
+        return fail("error", "ZenMux 额度响应中的 data 格式错误", **base)
     windows = []
     for key, label, tier in [
         ("quota_5_hour", "每 5 小时", "five_hour"),
@@ -336,18 +363,20 @@ async def query_zenmux(channel: Channel) -> ChannelResult:
         # usage_percentage 可能传 0-1 小数比例，也可能直接传 0-100 的整数百分比。
         # 上游偶发返回 >100 的脏值——这里用 _clamp 兜底归一；同时按 raw 值大小
         # 判断口径：≤1 视为小数比例（×100），>1 视为直接百分比，避免把 50 当成 50%。
-        raw = float(item.get("usage_percentage") or 0)
+        raw = finite_float(item.get("usage_percentage"), 0.0) or 0.0
         used_pct = _clamp(raw * 100 if raw <= 1 else raw)
         used_usd = item.get("used_value_usd")
         max_usd = item.get("max_value_usd")
+        used_value = finite_float(used_usd, None)
+        max_value = finite_float(max_usd, None)
         windows.append(
             window(
                 tier,
                 label,
                 used_percent=used_pct,
                 remaining_percent=max(0.0, 100 - used_pct),
-                used_label=f"${float(used_usd):,.2f}" if used_usd is not None else None,
-                max_label=f"${float(max_usd):,.2f}" if max_usd is not None else None,
+                used_label=f"${used_value:,.2f}" if used_value is not None else None,
+                max_label=f"${max_value:,.2f}" if max_value is not None else None,
                 reset_at=to_ts(item.get("resets_at")),
             )
         )

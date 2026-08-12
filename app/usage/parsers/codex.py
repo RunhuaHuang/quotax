@@ -17,16 +17,17 @@
 cache-inclusive 归一化：input_tokens 包含 cached_input_tokens 部分，解析时减去得
 "新鲜 input"，与 Claude Code 口径对齐。
 
-游标：(mtime_ns, line_offset)，JSONL 追加写。
+游标：(mtime_ns, line_offset, last_model)，JSONL 追加写；增量起点没有新的
+turn_context 时恢复游标保存的模型上下文。
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
 from pathlib import Path
 
+from ...models import to_ts
 from .. import store
 from . import BaseParser, CollectResult, NormalizedRecord
 
@@ -37,10 +38,13 @@ CODEX_ARCHIVED_DIR = Path.home() / ".codex" / "archived_sessions"
 
 
 def _safe_int(v, default=0) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
+    if isinstance(v, bool):
         return default
+    try:
+        converted = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(0, converted)
 
 
 def _norm_model(model: str) -> str:
@@ -85,18 +89,39 @@ class CodexParser(BaseParser):
         stat = file_path.stat()
         mtime_ns = stat.st_mtime_ns
         cursor = store.get_cursor(self.source, str(file_path))
-        if cursor and cursor.get("last_modified_ns") == mtime_ns:
-            return
         offset = cursor.get("last_line_offset", 0) if cursor else 0
+        rewound = offset < 0 or offset > stat.st_size
+        if rewound:
+            offset = 0
+        # mtime 精度较粗时，追加内容可能暂时保持同一 mtime；文件大小变化仍应
+        # 触发增量扫描，不能只看 mtime。
+        if (
+            cursor
+            and cursor.get("last_modified_ns") == mtime_ns
+            and not rewound
+            and stat.st_size == offset
+        ):
+            return
 
         records: list[NormalizedRecord] = []
-        current_model: str | None = None
+        # Incremental scans start in the middle of a session file. Restore the
+        # model active at that boundary; otherwise a token_count event without
+        # a preceding turn_context is incorrectly priced as the gpt-5 default.
+        if offset > 0 and not rewound:
+            saved_model = cursor.get("last_model") if cursor else None
+            current_model = str(saved_model) if saved_model else self._restore_model(file_path, offset)
+        else:
+            current_model = None
         truncated = False
 
         with file_path.open("r", encoding="utf-8", errors="replace") as f:
             if offset > 0:
                 f.seek(offset)
-            for raw_line in f:
+            while True:
+                line_offset = f.tell()
+                raw_line = f.readline()
+                if not raw_line:
+                    break
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -154,7 +179,9 @@ class CodexParser(BaseParser):
 
                 records.append(
                     NormalizedRecord(
-                        uuid=f"{session_id}:{ts_ms}",
+                        # 同一会话可能在同一毫秒产生多条 token_count；文件内字节偏移
+                        # 稳定且唯一，避免仅用时间戳导致后续记录被去重丢弃。
+                        uuid=f"{session_id}:{ts_ms}:{line_offset}",
                         timestamp_ms=ts_ms,
                         model=str(current_model or "gpt-5"),
                         session_id=session_id,
@@ -167,21 +194,49 @@ class CodexParser(BaseParser):
             new_offset = offset if truncated else f.tell()
 
         store.set_cursor(
-            self.source, str(file_path), last_modified_ns=mtime_ns, last_line_offset=new_offset
+            self.source,
+            str(file_path),
+            last_modified_ns=mtime_ns,
+            last_line_offset=new_offset,
+            # Empty string deliberately clears a stale model after a rewritten
+            # file with no turn_context; store treats None as "leave unchanged"
+            # for partial cursor updates from other parsers.
+            last_model=current_model if current_model is not None else "",
         )
         result.records.extend(records)
 
+    @staticmethod
+    def _restore_model(file_path: Path, offset: int) -> str | None:
+        """Replay only the prefix needed to recover the last turn_context."""
+        model: str | None = None
+        try:
+            with file_path.open("r", encoding="utf-8", errors="replace") as f:
+                while True:
+                    line_start = f.tell()
+                    raw_line = f.readline()
+                    if not raw_line:
+                        break
+                    line_end = f.tell()
+                    # Cursors are recorded at complete-line boundaries. If an
+                    # old/corrupt cursor points inside a line, do not consume
+                    # that line as historical context.
+                    if line_start >= offset or line_end > offset:
+                        break
+                    try:
+                        entry = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(entry, dict) or entry.get("type") != "turn_context":
+                        continue
+                    payload = entry.get("payload")
+                    candidate = payload.get("model") if isinstance(payload, dict) else None
+                    if isinstance(candidate, str) and candidate:
+                        model = _norm_model(candidate)
+        except OSError:
+            return None
+        return model
+
 
 def _parse_ts(value) -> int | None:
-    """codex 时间戳兼容 epoch 秒 / 毫秒 / ISO8601。"""
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        v = int(value)
-        return v if v > 1_000_000_000_000 else v * 1000  # < 1e12 视为秒
-    if isinstance(value, str):
-        try:
-            return int(datetime.fromisoformat(value).timestamp() * 1000)
-        except ValueError:
-            return None
-    return None
+    """codex 时间戳兼容 epoch 秒 / 毫秒 / 数字字符串 / ISO8601。"""
+    return to_ts(value)

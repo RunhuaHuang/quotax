@@ -20,10 +20,10 @@ Top: subscription usage (Claude / Codex / OpenCode, auto-reading local CLI login
 - **Zero-key subscriptions + auto-detect**: Reads local CLI credentials (Claude / Gemini / Grok / Codex / Copilot) — **no refresh, no write**, sharing the same login state as your agent. On startup it auto-detects locally logged-in CLIs and creates channels for them — no manual setup needed.
 - **Usage analytics dashboard**: A dedicated tab with SQLite-persisted incremental collection — four-bucket token overview, cache hit rate, daily trend curves, model distribution, per-request log, cost estimation (LiteLLM pricing + rebill).
 - **Codex OAuth in-browser**: ChatGPT subscriptions support one-click "Login with ChatGPT" OAuth — automatically obtains credentials and creates the channel.
-- **Per-channel cache + request coalescing**: 60s on success / 15s on failure; concurrent queries to the same channel hit the upstream only once.
+- **Per-channel cache + request coalescing**: 5 minutes on success / 15 minutes on failure; concurrent queries to the same channel hit the upstream only once, and manual refresh bypasses the cache.
 - **Drag-to-reorder**: Cards can be dragged to customize order; persisted to browser `localStorage`.
 - **History trends**: Each successful query records a data point; SVG line charts show balance / remaining-percent over time.
-- **Low-balance alerts**: Set a remaining-percent threshold per channel; cards turn orange and the summary chip counts alerts when below.
+- **Browser-independent monitoring**: Thresholds persist in the backend; optional desktop/Webhook alerts, cooldowns, and recovery notifications keep working after the browser closes (off by default until explicitly enabled).
 - **Bilingual (zh / en)**: Toggle between Simplified Chinese and English with one click.
 - **Dark / light theme**: Follow system or set manually.
 - **CLI tool**: `quotaboard quota --brief` one-line summary, great for tmux statusbar / shell prompts.
@@ -57,7 +57,7 @@ irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
 >   ```powershell
 >   $env:QUOTAX_MIRROR='https://ghfast.top'; irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
 >   ```
-> - **Upgrade**: just re-run the same command; personal data (`config.json` / `usage.db` / `history/`) is preserved.
+> - **Upgrade**: just re-run the same command; personal data (`config.json` / `monitor-state.json` / `usage.db` / `history/`) is preserved.
 
 ### Opening later
 
@@ -151,14 +151,16 @@ Reads only local AI CLI log files / databases — no network requests:
 | Source | Path | Format | Notes |
 | --- | --- | --- | --- |
 | Claude Code | `~/.claude/projects/*/*.jsonl` | JSONL | `type=assistant` lines' `message.usage`, deduped by `message.id` |
-| Codex | `~/.codex/sessions/**/*.jsonl` + `archived_sessions/*.jsonl` | JSONL | `token_count` events; cumulative tokens need delta; input includes cache |
+| Codex | `~/.codex/sessions/**/*.jsonl` + `archived_sessions/*.jsonl` | JSONL | `token_count` events use incremental `last_token_usage`; input includes cache |
 | Gemini CLI | `~/.gemini/tmp/<hash>/chats/session-*.json` | single JSON | `role=model` messages; input includes cache; output includes thoughts |
 | Grok CLI | `~/.grok/sessions/<cwd>/<uuid>/updates.jsonl` | JSONL (JSON-RPC) | `turn_completed` event's `usage`; input includes cache |
 | OpenCode | `~/.local/share/opencode/opencode.db` | SQLite | new version reads session aggregate columns; old version parses message.data JSON |
 
 **Cache-inclusive normalization**: Codex / Gemini / Grok input fields all include cache-hit portions; parsing subtracts `cache_read` to get "fresh input", aligning with Claude Code's semantics.
 
-**Incremental collection**: JSONL sources record a `(mtime, line_offset)` cursor per file and read only new lines past the cursor; truncated lines (concurrent writes) keep the old cursor for next read. The SQLite source (opencode) records a watermark. Re-collection is idempotent (`INSERT OR IGNORE` dedup by primary key), producing no duplicate records.
+**Incremental collection**: JSONL sources record a `(mtime, line_offset)` cursor per file and read only new lines past the cursor; Codex also persists the model context at the cursor boundary. Truncated lines (concurrent writes) keep the old cursor for the next read. The SQLite source (OpenCode) uses rowid cursors; mutable session aggregates re-read the last row and update its stored record, while legacy timestamp cursors are migrated once. Re-collection is idempotent (deduplication or aggregate upsert by primary key), producing no duplicate records.
+
+The usage overview, trend, model distribution, request log, and model filters all use the same **UTC calendar-day window**. A 14-day view includes today plus the previous 13 UTC calendar days, so the dashboard sections cannot drift because of rolling 24-hour cutoffs.
 
 ### Frontend dashboard
 
@@ -199,14 +201,20 @@ Click the top-bar "Trend" button. Each successful quota query records a data poi
 
 ![Settings modal](docs/settings-modal.png)
 
-Set a "remaining-percent threshold" per channel in the settings modal. When below: card border turns orange, status dot turns red; the top-bar summary chip shows a "Low" count. Thresholds are browser-local only and don't affect backend queries.
+Set a remaining-percent threshold per channel in Settings. Thresholds persist in the local `config.json`; thresholds left in older browser `localStorage` are migrated once automatically. Below the threshold, the card turns orange/red and the top summary shows a Low count.
+
+Background monitoring is off by default. Once explicitly enabled, the QuotaX service checks on the configured interval through the same cache/request-coalescing path, so it keeps working after the browser closes. It supports system desktop notifications, an optional Webhook, repeat-alert cooldowns, and recovery events. Active-alert/cooldown state lives in `monitor-state.json`, preventing a restart from immediately re-alerting everything.
+
+Webhooks receive `{"source":"QuotaX","version":1,"event":{...}}`; `event.type` is `alert` or `recovered`. Since signed URLs are secrets, redacted exports remove the Webhook URL.
+
+The same settings page controls local usage-history retention. At most once per day, QuotaX removes expired `usage.db` records and scan cursors for log files that no longer exist.
 
 ## Config import / export
 
 At the bottom of the config modal:
 
-- **Export (with secrets)**: exports the full `config.json` (plaintext API Keys) for personal backup / migration. Keep it safe.
-- **Export (redacted)**: exports the channel structure without secrets (type / name / base_url etc.), safe to share.
+- **Export (with secrets)**: exports the full configuration, including plaintext API Keys and Webhook URL, for backup / migration. Keep it safe.
+- **Export (redacted)**: exports channel/monitoring structure without credentials or Webhook URL, safe to share.
 - **Import**: choose **merge** (append to existing, same-id overwrites — safer, recommended) or **replace** (clears all existing channels first).
 
 ## Non-intrusive login design
@@ -230,12 +238,22 @@ Exit codes: `0` all OK; `1` has error/expired channels; `2` config corrupted or 
 
 ## Caching
 
-To avoid bothering upstream APIs too often, each channel's query result has an independent in-process cache: **60s on success, 15s on failure**. Concurrent queries to the same channel within the cache TTL coalesce into one upstream request (dedup / in-flight reuse). Click the top-bar "Refresh" button to force-bypass the cache for a real query.
+To avoid bothering upstream APIs too often, each channel's query result has an independent in-process cache: **5 minutes on success, 15 minutes on failure**. The longer failure cooldown prevents automatic refreshes from amplifying rate limits or transient network errors. Concurrent queries to the same channel coalesce into one upstream request (dedup / in-flight reuse). Click the top-bar "Refresh" button to force-bypass the cache for a real query.
+
+Each card labels its own freshness as Live, Cached, Stale data, or Saved snapshot, together with data age. This remains accurate when only some channels hit cache.
+
+## Diagnostics
+
+- `GET /api/health`: version, config status, SQLite size/records, latest collection, and monitor state;
+- `GET /api/monitor/status`: scheduler state, previous/next run, active alerts, and latest error;
+- `POST /api/monitor/run`: run an immediate check (force refresh by default);
+- `GET /api/usage/status` / `POST /api/usage/cleanup`: local usage collection and retention diagnostics.
 
 ## Security
 
 - The service **listens only on `127.0.0.1`** — never exposed externally.
-- All credentials (API Key / AK·SK / Cookie) are stored only in local `config.json` (permissions `600`), never sent to any third party.
+- API Keys / AK·SK / Cookies are stored only in local `config.json` (permissions `600`); uploaded or OAuth-generated Codex `auth.json` files live under `credentials/` beside it (directory `700`, files `600`). During a query, credentials are sent only to the user-configured provider, never through a QuotaX-owned server.
+- Background monitoring is off by default. Alerts go only to desktop/Webhook destinations explicitly enabled by the user; redacted exports remove the Webhook URL.
 - Subscription channels only read local CLI credentials — no refresh, no write.
 - Redirects are not followed by default (`follow_redirects: false`), preventing malicious base_url 3xx redirects from leaking the Authorization header.
 - DNS-rebinding protection: request Host header is validated against a whitelist, preventing malicious web pages from cross-origin reading of local endpoints.
@@ -246,7 +264,7 @@ To avoid bothering upstream APIs too often, each channel's query result has an i
 git clone https://github.com/RunhuaHuang/quotax.git
 cd quotax
 uv sync                      # install deps (reuses local Python 3.11+)
-uv run pytest                # run tests (249 cases)
+uv run pytest                # run the full backend test suite
 uv run uvicorn app.main:app --port 8900   # start dev server
 ```
 

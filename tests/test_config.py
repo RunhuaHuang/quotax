@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import threading
 
 import pytest
 
@@ -158,6 +159,45 @@ def test_upsert_channel_without_provided_fields_falls_back_to_legacy_behavior(
     assert updated.name == "DeepSeek 账户余额"  # 未受保护字段按旧行为回退成默认名
 
 
+def test_concurrent_upserts_do_not_lose_channels(isolated_config, monkeypatch):
+    """两个线程同时做读改写时必须串行，否则后写者会用旧快照覆盖先写者。"""
+    original_save = config_store._save_raw
+    first_save_entered = threading.Event()
+    release_first_save = threading.Event()
+    second_done = threading.Event()
+
+    def controlled_save(data):
+        if not first_save_entered.is_set():
+            first_save_entered.set()
+            assert release_first_save.wait(timeout=2)
+        original_save(data)
+
+    monkeypatch.setattr(config_store, "_save_raw", controlled_save)
+
+    def add(channel_id):
+        config_store.upsert_channel(
+            {"id": channel_id, "type": "deepseek", "api_key": f"sk-{channel_id}"},
+            provided_fields={"id", "type", "api_key"},
+        )
+        if channel_id == "ch_b":
+            second_done.set()
+
+    first = threading.Thread(target=add, args=("ch_a",))
+    second = threading.Thread(target=add, args=("ch_b",))
+    first.start()
+    assert first_save_entered.wait(timeout=1)
+    second.start()
+
+    # 第一笔事务还停在写入前时，第二笔不能越过完整的读改写锁。
+    assert not second_done.wait(timeout=0.1)
+    release_first_save.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert {c.id for c in config_store.list_channels()} == {"ch_a", "ch_b"}
+
+
 # ── 原子写 / 损坏恢复 ──────────────────────────────────────────
 
 
@@ -240,6 +280,13 @@ def test_load_raw_corrupted_persists_across_reads(isolated_config):
     # 第一次读取：报错
     with pytest.raises(config_store.ConfigCorruptedError):
         config_store._load_raw()
+
+
+@pytest.mark.parametrize("channels", [{"id": "not-a-list"}, ["not-an-object"]])
+def test_load_raw_rejects_invalid_channels_structure(isolated_config, channels):
+    isolated_config.write_text(json.dumps({"channels": channels}), encoding="utf-8")
+    with pytest.raises(config_store.ConfigCorruptedError, match="channels"):
+        config_store._load_raw()
     # 第二次读取：仍然报错（没有回退成空配置）
     with pytest.raises(config_store.ConfigCorruptedError):
         config_store._load_raw()
@@ -269,6 +316,71 @@ def test_extra_field_round_trips(isolated_config):
     assert reloaded.extra == {"note": "hello"}
 
 
+def test_safe_export_redacts_nested_sensitive_extra_values(isolated_config):
+    """Cookie/Token 藏在嵌套 extra 中时，安全导出也不能泄露。"""
+    config_store.upsert_channel(
+        {
+            "type": "deepseek",
+            "api_key": "sk-real",
+            "extra": {
+                "profile": {"cookie": "auth=TOP-SECRET", "note": "keep"},
+                "items": [{"access_token": "AT-SECRET", "refreshToken": "RT-SECRET"}, {"label": "ok"}],
+                "codex_auth_file": "credentials/codex_ch1.json",
+            },
+        },
+        provided_fields={"type", "api_key", "extra"},
+    )
+    safe = config_store.export_config(include_secrets=False)
+    extra = safe["channels"][0]["extra"]
+    assert extra["profile"]["cookie"] == "[REDACTED]"
+    assert extra["items"][0]["access_token"] == "[REDACTED]"
+    assert extra["items"][0]["refreshToken"] == "[REDACTED]"
+    assert extra["profile"]["note"] == "keep"
+    assert extra["codex_auth_file"] == "credentials/codex_ch1.json"
+
+
+def test_upsert_channel_restores_redacted_extra_values(isolated_config):
+    """GET 脱敏后的 extra（含 [REDACTED] 占位符）被原样 PUT 回来时，必须从旧值
+    恢复真实 Cookie/Token，不能把占位符当真实凭据写入。这与 import_config 的
+    _restore_redacted_values 行为一致，也与 api_key 的打码回传保护对称——之前
+    upsert 只保护了 api_key/ak/sk 三个顶层密钥，漏了 extra 里的嵌套凭据。"""
+    created = config_store.upsert_channel(
+        {
+            "type": "deepseek",
+            "api_key": "sk-real1234567890",
+            "extra": {
+                "profile": {"cookie": "auth=TOP-SECRET", "note": "keep"},
+                "items": [{"access_token": "AT-SECRET"}],
+            },
+        },
+        provided_fields={"type", "api_key", "extra"},
+    )
+
+    # 模拟"GET 渠道 → 改某字段 → 把含 [REDACTED] 的 extra 原样 PUT 回来"的客户端
+    updated = config_store.upsert_channel(
+        {
+            "id": created.id,
+            "type": "deepseek",
+            "name": "改名",
+            "extra": {
+                "profile": {"cookie": "[REDACTED]", "note": "keep"},
+                "items": [{"access_token": "[REDACTED]"}],
+            },
+        },
+        provided_fields={"id", "type", "name", "extra"},
+    )
+    # 真实 Cookie/Token 必须被保留，不能被字面量 [REDACTED] 覆盖
+    assert updated.extra["profile"]["cookie"] == "auth=TOP-SECRET"
+    assert updated.extra["items"][0]["access_token"] == "AT-SECRET"
+    assert updated.extra["profile"]["note"] == "keep"
+
+    # 落盘的也必须是真实值
+    raw = json.loads(config_store.CONFIG_PATH.read_text(encoding="utf-8"))
+    stored = next(c for c in raw["channels"] if c["id"] == created.id)
+    assert stored["extra"]["profile"]["cookie"] == "auth=TOP-SECRET"
+    assert stored["extra"]["items"][0]["access_token"] == "AT-SECRET"
+
+
 # ── 配置导入/导出 ──────────────────────────────────────────────
 
 
@@ -278,7 +390,7 @@ def test_export_includes_secrets_when_requested(isolated_config):
         provided_fields={"type", "name", "api_key"},
     )
     data = config_store.export_config(include_secrets=True)
-    assert data["version"] == 1
+    assert data["version"] == 2
     assert len(data["channels"]) == 1
     assert data["channels"][0]["api_key"] == "sk-secret1234567890"
 
@@ -310,6 +422,17 @@ def test_import_merge_appends_and_preserves_existing_secrets(isolated_config):
     assert reloaded.api_key == "sk-realsecret1234"  # 密钥沿用
 
 
+def test_import_does_not_mutate_caller_payload(isolated_config):
+    """导入时补 id/规整 URL 只能作用于内部副本，不能偷偷修改调用方对象。"""
+    payload = {
+        "version": 1,
+        "channels": [{"type": "kimi_api", "api_key": "sk-new", "base_url": "https://x.com/"}],
+    }
+    before = json.loads(json.dumps(payload))
+    config_store.import_config(payload, mode="merge")
+    assert payload == before
+
+
 def test_import_replace_clears_all(isolated_config):
     config_store.upsert_channel({"type": "deepseek", "api_key": "sk-old1"})
     payload = {"version": 1, "channels": [{"type": "kimi_api", "api_key": "sk-new1", "base_url": "https://x.com"}]}
@@ -318,6 +441,72 @@ def test_import_replace_clears_all(isolated_config):
     channels = config_store.list_channels()
     assert len(channels) == 1
     assert channels[0].type == "kimi_api"
+
+
+def test_import_replace_cleans_orphan_codex_credentials_but_keeps_referenced(isolated_config):
+    """替换配置后，旧渠道的 refresh token 文件不能继续滞留在 credentials/。"""
+    cred_dir = isolated_config.parent / "credentials"
+    cred_dir.mkdir()
+    keep = cred_dir / "codex_keep.json"
+    orphan = cred_dir / "codex_orphan.json"
+    nested_orphan = cred_dir / "nested" / "codex_nested.json"
+    nested_orphan.parent.mkdir()
+    keep.write_text("keep", encoding="utf-8")
+    orphan.write_text("orphan", encoding="utf-8")
+    nested_orphan.write_text("nested", encoding="utf-8")
+
+    config_store.import_config(
+        {
+            "channels": [
+                {
+                    "id": "keep",
+                    "type": "codex_subscription",
+                    "extra": {"codex_auth_file": "credentials/codex_keep.json"},
+                }
+            ]
+        },
+        mode="replace",
+    )
+
+    assert keep.read_text(encoding="utf-8") == "keep"
+    assert not orphan.exists()
+    assert not nested_orphan.exists()
+
+
+def test_import_merge_removes_old_codex_file_when_channel_reassociated(isolated_config):
+    """merge 覆盖同一渠道的凭据关联时，旧文件应被回收。"""
+    cred_dir = isolated_config.parent / "credentials"
+    cred_dir.mkdir()
+    old_path = cred_dir / "codex_old.json"
+    new_path = cred_dir / "codex_new.json"
+    old_path.write_text("old", encoding="utf-8")
+    config_store.import_config(
+        {
+            "channels": [
+                {
+                    "id": "codex_channel",
+                    "type": "codex_subscription",
+                    "extra": {"codex_auth_file": "credentials/codex_old.json"},
+                }
+            ]
+        },
+        mode="replace",
+    )
+    new_path.write_text("new", encoding="utf-8")
+    config_store.import_config(
+        {
+            "channels": [
+                {
+                    "id": "codex_channel",
+                    "type": "codex_subscription",
+                    "extra": {"codex_auth_file": "credentials/codex_new.json"},
+                }
+            ]
+        },
+        mode="merge",
+    )
+    assert not old_path.exists()
+    assert new_path.exists()
 
 
 def test_import_rejects_unknown_type(isolated_config):
@@ -329,6 +518,217 @@ def test_import_rejects_unknown_type(isolated_config):
 def test_import_rejects_non_list_channels(isolated_config):
     with pytest.raises(config_store.ImportConfigError):
         config_store.import_config({"channels": "not a list"})
+
+
+def test_import_rejects_invalid_mode(isolated_config):
+    with pytest.raises(config_store.ImportConfigError):
+        config_store.import_config({"channels": []}, mode="invalid")
+
+
+def test_import_rejects_unknown_monitor_field(isolated_config):
+    with pytest.raises(config_store.ImportConfigError):
+        config_store.import_config(
+            {"channels": [], "settings": {"monitor": {"unexpected": True}}}
+        )
+
+
+def test_import_rejects_malformed_base_url(isolated_config):
+    with pytest.raises(config_store.ImportConfigError):
+        config_store.import_config(
+            {"channels": [{"type": "kimi_api", "api_key": "x", "base_url": "http://"}]}
+        )
+
+
+def test_import_rejects_non_boolean_enabled_and_non_object_extra(isolated_config):
+    with pytest.raises(config_store.ImportConfigError):
+        config_store.import_config({"channels": [{"type": "deepseek", "enabled": "false"}]})
+    with pytest.raises(config_store.ImportConfigError):
+        config_store.import_config({"channels": [{"type": "deepseek", "extra": []}]})
+
+
+def test_import_merge_masked_secret_preserves_existing_secret(isolated_config):
+    config_store.upsert_channel(
+        {"id": "ch_1", "type": "deepseek", "api_key": "sk-real-secret-1234"}
+    )
+    config_store.import_config(
+        {
+            "channels": [
+                {"id": "ch_1", "type": "deepseek", "api_key": "sk-r********1234"}
+            ]
+        }
+    )
+    assert config_store.get_channel("ch_1").api_key == "sk-real-secret-1234"
+
+
+def test_import_merge_nested_redacted_values_preserve_existing_secrets(isolated_config):
+    config_store.upsert_channel(
+        {
+            "id": "ch_nested",
+            "type": "opencode_subscription",
+            "api_key": "cookie-top-secret",
+            "extra": {
+                "profile": {
+                    "cookie": "cookie-nested-secret",
+                    "note": "old note",
+                },
+                "items": [
+                    {"access_token": "access-old", "label": "first"},
+                    {"refreshToken": "refresh-old", "label": "second"},
+                ],
+            },
+        }
+    )
+    config_store.import_config(
+        {
+            "channels": [
+                {
+                    "id": "ch_nested",
+                    "type": "opencode_subscription",
+                    "extra": {
+                        "profile": {"cookie": "[REDACTED]", "note": "new note"},
+                        "items": [
+                            {"access_token": "[REDACTED]", "label": "first updated"},
+                            {"refreshToken": "[REDACTED]", "label": "second updated"},
+                        ],
+                    },
+                }
+            ]
+        },
+        mode="merge",
+    )
+    channel = config_store.get_channel("ch_nested")
+    assert channel is not None
+    assert channel.extra == {
+        "profile": {"cookie": "cookie-nested-secret", "note": "new note"},
+        "items": [
+            {"access_token": "access-old", "label": "first updated"},
+            {"refreshToken": "refresh-old", "label": "second updated"},
+        ],
+    }
+
+
+def test_import_replace_drops_unrecoverable_nested_redacted_values(isolated_config):
+    config_store.import_config(
+        {
+            "channels": [
+                {
+                    "id": "ch_redacted",
+                    "type": "deepseek",
+                    "api_key": "[REDACTED]",
+                    "extra": {
+                        "cookie": "[REDACTED]",
+                        "nested": {"token": "[REDACTED]", "label": "kept"},
+                        "items": [{"accessToken": "[REDACTED]", "label": "kept"}],
+                    },
+                }
+            ]
+        },
+        mode="replace",
+    )
+    channel = config_store.get_channel("ch_redacted")
+    assert channel is not None
+    assert channel.api_key is None
+    assert channel.extra == {
+        "nested": {"label": "kept"},
+        "items": [{"label": "kept"}],
+    }
+
+
+# ── 持久化后台监控设置 ─────────────────────────────────────────
+
+
+def test_settings_defaults_are_safe_and_monitoring_is_off(isolated_config):
+    settings = config_store.get_settings()["monitor"]
+    assert settings["enabled"] is False
+    assert settings["interval_seconds"] == 300
+    assert settings["thresholds"] == {}
+    assert not isolated_config.exists()  # 单纯读取默认值不制造配置文件
+
+
+def test_update_settings_merges_and_persists(isolated_config):
+    updated = config_store.update_settings(
+        {"monitor": {"enabled": True, "interval_seconds": 900, "thresholds": {"ch_a": 17.5}}}
+    )
+    assert updated["monitor"]["enabled"] is True
+    assert updated["monitor"]["interval_seconds"] == 900
+    assert updated["monitor"]["cooldown_seconds"] == 3600
+    assert updated["monitor"]["thresholds"] == {"ch_a": 17.5}
+    assert config_store.get_settings() == updated
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"interval_seconds": 10},
+        {"cooldown_seconds": 0},
+        {"retention_days": 0},
+        {"thresholds": {"ch_a": 101}},
+        {"webhook_url": "javascript:alert(1)"},
+    ],
+)
+def test_update_settings_rejects_unsafe_values(isolated_config, patch):
+    with pytest.raises(config_store.SettingsValidationError):
+        config_store.update_settings({"monitor": patch})
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"interval_seconds": 60.5},
+        {"interval_seconds": "60.5"},
+        {"thresholds": {"ch_a": float("nan")}},
+        {"thresholds": {"ch_a": float("inf")}},
+        {"webhook_url": "http://"},
+        {"webhook_url": "https://"},
+        {"webhook_url": "https://example.test/bad path"},
+        {"unexpected": True},
+    ],
+)
+def test_update_settings_rejects_malformed_values(isolated_config, patch):
+    with pytest.raises(config_store.SettingsValidationError):
+        config_store.update_settings({"monitor": patch})
+
+
+def test_safe_export_strips_webhook_secret_but_full_export_keeps_it(isolated_config):
+    url = "https://hooks.example.test/path/secret-token"
+    config_store.update_settings({"monitor": {"webhook_url": url}})
+    assert config_store.export_config(include_secrets=False)["settings"]["monitor"]["webhook_url"] == ""
+    assert config_store.export_config(include_secrets=True)["settings"]["monitor"]["webhook_url"] == url
+
+
+def test_import_merge_settings_preserves_unmentioned_fields(isolated_config):
+    config_store.update_settings(
+        {"monitor": {"enabled": True, "interval_seconds": 600, "webhook_url": "https://example.test/hook"}}
+    )
+    result = config_store.import_config(
+        {"version": 2, "channels": [], "settings": {"monitor": {"thresholds": {"ch_x": 20}}}},
+        mode="merge",
+    )
+    assert result["settings_imported"] is True
+    monitor = config_store.get_settings()["monitor"]
+    assert monitor["enabled"] is True
+    assert monitor["interval_seconds"] == 600
+    assert monitor["webhook_url"] == "https://example.test/hook"
+    assert monitor["thresholds"] == {"ch_x": 20.0}
+
+
+def test_import_merge_redacted_settings_does_not_clear_existing_webhook(isolated_config):
+    config_store.update_settings({"monitor": {"webhook_url": "https://example.test/real-secret"}})
+    config_store.import_config(
+        {"version": 2, "channels": [], "settings": {"monitor": {"webhook_url": "", "interval_seconds": 900}}},
+        mode="merge",
+    )
+    monitor = config_store.get_settings()["monitor"]
+    assert monitor["webhook_url"] == "https://example.test/real-secret"
+    assert monitor["interval_seconds"] == 900
+
+
+def test_import_replace_old_backup_resets_monitor_to_safe_default(isolated_config):
+    config_store.update_settings({"monitor": {"enabled": True, "webhook_url": "https://example.test/hook"}})
+    config_store.import_config({"version": 1, "channels": []}, mode="replace")
+    monitor = config_store.get_settings()["monitor"]
+    assert monitor["enabled"] is False
+    assert monitor["webhook_url"] == ""
 
 
 # ── resolve_codex_auth_file：路径穿越防护 ────────────────────────
@@ -367,3 +767,16 @@ def test_resolve_codex_auth_file_rejects_wrong_filename_pattern(isolated_config)
 def test_resolve_codex_auth_file_rejects_empty(isolated_config):
     assert config_store.resolve_codex_auth_file("") is None
     assert config_store.resolve_codex_auth_file(None) is None
+
+
+def test_codex_credentials_symlink_outside_config_is_rejected(isolated_config):
+    """credentials/ 不能通过目录符号链接把读写边界带到配置目录之外。"""
+    outside = isolated_config.parent.parent / f"{isolated_config.parent.name}-outside_credentials"
+    outside.mkdir()
+    try:
+        (isolated_config.parent / "credentials").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("当前平台不允许创建目录符号链接")
+    assert config_store.resolve_codex_auth_file("credentials/codex_x.json") is None
+    with pytest.raises(ValueError, match="credentials"):
+        config_store.codex_credentials_path("ch_x")

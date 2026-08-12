@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import socket
 import ssl
 import threading
@@ -9,7 +10,10 @@ import urllib.request
 
 import httpx
 
+from .config import assert_public_http_url
+
 TIMEOUT_SECONDS = 15.0
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 _client: httpx.AsyncClient | None = None
 _client_lock = threading.Lock()
@@ -106,20 +110,46 @@ async def request_json(
     method: str, url: str, *, headers: dict | None = None, json_body: dict | None = None
 ) -> dict | list:
     """发送请求并解析 JSON；非 2xx 抛 ResponseError，JSON 非法抛 ParseError。"""
+    assert_public_http_url(url, field_name="请求 URL")
     client = get_client()
-    response = await client.request(method, url, headers=headers, json=json_body)
-    if response.status_code < 200 or response.status_code >= 300:
-        raise ResponseError(response.status_code, response.text[:500])
+    status_code, text = await _request_text_bounded(client, method, url, headers=headers, json_body=json_body)
+    if status_code < 200 or status_code >= 300:
+        raise ResponseError(status_code, text[:500])
     try:
-        return response.json()
+        return json.loads(text)
     except ValueError as e:
         raise ParseError(f"响应不是合法 JSON: {e}") from e
 
 
 async def request_text(method: str, url: str, *, headers: dict | None = None, json_body: dict | None = None) -> str:
     """发送请求并返回文本；非 2xx 抛 ResponseError。"""
+    assert_public_http_url(url, field_name="请求 URL")
     client = get_client()
-    response = await client.request(method, url, headers=headers, json=json_body)
-    if response.status_code < 200 or response.status_code >= 300:
-        raise ResponseError(response.status_code, response.text[:500])
-    return response.text
+    status_code, text = await _request_text_bounded(client, method, url, headers=headers, json_body=json_body)
+    if status_code < 200 or status_code >= 300:
+        raise ResponseError(status_code, text[:500])
+    return text
+
+
+async def _request_text_bounded(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    headers: dict | None,
+    json_body: dict | None,
+) -> tuple[int, str]:
+    """流式读取响应并在超过上限时立即中止。
+
+    ``AsyncClient.request()`` 会先把完整响应读入内存，之后再检查长度；恶意或异常
+    上游返回超大 HTML/JSON 时，事后检查仍可能造成内存峰值。使用 stream + bytearray
+    把峰值限制在 ``MAX_RESPONSE_BYTES`` 附近，再交给上层做状态码/JSON 处理。
+    """
+    async with client.stream(method, url, headers=headers, json=json_body) as response:
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            if len(body) + len(chunk) > MAX_RESPONSE_BYTES:
+                raise ResponseError(response.status_code, f"响应体过大（超过 {MAX_RESPONSE_BYTES} 字节）")
+            body.extend(chunk)
+        encoding = response.encoding or "utf-8"
+        return response.status_code, bytes(body).decode(encoding, errors="replace")

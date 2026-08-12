@@ -2,9 +2,34 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
+
+
+def finite_float(value, default: float | None = None) -> float | None:
+    """把上游数字安全归一为有限浮点数。
+
+    provider 的 JSON 响应偶尔会把空值、字符串或 NaN/Infinity 混入额度字段。
+    这些值不能进入结果模型：Python 的 json.dumps(allow_nan=False) 会直接失败，
+    而 NaN 参与比较时还会让告警和排序得到不可预测的结果。
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def bounded_percent(value, default: float | None = None) -> float | None:
+    """把百分比归一到 0～100；非法或非有限值返回 default。"""
+    number = finite_float(value, default)
+    if number is None:
+        return None
+    return max(0.0, min(100.0, number))
 
 
 @dataclass
@@ -60,11 +85,13 @@ def window(
     max_label: str | None = None,
     reset_at: int | None = None,
 ) -> QuotaWindow:
+    used = bounded_percent(used_percent)
+    remaining = bounded_percent(remaining_percent)
     return QuotaWindow(
         key=key,
         label=label,
-        used_percent=round(used_percent, 1) if used_percent is not None else None,
-        remaining_percent=round(remaining_percent, 1) if remaining_percent is not None else None,
+        used_percent=round(used, 1) if used is not None else None,
+        remaining_percent=round(remaining, 1) if remaining is not None else None,
         used_label=used_label,
         max_label=max_label,
         reset_at=reset_at,
@@ -73,8 +100,9 @@ def window(
 
 def amount(value: float, currency: str = "", symbol: str = "") -> dict:
     """金额对象：value 为数值，label 为格式化展示串。"""
-    label = f"{symbol}{value:,.2f}" if symbol else f"{value:,.2f} {currency}".strip()
-    return {"value": round(value, 2), "currency": currency, "label": label}
+    safe_value = finite_float(value, 0.0) or 0.0
+    label = f"{symbol}{safe_value:,.2f}" if symbol else f"{safe_value:,.2f} {currency}".strip()
+    return {"value": round(safe_value, 2), "currency": currency, "label": label}
 
 
 def ok(**kwargs) -> ChannelResult:
@@ -94,12 +122,23 @@ def to_ts(value) -> int | None:
     """
     if value is None:
         return None
-    if isinstance(value, (int, float)) and value > 0:
+    if isinstance(value, bool):
+        return None
+    numeric = finite_float(value, None)
+    if numeric is not None and numeric > 0:
         # < 1e10 视为秒级，否则毫秒级
-        return int(value * 1000 if value < 10_000_000_000 else value)
+        return int(numeric * 1000 if numeric < 10_000_000_000 else numeric)
     if isinstance(value, str):
         try:
-            return int(datetime.fromisoformat(value).timestamp() * 1000)
-        except ValueError:
+            # Normalise RFC3339's ``Z`` explicitly and treat offset-less log
+            # timestamps as UTC rather than the host machine's local timezone.
+            iso_value = value.strip()
+            if iso_value.endswith(("Z", "z")):
+                iso_value = iso_value[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(iso_value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return int(parsed.timestamp() * 1000)
+        except (ValueError, OverflowError, OSError):
             return None
     return None

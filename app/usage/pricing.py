@@ -21,7 +21,7 @@ import logging
 import re
 import threading
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -64,10 +64,10 @@ BUILTIN_PRICES: dict[str, tuple[float, float, float, float]] = {
     "claude-3-5-haiku": (0.8, 4.0, 0.08, 1.0),
     # ── OpenAI GPT（developers.openai.com/api/docs/pricing）──
     # cached input = input 的 10%。5.6 系列分 sol/terra/luna 三档不同价。
-    "gpt-5.6-sol": (5.0, 30.0, 0.5, 0.0),
-    "gpt-5.6-terra": (2.0, 12.0, 0.2, 0.0),
-    "gpt-5.6-luna": (0.2, 1.2, 0.02, 0.0),
-    "gpt-5.6": (2.0, 12.0, 0.2, 0.0),  # 无后缀的 5.6 按 terra 档兜底
+    "gpt-5.6-sol": (5.0, 30.0, 0.5, 6.25),
+    "gpt-5.6-terra": (2.0, 12.0, 0.2, 2.5),
+    "gpt-5.6-luna": (0.2, 1.2, 0.02, 0.25),
+    "gpt-5.6": (2.0, 12.0, 0.2, 2.5),  # 无后缀的 5.6 按 terra 档兜底
     "gpt-5.5": (5.0, 30.0, 0.5, 0.0),
     "gpt-5.5-pro": (30.0, 180.0, 0.0, 0.0),
     "gpt-5.4": (2.5, 15.0, 0.25, 0.0),
@@ -88,9 +88,10 @@ BUILTIN_PRICES: dict[str, tuple[float, float, float, float]] = {
     "gpt-4o-mini": (0.15, 0.6, 0.075, 0.15),
     "gpt-4-turbo": (10.0, 30.0, 5.0, 0.0),
     # ── Google Gemini ──
-    "gemini-2.5-pro": (1.25, 5.0, 0.125, 1.25),
-    "gemini-2.5-flash": (0.075, 0.3, 0.01875, 0.075),
-    "gemini-2.0-flash": (0.075, 0.3, 0.01875, 0.075),
+    "gemini-2.5-pro": (1.25, 10.0, 0.125, 1.25),
+    "gemini-2.5-flash": (0.3, 2.5, 0.03, 0.3),
+    "gemini-2.5-flash-lite": (0.1, 0.4, 0.01, 0.1),
+    "gemini-2.0-flash": (0.1, 0.4, 0.025, 0.1),
     # ── DeepSeek（api-docs.deepseek.com/quick_start/pricing）──
     # cache hit input = cache miss 的 2%。v4-flash / v4-pro 两个档。
     "deepseek-v4-flash": (0.14, 0.28, 0.0028, 0.0),
@@ -103,6 +104,10 @@ BUILTIN_PRICES: dict[str, tuple[float, float, float, float]] = {
     # ── xAI Grok ──
     "grok-4": (3.0, 15.0, 0.3, 3.75),
     "grok-4-fast": (0.2, 1.5, 0.02, 0.25),
+    "grok-4.5": (2.0, 6.0, 0.3, 0.0),
+    "grok-4.20": (1.25, 2.5, 0.2, 0.0),
+    "grok-4.3": (1.25, 2.5, 0.2, 0.0),
+    "grok-build": (1.0, 2.0, 0.2, 0.0),
     # ── Kimi / MiniMax / 等（订阅常见，补几个兜底）──
     "kimi": (0.24, 0.96, 0.024, 0.0),
     "minimax": (1.0, 1.0, 0.0, 0.0),
@@ -110,6 +115,9 @@ BUILTIN_PRICES: dict[str, tuple[float, float, float, float]] = {
 
 _MILLION = Decimal(1000000)
 _PER_MILLION_QUANTUM = Decimal("0.000001")  # 单价精度：6 位小数（USD/1M）
+_MAX_RATE_PER_MILLION = Decimal(1000000)
+_MAX_MODEL_KEY_LENGTH = 256
+_MAX_LITELLM_RESPONSE_BYTES = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -127,6 +135,29 @@ class ResolvedRate:
 
 def _to_decimal(v) -> Decimal:
     return v if isinstance(v, Decimal) else Decimal(str(v))
+
+
+def _validated_model_key(model_key) -> str:
+    if not isinstance(model_key, str):
+        raise TypeError("model_key 必须是字符串")
+    key = normalize_key(model_key)
+    if not key:
+        raise ValueError("model_key 不能为空")
+    if len(key) > _MAX_MODEL_KEY_LENGTH or any(ord(ch) < 32 for ch in key):
+        raise ValueError(f"model_key 不能超过 {_MAX_MODEL_KEY_LENGTH} 个字符或包含控制字符")
+    return key
+
+
+def _validated_rate(value, *, field_name: str) -> Decimal:
+    try:
+        rate = _to_decimal(0 if value is None or value == "" else value)
+    except (InvalidOperation, TypeError, ValueError) as e:
+        raise ValueError(f"{field_name} 必须是有效数字") from e
+    if not rate.is_finite():
+        raise ValueError(f"{field_name} 必须是有限数字")
+    if rate < 0 or rate > _MAX_RATE_PER_MILLION:
+        raise ValueError(f"{field_name} 必须在 0 到 {_MAX_RATE_PER_MILLION} 之间")
+    return rate
 
 
 def normalize_key(model: str) -> str:
@@ -157,12 +188,18 @@ def fallback_candidates(model: str) -> list[str]:
     key = normalize_key(model)
     if not key:
         return []
-    # 先剥掉末尾的日期段：-20260101 / -2025-10-22 这种
-    key = re.sub(r"-\d{6,8}(?:-\d{2})?$", "", key)
-    parts = key.split("-")
     candidates: list[str] = []
     seen: set[str] = set()
-    # 从完整名开始，逐段去尾
+    # 先尝试完整键，再剥掉末尾日期段；完整日期键可能有专门价格，不能在进入
+    # fallback 前就丢掉。
+    original_key = key
+    stripped_key = re.sub(r"-\d{6,8}(?:-\d{2})?$", "", key)
+    for cand in (original_key, stripped_key):
+        if cand and cand not in seen:
+            seen.add(cand)
+            candidates.append(cand)
+    parts = stripped_key.split("-")
+    # 从去日期后的基础名开始逐段去尾
     for i in range(len(parts), 0, -1):
         cand = "-".join(parts[:i])
         if cand and cand not in seen:
@@ -181,6 +218,9 @@ class PricingBook:
     def __init__(self) -> None:
         # key: normalized model key → (input, output, cache_read, cache_creation, is_builtin)
         self._by_key: dict[str, tuple[Decimal, Decimal, Decimal, Decimal, bool]] = {}
+        # 内置模型被用户/LiteLLM 覆盖时仍保留 is_builtin=True（兼容旧 API 语义），
+        # 另用集合记录“当前不是默认值”，供恢复默认按钮和持久化区分。
+        self._overrides: set[str] = set()
         # 单价表会在多个 to_thread 中被并发读写，用 RLock 保护内部 dict
         self._lock = threading.RLock()
         self._load_builtin()
@@ -221,21 +261,57 @@ class PricingBook:
         手动编辑和 LiteLLM 拉取都用这个入口；is_builtin=False 表示用户 / 远端来源，
         查询时和内置价一视同仁（resolve 不区分来源）。
         """
-        key = normalize_key(model_key)
-        if not key:
-            return
+        key = _validated_model_key(model_key)
+        input_rate = _validated_rate(input_, field_name="input_per_million")
+        output_rate = _validated_rate(output, field_name="output_per_million")
+        cache_read_rate = _validated_rate(cache_read, field_name="cache_read_per_million")
+        cache_creation_rate = _validated_rate(cache_creation, field_name="cache_creation_per_million")
         with self._lock:
+            if key in BUILTIN_PRICES and not is_builtin:
+                self._overrides.add(key)
+            elif is_builtin:
+                self._overrides.discard(key)
             self._by_key[key] = (
-                _to_decimal(input_ or 0),
-                _to_decimal(output or 0),
-                _to_decimal(cache_read or 0),
-                _to_decimal(cache_creation or 0),
-                is_builtin,
+                input_rate,
+                output_rate,
+                cache_read_rate,
+                cache_creation_rate,
+                key in BUILTIN_PRICES or bool(is_builtin),
             )
 
     def remove(self, model_key: str) -> bool:
         with self._lock:
-            return self._by_key.pop(normalize_key(model_key), None) is not None
+            key = normalize_key(model_key)
+            if key in BUILTIN_PRICES:
+                # 对内置模型的“删除”语义是恢复默认，而不是让默认价格消失。
+                default = BUILTIN_PRICES[key]
+                self._by_key[key] = (
+                    _to_decimal(default[0]),
+                    _to_decimal(default[1]),
+                    _to_decimal(default[2]),
+                    _to_decimal(default[3]),
+                    True,
+                )
+                self._overrides.discard(key)
+                return True
+            return self._by_key.pop(key, None) is not None
+
+    def restore_default(self, model_key: str) -> bool:
+        """恢复内置模型默认单价；非内置模型返回 False。"""
+        key = normalize_key(model_key)
+        if key not in BUILTIN_PRICES:
+            return False
+        with self._lock:
+            default = BUILTIN_PRICES[key]
+            self._by_key[key] = (
+                _to_decimal(default[0]),
+                _to_decimal(default[1]),
+                _to_decimal(default[2]),
+                _to_decimal(default[3]),
+                True,
+            )
+            self._overrides.discard(key)
+        return True
 
     def entries(self) -> list[dict]:
         """导出全部单价项（按 key 排序），供前端定价表展示 / 编辑。"""
@@ -251,6 +327,9 @@ class PricingBook:
                         "cache_read_per_million": float(cr),
                         "cache_creation_per_million": float(cc),
                         "is_builtin": builtin,
+                        "is_builtin_model": key in BUILTIN_PRICES,
+                        "is_overridden": key in self._overrides,
+                        "can_restore_default": key in BUILTIN_PRICES and key in self._overrides,
                     }
                 )
             return out
@@ -275,7 +354,18 @@ def calc_cost(
         if price is None:
             return zero
         n = tokens.get(field, 0) or 0
-        return (Decimal(n) * price / _MILLION).quantize(_PER_MILLION_QUANTUM, rounding=ROUND_HALF_UP)
+        if isinstance(n, bool):
+            return zero
+        try:
+            count = Decimal(str(n))
+        except (InvalidOperation, TypeError, ValueError):
+            return zero
+        # Token 计数理论上是非负整数；对畸形小数取整数部分，避免把 NaN/Infinity
+        # 或负值传播到成本与 JSON 响应。正常解析器产出的整数不会改变结果。
+        if not count.is_finite() or count <= 0:
+            return zero
+        count = count.to_integral_value(rounding="ROUND_DOWN")
+        return (count * price / _MILLION).quantize(_PER_MILLION_QUANTUM, rounding=ROUND_HALF_UP)
 
     inp = bucket("input", rate.input)
     out = bucket("output", rate.output)
@@ -301,7 +391,10 @@ def fetch_litellm(timeout: float = 15.0) -> dict:
     """
     req = Request(LITELLM_URL, headers={"User-Agent": "QuotaX/1.0"})
     with urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
+        # 传入上限给 read，避免先把恶意/异常大的远端文件完整载入内存再检查。
+        raw = resp.read(_MAX_LITELLM_RESPONSE_BYTES + 1)
+    if len(raw) > _MAX_LITELLM_RESPONSE_BYTES:
+        raise ValueError(f"LiteLLM 单价响应过大（超过 {_MAX_LITELLM_RESPONSE_BYTES} 字节）")
     data = json.loads(raw)
     if not isinstance(data, dict):
         return {}
@@ -311,17 +404,30 @@ def fetch_litellm(timeout: float = 15.0) -> dict:
             continue
         # litellm 顶层混了一些非模型元数据（如 "sample_spec"），只取带价格的
         inp_raw = info.get("input_cost_per_token")
-        if inp_raw is None or float(inp_raw) <= 0:
+        if inp_raw is None:
             continue
-        key = normalize_key(name)
-        if not key:
+        try:
+            key = _validated_model_key(name)
+            rates = (
+                _validated_rate(_to_decimal(inp_raw) * _MILLION, field_name="input_per_million"),
+                _validated_rate(
+                    _to_decimal(info.get("output_cost_per_token") or 0) * _MILLION,
+                    field_name="output_per_million",
+                ),
+                _validated_rate(
+                    _to_decimal(info.get("cache_read_input_token_cost") or 0) * _MILLION,
+                    field_name="cache_read_per_million",
+                ),
+                _validated_rate(
+                    _to_decimal(info.get("cache_creation_input_token_cost") or 0) * _MILLION,
+                    field_name="cache_creation_per_million",
+                ),
+            )
+        except (InvalidOperation, TypeError, ValueError):
             continue
-        out[key] = (
-            _to_decimal(inp_raw) * _MILLION,
-            _to_decimal(info.get("output_cost_per_token") or 0) * _MILLION,
-            _to_decimal(info.get("cache_read_input_token_cost") or 0) * _MILLION,
-            _to_decimal(info.get("cache_creation_input_token_cost") or 0) * _MILLION,
-        )
+        if rates[0] <= 0:
+            continue
+        out[key] = rates
     return out
 
 
@@ -333,14 +439,10 @@ def apply_litellm(book: PricingBook, fetched: dict) -> int:
     """
     count = 0
     for key, (inp, out, cr, cc) in fetched.items():
-        book.upsert(
-            key,
-            float(inp),
-            float(out),
-            float(cr),
-            float(cc),
-            is_builtin=False,
-        )
+        try:
+            book.upsert(key, inp, out, cr, cc, is_builtin=False)
+        except (TypeError, ValueError):
+            continue
         count += 1
     return count
 

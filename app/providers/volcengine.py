@@ -18,8 +18,8 @@ import json
 from datetime import UTC, datetime
 
 from ..config import Channel
-from ..models import ChannelResult, fail, ok, to_ts, window
-from ..net import ParseError, ResponseError, request_text
+from ..models import ChannelResult, fail, finite_float, ok, to_ts, window
+from ..net import ParseError, friendly_error, request_text
 
 HOST = "open.volcengineapi.com"
 API_VERSION = "2024-01-01"
@@ -130,6 +130,8 @@ def _is_auth_error(code: str) -> bool:
 
 
 def _error_of(body: dict) -> tuple[str, str] | None:
+    if not isinstance(body, dict):
+        return None
     err = (body.get("ResponseMetadata") or {}).get("Error") if isinstance(body.get("ResponseMetadata"), dict) else None
     if not isinstance(err, dict):
         err = body.get("Error")
@@ -161,6 +163,9 @@ async def query_volcengine(channel: Channel) -> ChannelResult:
     # 1) Agent Plan
     try:
         body = await _openapi_call(region, channel.ak, channel.sk, "GetAFPUsage")
+        if not isinstance(body, dict):
+            soft_errors.append("Agent Plan: 响应不是对象结构")
+            body = {}
         err = _error_of(body)
         if err:
             if _is_signature_error(err[0]):
@@ -170,14 +175,26 @@ async def query_volcengine(channel: Channel) -> ChannelResult:
             soft_errors.append(f"Agent Plan: {err[0]} {err[1]}")
         else:
             result = body.get("Result") or body
-            agent_windows = _parse_afp_tiers(result)
-            agent_plan_type = result.get("PlanType")
-    except (ResponseError, ParseError) as e:
-        soft_errors.append(f"Agent Plan: {e}")
+            if isinstance(result, dict):
+                agent_windows = _parse_afp_tiers(result)
+                agent_plan_type = result.get("PlanType")
+            else:
+                soft_errors.append("Agent Plan: 响应中的 Result 格式错误")
+    except Exception as e:
+        # 必须捕获所有异常（不只是 ResponseError/ParseError）：_openapi_call →
+        # request_text → client.stream 在 DNS 失败 / TLS 握手 / 连接超时 / 代理失败时
+        # 抛的是 httpx.ConnectError/ReadTimeout 等，它们不是 ResponseError 的子类，
+        # 窄 except 会让异常逃逸出本函数，最终被 query_channel 顶层兜底成整张卡 error，
+        # 导致另一个正常的 plan 数据也一起丢失（双 plan 隔离失效）。friendly_error 把
+        # 底层网络异常翻译成中文提示；ResponseError/ParseError 则原样保留可读文案。
+        soft_errors.append(f"Agent Plan: {friendly_error(e)}")
 
     # 2) Coding Plan
     try:
         body = await _openapi_call(region, channel.ak, channel.sk, "GetCodingPlanUsage")
+        if not isinstance(body, dict):
+            soft_errors.append("Coding Plan: 响应不是对象结构")
+            body = {}
         err = _error_of(body)
         if err:
             if _is_signature_error(err[0]):
@@ -187,9 +204,12 @@ async def query_volcengine(channel: Channel) -> ChannelResult:
             soft_errors.append(f"Coding Plan: {err[0]} {err[1]}")
         else:
             result = body.get("Result") or body
-            coding_windows = _parse_coding_plan_tiers(result)
-    except (ResponseError, ParseError) as e:
-        soft_errors.append(f"Coding Plan: {e}")
+            if isinstance(result, dict):
+                coding_windows = _parse_coding_plan_tiers(result)
+            else:
+                soft_errors.append("Coding Plan: 响应中的 Result 格式错误")
+    except Exception as e:
+        soft_errors.append(f"Coding Plan: {friendly_error(e)}")
 
     windows, plan_name, plan_names = _merge_plans(agent_windows, coding_windows, agent_plan_type)
     if not windows:
@@ -246,6 +266,8 @@ def _merge_plans(
 
 def _parse_afp_tiers(result: dict) -> list:
     """Agent Plan：Result.AFPFiveHour/AFPWeekly/AFPMonthly，字段 Quota/Used/ResetTime。"""
+    if not isinstance(result, dict):
+        return []
     windows = []
     for key, tier, label in [
         ("AFPFiveHour", "five_hour", "每 5 小时"),
@@ -255,10 +277,10 @@ def _parse_afp_tiers(result: dict) -> list:
         item = result.get(key)
         if not isinstance(item, dict):
             continue
-        quota = float(item.get("Quota") or 0)
+        quota = finite_float(item.get("Quota"), 0.0) or 0.0
         if quota <= 0:
             continue
-        used = float(item.get("Used") or 0)
+        used = finite_float(item.get("Used"), 0.0) or 0.0
         used_pct = used / quota * 100
         windows.append(
             window(
@@ -276,6 +298,8 @@ def _parse_afp_tiers(result: dict) -> list:
 
 def _parse_coding_plan_tiers(result: dict) -> list:
     """Coding Plan：Result.QuotaUsage[]（或 Usages/Details），只给百分比。"""
+    if not isinstance(result, dict):
+        return []
     items = result.get("QuotaUsage") or result.get("Usages") or result.get("Details")
     if not isinstance(items, list):
         return []
@@ -305,7 +329,7 @@ def _parse_coding_plan_tiers(result: dict) -> list:
             (item.get(k) for k in ("Percent", "UsedPercent", "UsagePercent") if item.get(k) is not None),
             None,
         )
-        used = float(raw) if raw is not None else 0.0
+        used = finite_float(raw, 0.0) or 0.0
         windows.append(
             window(
                 tier,
