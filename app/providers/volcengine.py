@@ -11,13 +11,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import hmac as hmac_mod
 import json
+import os
+import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 
 from ..config import Channel
+from ..credentials import CRED_NOT_FOUND, CRED_OK, Credential
 from ..models import ChannelResult, fail, finite_float, ok, to_ts, window
 from ..net import ParseError, friendly_error, request_text
 
@@ -153,7 +158,10 @@ async def query_volcengine(channel: Channel) -> ChannelResult:
         "category": "coding_plan",
     }
     if not channel.ak or not channel.sk:
-        return fail("error", "未配置 AK/SK", **base)
+        # 未配置 AK/SK：回退到官方 arkcli CLI 的 SSO 登录态（参考 CodexBar 的
+        # Doubao provider——Auto 模式同样"配了 API 凭据优先，没配走 arkcli"）。
+        # 同步 subprocess 包 to_thread，避免阻塞事件循环。
+        return await asyncio.to_thread(_query_via_arkcli, base)
     region = channel.region or DEFAULT_REGION
     soft_errors: list[str] = []
     agent_windows: list = []
@@ -340,3 +348,215 @@ def _parse_coding_plan_tiers(result: dict) -> list:
             )
         )
     return windows
+
+
+# ── arkcli CLI 回退（参考 CodexBar DoubaoUsageFetcher）─────────
+#
+# 官方 arkcli CLI 用 SSO 登录（arkcli auth login），不需要在 IAM 里创建 AK/SK。
+# `arkcli usage plan --format json` 输出个人版/团队版 × Coding/Agent 四组产品，
+# 每组 periods[] 含 label（5-hour/weekly/monthly 等）、percent（已用百分比）、
+# reset_at（ISO 字符串或 epoch 秒/毫秒）。协议细节对照 CodExBar：
+# - 二进制定位：ARKCLI_PATH 环境变量 → PATH → ~/.local/bin / /opt/homebrew/bin /
+#   /usr/local/bin 三个常见安装位
+# - 未登录的两种表现：viewer.auth_method == "none"，或非零退出 + stderr 含
+#   "not logged in" 等关键词
+# - 输出上限 256KB / 超时 15s
+
+_ARKCLI_TIMEOUT = 15
+_ARKCLI_MAX_OUTPUT = 256 * 1024
+
+# CodExBar isArkcliAuthenticationError 的同款关键词（小写匹配）
+_ARKCLI_AUTH_MARKERS = (
+    "not logged in",
+    "not authenticated",
+    "authentication required",
+    "login required",
+    "please login",
+    "please log in",
+)
+
+# product → (窗口 key 前缀, 展示 label 前缀)。key 必须保持 agent_/coding_ 开头，
+# main.py 的火山拆卡逻辑（_split_multi_plan）按这两个前缀分桶。
+_ARKCLI_PRODUCTS: dict[str, tuple[str, str]] = {
+    "agent-plan": ("agent", "Agent "),
+    "coding-plan": ("coding", "Coding "),
+    "agent-plan-team": ("agent", "Agent "),
+    "coding-plan-team": ("coding", "Coding "),
+}
+
+
+class ArkcliError(Exception):
+    """arkcli 调用失败。status 取 ChannelResult 语义：not_found / expired / error。"""
+
+    def __init__(self, status: str, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _resolve_arkcli_path() -> str | None:
+    """定位 arkcli：ARKCLI_PATH 覆盖 → PATH → 常见安装位（与 CodExBar 一致）。"""
+    override = os.environ.get("ARKCLI_PATH")
+    if override and os.path.isfile(override) and os.access(override, os.X_OK):
+        return override
+    from shutil import which
+
+    found = which("arkcli")
+    if found:
+        return found
+    for p in (
+        Path.home() / ".local" / "bin" / "arkcli",
+        Path("/opt/homebrew/bin/arkcli"),
+        Path("/usr/local/bin/arkcli"),
+    ):
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
+def run_arkcli_usage_plan() -> dict:
+    """执行 `arkcli usage plan --format json` 并解析 stdout 为 dict。
+
+    失败抛 ArkcliError（status 已按 ChannelResult 语义归类）。同步阻塞函数，
+    调用方（async 上下文）需用 asyncio.to_thread 包裹。
+    """
+    path = _resolve_arkcli_path()
+    if not path:
+        raise ArkcliError(
+            "not_found",
+            "未找到 arkcli CLI。请安装 arkcli 并运行 `arkcli auth login`，"
+            "或在渠道里配置火山 AK/SK",
+        )
+    try:
+        result = subprocess.run(  # noqa: PLW1510 手动检查 returncode
+            [path, "usage", "plan", "--format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=_ARKCLI_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise ArkcliError("error", "arkcli usage plan 执行超时（15s），请检查 arkcli 登录状态") from None
+    except OSError as e:
+        raise ArkcliError("error", f"arkcli 启动失败: {e}") from e
+    if len(result.stdout.encode("utf-8", errors="replace")) > _ARKCLI_MAX_OUTPUT:
+        raise ArkcliError("error", "arkcli 输出过大（超过 256KB），请升级 arkcli 后重试")
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout or "").strip()
+        if any(marker in message.lower() for marker in _ARKCLI_AUTH_MARKERS):
+            raise ArkcliError(
+                "expired", "arkcli 未登录，请运行 `arkcli auth login` 后重试（或在渠道里配置 AK/SK）"
+            )
+        raise ArkcliError("error", f"arkcli 执行失败 (exit {result.returncode}): {message[:200]}")
+    try:
+        parsed = json.loads(result.stdout)
+    except ValueError as e:
+        raise ArkcliError("error", f"arkcli 输出不是合法 JSON: {e}") from e
+    if not isinstance(parsed, dict):
+        raise ArkcliError("error", "arkcli 输出结构异常（顶层不是对象）")
+    return parsed
+
+
+def parse_arkcli_usage(data: dict) -> list:
+    """解析 arkcli usage plan JSON → 窗口列表。
+
+    percent 是「已用百分比」（CodExBar rateWindow 按 usedPercent 消费，与
+    AK/SK 路径的 GetCodingPlanUsage 百分比语义一致）。团队版窗口 key 加
+    _team_ 段（agent_team_five_hour），仍以 agent_/coding_ 开头保证 main.py
+    的火山拆卡逻辑正常分桶；label 加「团队 ·」前缀区分。
+    """
+    viewer = data.get("viewer")
+    auth_method = str(viewer.get("auth_method") or "").strip().lower() if isinstance(viewer, dict) else ""
+    if auth_method == "none":
+        raise ArkcliError("expired", "arkcli 未登录（auth_method=none），请运行 `arkcli auth login`")
+    items = data.get("items")
+    if not isinstance(items, list):
+        raise ArkcliError("error", "arkcli 输出缺少 items 数组")
+
+    windows = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        product = str(item.get("product") or "").strip().lower()
+        group = _ARKCLI_PRODUCTS.get(product)
+        if group is None or item.get("subscribed") is False:
+            continue
+        key_prefix, label_prefix = group
+        is_team = product.endswith("-team")
+        for period in item.get("periods") or []:
+            if not isinstance(period, dict):
+                continue
+            label = str(period.get("label") or "").lower()
+            if any(k in label for k in ("session", "5-hour", "five_hour", "5h", "5 hour")):
+                tier, tier_label = "five_hour", "每 5 小时"
+            elif "week" in label:
+                tier, tier_label = "weekly", "每周额度"
+            elif "month" in label:
+                tier, tier_label = "monthly", "每月额度"
+            elif "day" in label:
+                # arkcli 会输出 AFPDaily（每日窗口）；CodExBar 因 UI 没有槽位而跳过，
+                # 我们的 custom 档可以直接显示
+                tier, tier_label = "custom", "每日额度"
+            else:
+                tier, tier_label = "custom", str(period.get("label") or "其他档位")
+            used = finite_float(period.get("percent"), None)
+            if used is None:
+                continue
+            used = max(0.0, min(100.0, used))
+            key = f"{key_prefix}_{'team_' if is_team else ''}{tier}"
+            label = ("团队 · " if is_team else "") + label_prefix + tier_label
+            windows.append(
+                window(
+                    key,
+                    label,
+                    used_percent=used,
+                    remaining_percent=max(0.0, 100 - used),
+                    reset_at=to_ts(period.get("reset_at")),
+                )
+            )
+    if not windows:
+        # 没有任何已订阅产品的窗口：带出 arkcli 报的具体 error（如有）
+        first_error = next(
+            (
+                str(item.get("error")).strip()
+                for item in items
+                if isinstance(item, dict)
+                and str(item.get("product") or "").lower() in _ARKCLI_PRODUCTS
+                and str(item.get("error") or "").strip()
+            ),
+            None,
+        )
+        raise ArkcliError("error", first_error or "arkcli 未返回任何已订阅的火山 Plan 用量")
+    return windows
+
+
+def _query_via_arkcli(base: dict) -> ChannelResult:
+    """无 AK/SK 时的查询路径：arkcli → 窗口 → 与 AK/SK 路径同构的结果。"""
+    try:
+        windows = parse_arkcli_usage(run_arkcli_usage_plan())
+    except ArkcliError as e:
+        return fail(e.status, e.message, **base)
+    plan_names: dict[str, str] = {}
+    if any(w.key.startswith("agent") for w in windows):
+        plan_names["agent_plan_name"] = "火山 Agent Plan" + (
+            "（含团队版）" if any(w.key.startswith("agent_team_") for w in windows) else ""
+        )
+    if any(w.key.startswith("coding") for w in windows):
+        plan_names["coding_plan_name"] = "火山 Coding Plan" + (
+            "（含团队版）" if any(w.key.startswith("coding_team_") for w in windows) else ""
+        )
+    name = " · ".join(v for v in plan_names.values()) or "火山方舟 Plan"
+    return ok(plan_name=name, windows=windows, source="arkcli usage plan", extra=plan_names, **base)
+
+
+def read_arkcli_credentials() -> Credential:
+    """启动自动探测用：arkcli 已安装、已登录且至少有一个订阅产品 → ok。
+
+    供 main.py 的 _SUBSCRIPTION_DETECTORS 使用——arkcli 登录过的机器开箱
+    自动建火山渠道（与 Claude/Cursor 的 CLI 登录态探测同模式）。
+    """
+    try:
+        parse_arkcli_usage(run_arkcli_usage_plan())
+    except ArkcliError as e:
+        status = {"not_found": CRED_NOT_FOUND, "expired": "expired"}.get(e.status, "error")
+        return Credential("", status, "arkcli", e.message)
+    return Credential("arkcli", CRED_OK, "arkcli usage plan")

@@ -286,6 +286,81 @@ async def query_kimi_api(channel: Channel) -> ChannelResult:
     )
 
 
+# ── 智谱 API 余额 ────────────────────────────────────────────
+
+
+async def query_zhipu_balance(channel: Channel) -> ChannelResult:
+    """智谱开放平台（bigmodel.cn）按量付费账户余额。
+
+    端点是控制台网页端的内部接口（官方文档没有公开的余额 API，社区验证可用）：
+    GET https://www.bigmodel.cn/api/biz/account/query-customer-account-report，
+    认证与智谱其它接口一致——Authorization 头直接放 API Key（不带 Bearer）。
+    响应的 balance 对象含 balance / availableBalance / rechargeAmount /
+    giveAmount / totalSpendAmount / frozenBalance（单位：元）。
+    """
+    base = {
+        "id": channel.id,
+        "type": channel.type,
+        "name": channel.name,
+        "category": "balance",
+    }
+    if (err := _require(channel.api_key, "API Key", base)) is not None:
+        return err
+    try:
+        data = await request_json(
+            "GET",
+            "https://www.bigmodel.cn/api/biz/account/query-customer-account-report",
+            headers={
+                # 智谱风格：Authorization 直放 API Key，不带 Bearer 前缀
+                "Authorization": channel.api_key,
+                "Accept": "application/json",
+            },
+        )
+    except Exception as e:
+        status, message = _status_for_error(e)
+        return fail(status, message, **base)
+
+    if not isinstance(data, dict):
+        return fail("error", "智谱余额响应格式错误", **base)
+    # 兼容两种包裹：{"data": {...}} 与直接平铺。业务失败时智谱返回 success=false
+    # / code!=200 + msg。
+    if data.get("success") is False or (data.get("code") not in (None, 200) and data.get("code") != 200):
+        return fail("error", str(data.get("msg") or "智谱余额查询失败"), **base)
+    outer = data.get("data") if isinstance(data.get("data"), dict) else data
+    # 实测（2026-08）响应是 data.balance 直接给金额数字、其余字段平铺在 data 里；
+    # 同时兼容 balance 本身是对象的旧形态（linux.do 帖子的示例是 balance.balance）。
+    raw_balance = outer.get("balance") if isinstance(outer, dict) else None
+    if isinstance(raw_balance, dict):
+        holder = raw_balance
+    elif raw_balance is not None and finite_float(raw_balance, None) is not None:
+        holder = outer
+    else:
+        return fail("error", "智谱未返回余额数据（响应里没有 balance 字段）", **base)
+
+    available = finite_float(holder.get("availableBalance"), None)
+    current = finite_float(holder.get("balance"), None)
+    total = available if available is not None else (current or 0.0)
+    total = max(0.0, total)
+    # 摘要行：累计充值 / 赠送 / 累计消费 / 冻结——字段缺失就跳过，不硬凑
+    parts = []
+    for key, label in (
+        ("rechargeAmount", "累计充值"),
+        ("giveAmount", "赠送"),
+        ("totalSpendAmount", "累计消费"),
+        ("frozenBalance", "冻结"),
+    ):
+        v = finite_float(holder.get(key), None)
+        if v is not None:
+            parts.append(f"{label} ¥{v:,.2f}")
+    return ok(
+        plan_name="智谱 API 账户余额",
+        amount=amount(total, "CNY", "¥"),
+        windows=[window("balance", "账户余额", max_label=f"¥{total:,.2f}")],
+        message=" · ".join(parts) or None,
+        **base,
+    )
+
+
 # ── new-api / one-api 中转站 ────────────────────────────────
 
 

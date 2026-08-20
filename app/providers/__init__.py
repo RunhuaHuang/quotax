@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from ..config import Channel
 from ..models import ChannelResult
-from . import balances, coding_plans, mimo, opencode, subscriptions, volcengine
+from . import bailian, balances, coding_plans, cursor, mimo, opencode, subscriptions, volcengine
 
 REGISTRY: dict[str, object] = {
     # 余额类
@@ -18,6 +18,7 @@ REGISTRY: dict[str, object] = {
     "openrouter": balances.query_openrouter,
     "novita": balances.query_novita,
     "kimi_api": balances.query_kimi_api,
+    "zhipu_balance": balances.query_zhipu_balance,
     "newapi": balances.query_newapi,
     # Coding Plan 类
     "kimi_coding": coding_plans.query_kimi_coding,
@@ -27,6 +28,7 @@ REGISTRY: dict[str, object] = {
     "volcengine": volcengine.query_volcengine,
     "zenmux": coding_plans.query_zenmux,
     "mimo": mimo.query_mimo,
+    "bailian": bailian.query_bailian,
     # 订阅只读类
     "claude_subscription": subscriptions.query_claude,
     "gemini_subscription": subscriptions.query_gemini,
@@ -34,6 +36,7 @@ REGISTRY: dict[str, object] = {
     "codex_subscription": subscriptions.query_codex,
     "copilot_subscription": subscriptions.query_copilot,
     "opencode_subscription": opencode.query_opencode,
+    "cursor_subscription": cursor.query_cursor,
 }
 
 

@@ -107,6 +107,39 @@ def test_parse_usage_text_decimal_percent():
     assert result.session_percent_left == 45
 
 
+def test_parse_usage_text_used_semantics_and_garbled_label():
+    """Claude 2.x 真实捕获：显示 "X% used"（剩余 = 100 - X），且标签被 TUI
+    重绘打乱（"Current session" → "Curretsession" 丢 n、"Current week (all
+    models)" → "Currentweek(allmodels)" 丢空格）。必须模糊匹配 + 换算语义。
+
+    样本取自 claude 2.1.226 的真实 PTY 输出。"""
+    text = (
+        "Currentweek(allmodels)\n"
+        "█████████████████████42%used\n"
+        "ResetsAug22at6:59pm(Asia/Shanghai)\n"
+        "Curretsession0%usedReses3:59pm(Asia/Shanghai)"
+    )
+    result = parse_usage_text(text)
+    # "0% used" → 剩余 100%；"42% used" → 剩余 58%
+    assert result.session_percent_left == 100
+    assert result.weekly_percent_left == 58
+
+
+def test_parse_usage_text_used_semantics_clean_layout():
+    """干净布局下的 used 语义：'Current session 30% used' → 剩余 70%。"""
+    text = "Current session\n30% used\nCurrent week (all models)\n50% used"
+    result = parse_usage_text(text)
+    assert result.session_percent_left == 70
+    assert result.weekly_percent_left == 50
+
+
+def test_parse_usage_text_ambiguous_percent_without_semantics_is_ignored():
+    """没有 used/remaining 关键词的裸百分比（如状态栏 0%）不应被当成用量。"""
+    text = "Current session\n45%"
+    result = parse_usage_text(text)
+    assert result.session_percent_left is None
+
+
 # ── fetch_usage_via_pty 边界 ─────────────────────────────────
 
 

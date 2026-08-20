@@ -7,14 +7,127 @@ upsert_channel 的字段保留逻辑（P0 级 bug 的回归测试）。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import socket
 import stat
 import threading
 
 import pytest
 
 from app import config as config_store
+
+# ── assert_public_http_url_async（异步版 SSRF 校验，不阻塞事件循环）──────────────
+
+
+def test_async_url_check_rejects_private_addresses():
+    """字面私网/回环地址在 DNS 解析前就被拒绝，与网络状态无关。"""
+    for url in (
+        "http://127.0.0.1/x",
+        "http://[::1]/x",
+        "http://192.168.1.1/x",
+        "http://localhost/x",
+        "https://metadata.google.internal/",
+    ):
+        with pytest.raises(config_store.SettingsValidationError):
+            asyncio.run(config_store.assert_public_http_url_async(url, field_name="测试 URL"))
+
+
+def test_async_url_check_allows_fake_ip_proxy_range():
+    """198.18.0.0/15 是 Clash TUN fake-ip 的回传段（被代理域名在本机一律解析成
+    它），真实路由由代理管控——必须放行，否则 fake-ip 用户所有境外渠道全挂。"""
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def run():
+            await config_store.assert_public_http_url_async(
+                "http://198.18.1.203/x", field_name="测试 URL"
+            )
+
+        loop.run_until_complete(run())
+    finally:
+        loop.close()
+    # 字面 127.0.0.1 仍拒绝（放行范围仅限 fake-ip 段）
+    with pytest.raises(config_store.SettingsValidationError):
+        asyncio.run(config_store.assert_public_http_url_async("http://127.0.0.1/x", field_name="测试 URL"))
+
+
+def _public_addr(host, port):
+    """构造一个解析到公网 IP 的 getaddrinfo 结果（不依赖真实 DNS/网络环境）。"""
+    return [
+        (
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+            6,
+            "",
+            ("93.184.216.34", port),
+        )
+    ]
+
+
+def test_async_url_check_accepts_public_hostname(monkeypatch):
+    """域名解析到公网 IP 时应通过；DNS 解析失败（gaierror）时也被吞掉、不抛异常。
+
+    不依赖真实网络：getaddrinfo 用 monkeypatch 固定返回值，避免沙箱 / CI / 内网 DNS
+    把公网域名解析到保留段（如 198.18.x.x）导致测试被环境状态左右。
+    """
+    loop = asyncio.new_event_loop()
+    monkeypatch.setattr(
+        loop,
+        "getaddrinfo",
+        lambda *a, **kw: asyncio.sleep(0, result=_public_addr(*a[:2])),
+    )
+
+    async def run():
+        await config_store.assert_public_http_url_async("https://example.com/x", field_name="测试 URL")
+
+    loop.run_until_complete(run())
+    loop.close()
+
+
+def test_async_url_check_swallows_dns_failure(monkeypatch):
+    """DNS 暂时解析失败不是 SSRF 风险，应静默通过；真正的网络错误由请求层呈现。"""
+
+    async def _failing_getaddrinfo(*a, **kw):
+        raise socket.gaierror("temporary failure in name resolution")
+
+    loop = asyncio.new_event_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", _failing_getaddrinfo)
+
+    async def run():
+        await config_store.assert_public_http_url_async("https://example.com/x", field_name="测试 URL")
+
+    loop.run_until_complete(run())
+    loop.close()
+
+
+def test_async_url_check_rejects_private_resolved_address(monkeypatch):
+    """域名即使能解析，一旦解析到私网/回环地址也必须被拒绝（DNS rebinding 防护）。"""
+
+    def _private_addr(*a, **kw):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.10", 443))]
+
+    loop = asyncio.new_event_loop()
+    monkeypatch.setattr(
+        loop,
+        "getaddrinfo",
+        lambda *a, **kw: asyncio.sleep(0, result=_private_addr(*a, **kw)),
+    )
+
+    async def run():
+        with pytest.raises(config_store.SettingsValidationError):
+            await config_store.assert_public_http_url_async("https://rebind.example/x", field_name="测试 URL")
+
+    loop.run_until_complete(run())
+    loop.close()
+
+
+def test_async_url_check_rejects_malformed_url():
+    with pytest.raises(config_store.SettingsValidationError):
+        asyncio.run(config_store.assert_public_http_url_async("not-a-url", field_name="测试 URL"))
+    with pytest.raises(config_store.SettingsValidationError):
+        asyncio.run(config_store.assert_public_http_url_async("ftp://example.com/x", field_name="测试 URL"))
 
 # ── mask_secret / is_masked_secret ──────────────────────────────
 

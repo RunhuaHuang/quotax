@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from .config import assert_public_http_url
+from .config import assert_public_http_url_async
 
 
 def _clip(value: Any, limit: int) -> str:
@@ -83,7 +83,7 @@ async def send_webhook(url: str, event: dict) -> dict:
     """POST 标准 JSON 告警事件。Webhook URL 可能含签名，结果中永不回显 URL。"""
     payload = {"source": "QuotaX", "version": 1, "event": event}
     try:
-        assert_public_http_url(url, field_name="Webhook URL")
+        await assert_public_http_url_async(url, field_name="Webhook URL")
         async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
             response = await client.post(url, json=payload, headers={"User-Agent": "QuotaX/0.1"})
         response.raise_for_status()

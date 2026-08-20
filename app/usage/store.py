@@ -78,7 +78,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             timestamp_ms     INTEGER NOT NULL,
             day              TEXT NOT NULL,          -- YYYY-MM-DD (UTC)
             model            TEXT,                   -- 原始模型名
-            pricing_model    TEXT,                   -- 归一化匹配键
+            pricing_model    TEXT,                   -- 原始模型名副本（与 model 一致；当前无查询使用，保留备用）
             session_id       TEXT,
             input_tokens     INTEGER NOT NULL DEFAULT 0,
             output_tokens    INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +98,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_usage_source ON usage_records(source);
         CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_records(timestamp_ms);
         CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_records(session_id);
+        -- rebill 只扫 has_cost=0 的记录：部分索引让候选集从全表缩小到无价行，
+        -- 否则 CAST(total_cost_usd AS REAL) 无法走索引，大库全表扫描 + 逐行更新
+        -- 会长时间卡住所有用量查询（它们共用同一个连接锁）。
+        CREATE INDEX IF NOT EXISTS idx_usage_rebill ON usage_records(has_cost) WHERE has_cost = 0;
 
         -- 增量扫描游标：JSONL 源记 (mtime_ns, line_offset)；SQLite 源记水位线。
         CREATE TABLE IF NOT EXISTS scan_progress (
@@ -141,9 +145,24 @@ def _init_schema(conn: sqlite3.Connection) -> None:
 
 def reset_for_test() -> None:
     """测试专用：关闭并重置全局连接（配合 monkeypatch DB_PATH 到 tmp 路径）。"""
+    close()
+
+
+def close() -> None:
+    """关闭全局连接；退出前先 checkpoint WAL（TRUNCATE），让 -wal/-shm 落回主库。
+
+    应用退出时若直接丢弃连接，WAL 可能长期不 checkpoint，-wal/-shm 文件持续
+    膨胀（get_database_status 统计的 size 包含它们）。TRUNCATE 模式把已提交内容
+    收进主文件并截断 WAL，优雅退出后不会留下巨大的临时文件。
+    """
     global _conn
     with _lock:
         if _conn is not None:
+            try:
+                _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                # checkpoint 失败不影响关闭（WAL 内容仍已持久化，只是没合并回主文件）
+                pass
             _conn.close()
             _conn = None
 
@@ -500,6 +519,14 @@ def load_pricing(book) -> None:
 # ── rebill：只补 0 成本记录 ─────────────────────────────────────
 
 
+# rebill 的逐行 UPDATE 语句（复用，避免在循环里重复拼字符串）
+_REBILL_UPDATE_SQL = """UPDATE usage_records SET
+                   input_cost_usd=?, output_cost_usd=?, cache_read_cost=?,
+                   cache_create_cost=?, total_cost_usd=?, has_cost=1,
+                   pricing_model=?
+                   WHERE source=? AND uuid=?"""
+
+
 def rebill_zero_cost(book) -> dict:
     """用最新 PricingBook 重算所有"当初无价记为 0"的记录成本。
 
@@ -507,18 +534,36 @@ def rebill_zero_cost(book) -> dict:
     的记录；已有真实价格的记录不动（避免历史账目被反复改写）。
 
     返回 {recounted, still_zero}：重算后仍为 0 的（新单价表也没匹配上）计数。
+
+    性能与并发：改用独立连接 + 批量提交执行。SQLite 单连接 + 全局 _lock 的模型
+    下，原实现会在持锁状态下全表 fetch + 逐行 UPDATE，大库（数十万行）会让所有
+    用量查询接口（overview/trend/log）在这期间全部排队。独立连接在 WAL 模式下
+    读取者可以并行，只在与采集写入重叠时有短暂写锁等待（timeout=10 兜底）；
+    批量 commit 进一步缩短单次持锁时间。部分索引 idx_usage_rebill 把候选集限制
+    在 has_cost=0 的行内（见 _init_schema）。
     """
     from .pricing import calc_cost  # 局部导入避免循环
 
-    conn = get_conn()
-    with _lock:
+    # 先走 get_conn() 确保 schema（含部分索引）已初始化，再开独立连接跑长事务
+    get_conn()
+    conn = _connect()
+    try:
         rows = conn.execute(
             "SELECT source, uuid, model, input_tokens, output_tokens, "
             "cache_creation, cache_read FROM usage_records "
-            "WHERE CAST(total_cost_usd AS REAL) <= 0 AND has_cost = 0"
+            "WHERE has_cost = 0 AND CAST(total_cost_usd AS REAL) <= 0"
         ).fetchall()
         recounted = 0
         still_zero = 0
+        updates: list[tuple] = []
+
+        def _flush() -> None:
+            nonlocal updates
+            if updates:
+                conn.executemany(_REBILL_UPDATE_SQL, updates)
+                conn.commit()
+                updates = []
+
         for r in rows:
             rate = book.resolve(r["model"] or "")
             if rate.is_unknown():
@@ -536,12 +581,7 @@ def rebill_zero_cost(book) -> dict:
             if cost["total_usd"] <= 0:
                 still_zero += 1
                 continue
-            conn.execute(
-                """UPDATE usage_records SET
-                   input_cost_usd=?, output_cost_usd=?, cache_read_cost=?,
-                   cache_create_cost=?, total_cost_usd=?, has_cost=1,
-                   pricing_model=?
-                   WHERE source=? AND uuid=?""",
+            updates.append(
                 (
                     str(cost["input_usd"]),
                     str(cost["output_usd"]),
@@ -551,10 +591,14 @@ def rebill_zero_cost(book) -> dict:
                     r["model"],
                     r["source"],
                     r["uuid"],
-                ),
+                )
             )
             recounted += 1
-        conn.commit()
+            if len(updates) >= 1000:  # 分批提交，避免单事务持有写锁过长
+                _flush()
+        _flush()
+    finally:
+        conn.close()
     return {"recounted": recounted, "still_zero": still_zero}
 
 

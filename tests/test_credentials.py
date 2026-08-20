@@ -17,7 +17,9 @@ from app.credentials import (
     CRED_NOT_FOUND,
     CRED_OK,
     CRED_PARSE_ERROR,
+    _claude_cli_auth_status,
     _parse_claude_json,
+    read_claude_credentials,
 )
 
 
@@ -29,11 +31,56 @@ def test_claude_ok_when_token_present_and_not_expired():
     assert cred.token == "sk-ant-oat-real"
 
 
-def test_claude_expired_when_expires_at_in_past():
+def test_claude_access_token_expired_but_session_valid_is_no_token():
+    """access token 过期 ≠ 登录过期：refresh token 未过期就仍是登录态。
+
+    真实场景：钥匙串里 accessToken 的 expiresAt 停在 CLI 上次写回时（CLI 用
+    refresh token 续期后通常不写回钥匙串），但 refreshTokenExpiresAt 还在未来。
+    此时必须走 CRED_NO_TOKEN（调用方改走 PTY 探测），不能误报 CRED_EXPIRED。
+    """
+    past_ms = 1_000_000_000_000  # 2001 年，早就过期
+    future_ms = 9_999_999_999_999  # 远未来
+    content = json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat-real",
+                "expiresAt": past_ms,
+                "refreshTokenExpiresAt": future_ms,
+                "subscriptionType": "pro",
+            }
+        }
+    )
+    cred = _parse_claude_json(content, "macOS Keychain (Claude Code-credentials)")
+    assert cred.status == CRED_NO_TOKEN
+    assert cred.token == ""  # 过期 token 不再交给调用方直接调用量 API
+    assert cred.extra["subscription_type"] == "pro"
+
+
+def test_claude_access_token_expired_without_session_field_is_no_token():
+    """没有 refreshTokenExpiresAt 字段时，access token 过期也不能判「登录过期」
+    ——会话状态未知，交给 PTY 探测，而不是拿短命 token 的 expiresAt 误判。"""
     past_ms = 1_000_000_000_000
     content = json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat-real", "expiresAt": past_ms}})
     cred = _parse_claude_json(content, "macOS Keychain (Claude Code-credentials)")
+    assert cred.status == CRED_NO_TOKEN
+
+
+def test_claude_expired_when_refresh_token_expires():
+    """refresh token 过期才是真正的「登录过期」，需要重新登录。"""
+    past_ms = 1_000_000_000_000
+    future_ms = 9_999_999_999_999
+    content = json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat-real",
+                "expiresAt": future_ms,
+                "refreshTokenExpiresAt": past_ms,
+            }
+        }
+    )
+    cred = _parse_claude_json(content, "macOS Keychain (Claude Code-credentials)")
     assert cred.status == CRED_EXPIRED
+    assert cred.token == "sk-ant-oat-real"
 
 
 def test_malformed_optional_expiry_does_not_crash_credential_parsing():
@@ -164,4 +211,39 @@ def test_copilot_not_found_when_neither_candidate_exists(monkeypatch, tmp_path):
     fake_home = tmp_path / "home_without_copilot"
     monkeypatch.setattr(credentials.Path, "home", lambda: fake_home)
     cred = credentials.read_copilot_credentials()
+    assert cred.status == CRED_NOT_FOUND
+
+
+# ── Claude CLI 权威登录态（claude auth status --json）──────────────
+
+
+def test_claude_cli_logged_out_short_circuits_before_keychain(monkeypatch):
+    """CLI 明确报告未登录时，读凭据应直接短路为 not_found，不再读钥匙串——
+    避免钥匙串里残留的旧 token 被误判为可用。"""
+    monkeypatch.setattr(credentials, "_claude_cli_auth_status", lambda: {"loggedIn": False})
+
+    def _forbidden_keychain_read(*_args, **_kwargs):
+        raise AssertionError("CLI 已报告未登录，不应再读钥匙串")
+
+    monkeypatch.setattr(credentials, "_run_security", _forbidden_keychain_read)
+    cred = credentials.read_claude_credentials()
+    assert cred.status == CRED_NOT_FOUND
+    assert "未登录" in (cred.message or "")
+
+
+def test_claude_cli_logged_in_falls_through_to_keychain(monkeypatch, tmp_path):
+    """CLI 报告已登录时继续走钥匙串路径（这里钥匙串无内容 → not_found）。"""
+    monkeypatch.setattr(credentials, "_claude_cli_auth_status", lambda: {"loggedIn": True})
+    monkeypatch.setattr(credentials, "_run_security", lambda *_a, **_k: None)
+    monkeypatch.setattr(credentials.Path, "home", lambda: tmp_path)
+    cred = credentials.read_claude_credentials()
+    assert cred.status == CRED_NOT_FOUND
+
+
+def test_claude_cli_auth_status_unavailable_does_not_short_circuit(monkeypatch, tmp_path):
+    """CLI 不存在/命令失败（返回 None）时，退回读钥匙串的原有逻辑。"""
+    monkeypatch.setattr(credentials, "_claude_cli_auth_status", lambda: None)
+    monkeypatch.setattr(credentials, "_run_security", lambda *_a, **_k: None)
+    monkeypatch.setattr(credentials.Path, "home", lambda: tmp_path)
+    cred = credentials.read_claude_credentials()
     assert cred.status == CRED_NOT_FOUND

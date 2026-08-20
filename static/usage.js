@@ -530,6 +530,7 @@ async function updateLitellm() {
   if (btn) { btn.disabled = true; btn.textContent = t("usage.updating"); }
   try {
     const res = await fetch("/api/usage/pricing/litellm", { method: "POST" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     if (data.error) toast(t("usage.updateLitellmFailed", { msg: data.error }));
     else {
@@ -545,6 +546,7 @@ async function doRebill(silent) {
   if (btn) { btn.disabled = true; btn.textContent = t("usage.rebilling"); }
   try {
     const res = await fetch("/api/usage/pricing/rebill", { method: "POST" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     if (!silent) toast(t("usage.rebillResult", { count: data.recounted, zero: data.still_zero }));
     await reloadAll();

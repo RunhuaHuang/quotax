@@ -20,7 +20,6 @@ Keychain 访问权限——它在交互式终端里能正常显示用量。所�
 from __future__ import annotations
 
 import os
-import pty
 import re
 import select
 import signal
@@ -43,7 +42,7 @@ class ClaudePTYUsage:
 
 # ANSI 转义码剥离：颜色、光标移动、清屏等。PTY 输出满是这些，不剥离无法正则匹配。
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b[=>]|\x1b\][^\x07]*\x07|\r")
-# 百分比数字：匹配 "45%" / "45.0%" / " 45 %"
+# 百分比数字：匹配 "45%" / "45.0%" / " 45 %" / "42%used"
 _PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
 
 
@@ -52,33 +51,115 @@ def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-def _find_percent_after_label(lines: list[str], label: str, window: int = 12) -> int | None:
-    """在文本中找到 label 所在行，向下 window 行内找第一个百分比数字。
+def _normalize_for_label(text: str) -> str:
+    """小写 + 只保留字母数字，用于容忍 TUI 重绘时丢失空格/字符的标签匹配。
+
+    Claude 的 /usage 是重绘式 TUI，同一行可能被捕获成 "Curret session"（丢 n）
+    或 "Currentweek(allmodels)"（丢空格）——普通 `in` 匹配会漏掉。
+    """
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein 编辑距离（输入是短标签 token，朴素单行实现足够快）。"""
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        for j, cb in enumerate(b, start=1):
+            cur.append(min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _fuzzy_contains(haystack: str, needle: str, max_dist: int = 2) -> bool:
+    """needle 是否以 ≤ max_dist 编辑距离出现在 haystack 中（滑动窗口）。"""
+    n = len(needle)
+    if n == 0:
+        return False
+    for i in range(len(haystack) - n + 1):
+        if _edit_distance(haystack[i : i + n], needle) <= max_dist:
+            return True
+    return False
+
+
+def _label_matches(line: str, label: str) -> bool:
+    """标签匹配：先精确（去空格小写），再容忍 1~2 字符错位的模糊匹配。
+
+    参考 CodexBar 的 normalizedForLabelSearch + editDistance：真实捕获里
+    "Current session" 会被重绘成 "Curretsession"（丢 n），精确匹配会漏。
+    """
+    norm_line = _normalize_for_label(line)
+    norm_label = _normalize_for_label(label)
+    if not norm_label:
+        return False
+    if norm_label in norm_line:
+        return True
+    if len(norm_label) >= 6:
+        return _fuzzy_contains(norm_line, norm_label, max_dist=2)
+    return False
+
+
+def _percent_left_from_line(line: str) -> int | None:
+    """从一行提取百分比，并按 used/remaining 语义返回「剩余百分比」。
+
+    Claude 2.x 显示 "X% used"（剩余 = 100 - X）；旧版显示 "X% remaining/left"
+    （剩余 = X）。语义不明（如状态栏的 0%）时返回 None，宁可丢弃也不猜。
+    """
+    m = _PERCENT_RE.search(line)
+    if not m:
+        return None
+    try:
+        pct = int(float(m.group(1)))
+    except ValueError:
+        return None
+    pct = max(0, min(100, pct))
+    lower = line.lower()
+    if any(k in lower for k in ("used", "spent", "consumed")):
+        return 100 - pct
+    if any(k in lower for k in ("left", "remaining", "available")):
+        return pct
+    return None
+
+
+def _find_percent_after_label(lines: list[str], label: str, window: int = 14) -> int | None:
+    """在 label 所在行向下 window 行内找第一个「剩余百分比」。
 
     Claude 的 /usage 面板形如：
         Current session
-        45% remaining · resets in 3h 22m
-    标签和百分比可能不在同一行（TUI 布局），所以要向下扫一个窗口。
-    返回百分比值（整数），找到的第一个为准。
+        45% remaining · resets in 3h 22m   （旧版）
+    或（2.x）：
+        Curretsession0%used                 （TUI 重绘打乱 + used 语义）
+    标签和百分比可能不在同一行，且标签可能被重绘打乱，所以要模糊匹配 + 扫窗口。
     """
     for i, line in enumerate(lines):
-        if label.lower() in line.lower():
+        if _label_matches(line, label):
             for candidate in lines[i : i + window]:
-                m = _PERCENT_RE.search(candidate)
-                if m:
-                    try:
-                        return int(float(m.group(1)))
-                    except ValueError:
-                        continue
+                pct = _percent_left_from_line(candidate)
+                if pct is not None:
+                    return pct
             break
     return None
 
 
-def _find_reset_after_label(lines: list[str], label: str, window: int = 12) -> str | None:
-    """在 label 附近找重置时间文案（如 "resets in 3h 22m" / "resets in 2 days"）。"""
-    reset_re = re.compile(r"(resets?\s+in\s+[^.\n]+)", re.IGNORECASE)
+def _all_percent_left(lines: list[str]) -> list[int]:
+    """按出现顺序收集所有「剩余百分比」，用于标签被打乱时的顺序兜底。"""
+    out = []
+    for line in lines:
+        pct = _percent_left_from_line(line)
+        if pct is not None:
+            out.append(pct)
+    return out
+
+
+def _find_reset_after_label(lines: list[str], label: str, window: int = 14) -> str | None:
+    """在 label 附近找重置时间文案（如 "resets in 3h 22m" / "Resets Aug 22 at 6:59pm"）。"""
+    reset_re = re.compile(r"(resets?\s+(?:in\s+)?[^.\n]+)", re.IGNORECASE)
     for i, line in enumerate(lines):
-        if label.lower() in line.lower():
+        if _label_matches(line, label):
             for candidate in lines[i : i + window]:
                 m = reset_re.search(candidate)
                 if m:
@@ -90,8 +171,8 @@ def _find_reset_after_label(lines: list[str], label: str, window: int = 12) -> s
 def parse_usage_text(text: str) -> ClaudePTYUsage:
     """解析 claude CLI /usage 的终端文本输出。
 
-    输入是已剥离 ANSI 的纯文本。返回 ClaudePTYUsage，百分比为「剩余」语义
-    （Claude CLI 的 /usage 面板显示的就是 "X% remaining"）。
+    输入是已剥离 ANSI 的纯文本。返回 ClaudePTYUsage，百分比统一为「剩余」语义：
+    Claude 2.x 的 "X% used" 会换算成 100 - X，旧版 "X% remaining" 直接取 X。
     如果文本里没有订阅用量标签（如 CLI 未登录，只有本地 session 统计），
     返回的各字段均为 None——调用方据此判断 PTY 路径不可用。
     """
@@ -100,6 +181,16 @@ def parse_usage_text(text: str) -> ClaudePTYUsage:
 
     # 订阅用量面板的关键标签（出现这些说明 CLI 已登录、返回了真实额度）
     result.session_percent_left = _find_percent_after_label(lines, "Current session")
+    if result.session_percent_left is None:
+        # 顺序兜底：标签被 TUI 重绘彻底打乱时，真实用量面板里第一个百分比即
+        # session（参考 CodexBar 的 allPercents 顺序回退；仅在确认处于用量面板
+        # 内才启用，避免把状态栏 "0%" 误当 session）。
+        norm = _normalize_for_label(text)
+        if "currentsession" in norm or "currentweek" in norm:
+            ordered = _all_percent_left(lines)
+            if ordered:
+                result.session_percent_left = ordered[0]
+
     result.weekly_percent_left = _find_percent_after_label(lines, "Current week (all models)")
 
     # 分模型周额度（Opus / Sonnet）——标签可能是任意一种
@@ -139,9 +230,17 @@ def fetch_usage_via_pty(timeout: float = 20) -> ClaudePTYUsage | None:
     if not is_claude_cli_available():
         return None
 
-    import fcntl
-    import struct
-    import termios
+    # pty / fcntl / termios 都是 Unix 专属模块，Windows 上 import 直接抛
+    # ModuleNotFoundError。模块 docstring 承诺"其他平台返回 None"，所以必须在
+    # 函数内 import 并在 ImportError 时优雅降级——模块级 import 会让 Windows
+    # 用户连导入本模块都直接崩溃，和承诺行为不符。
+    try:
+        import fcntl
+        import pty
+        import struct
+        import termios
+    except ImportError:
+        return None
 
     try:
         master, slave = pty.openpty()

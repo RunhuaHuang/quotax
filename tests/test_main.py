@@ -1000,6 +1000,54 @@ def test_host_whitelist_does_not_block_index_page(client):
     assert resp.status_code == 200
 
 
+# ── QUOTAX_ALLOWED_HOSTS：反向代理场景的 Host 白名单扩展 ─────────
+
+
+def test_load_allowed_hosts_default_without_env():
+    from app.main import _load_allowed_hosts
+
+    hosts = _load_allowed_hosts({})
+    assert {"127.0.0.1", "localhost", "::1", "testserver"} <= hosts
+    assert "quotax.example.com" not in hosts
+
+
+def test_load_allowed_hosts_appends_env_entries():
+    """逗号分隔的域名/IP 并入白名单（反向代理转发的 Host 放行）。"""
+    from app.main import _load_allowed_hosts
+
+    hosts = _load_allowed_hosts(
+        {"QUOTAX_ALLOWED_HOSTS": "quotax.prismaistudio.xyz, 192.168.100.209"}
+    )
+    assert "quotax.prismaistudio.xyz" in hosts
+    assert "192.168.100.209" in hosts
+    # 基础白名单不受影响
+    assert "127.0.0.1" in hosts
+
+
+def test_load_allowed_hosts_normalizes_case_and_ignores_empty():
+    from app.main import _load_allowed_hosts
+
+    hosts = _load_allowed_hosts({"QUOTAX_ALLOWED_HOSTS": " Quotax.Example.COM ,, ,"})
+    assert "quotax.example.com" in hosts
+    assert len(hosts) == 5  # 4 个基础 + 1 个归一化后的条目，空段不产生条目
+
+
+def test_env_allowed_host_passes_middleware(client, monkeypatch):
+    """端到端：环境变量放行的域名请求应通过中间件（模拟 Lucky 反代转发）。"""
+    from app import main as app_main
+
+    monkeypatch.setattr(
+        app_main, "_ALLOWED_HOSTS", app_main._load_allowed_hosts(
+            {"QUOTAX_ALLOWED_HOSTS": "quotax.prismaistudio.xyz"}
+        )
+    )
+    resp = client.get("/api/health", headers={"Host": "quotax.prismaistudio.xyz:663"})
+    assert resp.status_code == 200
+    # 未放行的域名依然 403——扩展白名单不是关闭防护
+    resp = client.get("/api/health", headers={"Host": "evil.com"})
+    assert resp.status_code == 403
+
+
 # ── Codex OAuth 端点（start / callback / poll）─────────────────
 
 
@@ -1043,15 +1091,51 @@ def test_oauth_callback_server_stop_is_scheduled_off_handler_thread(monkeypatch)
     caller_thread = threading.get_ident()
     stop_thread_ids = []
 
-    def fake_stop():
+    def fake_stop(httpd=None):
         stop_thread_ids.append(threading.get_ident())
         stopped.set()
 
     monkeypatch.setattr(app_main, "_stop_callback_server", fake_stop)
-    app_main._schedule_callback_server_stop()
+    app_main._schedule_callback_server_stop(object())
     assert stopped.wait(timeout=1)
     assert len(stop_thread_ids) == 1
     assert stop_thread_ids[0] != caller_thread
+
+
+class _FakeHttpd:
+    """最小 HTTPServer 替身：记录 shutdown / server_close 是否被调用。"""
+
+    def __init__(self):
+        self.shutdown_called = False
+        self.close_called = False
+
+    def shutdown(self):
+        self.shutdown_called = True
+
+    def server_close(self):
+        self.close_called = True
+
+
+def test_oauth_stop_only_closes_its_own_server_instance():
+    """延迟停止线程只关自己那一轮的服务器，绝不能误杀新一轮流程的服务器。
+
+    回归场景：流程#1 回调完成 → 调度停止线程（还没执行）；用户立刻开始流程#2，
+    start 端点已把共享 dict 里的 server 换成新实例。此时 #1 的停止线程晚到，如果
+    它从 dict 取"当前值"，会把 #2 的服务器关掉，导致第二次 OAuth 回调无人接收、
+    静默挂死到超时。身份比较（is 同一个实例）保证它只关自己捕获的那台。
+    """
+    old_server = _FakeHttpd()
+    new_server = _FakeHttpd()
+    app_main._active_oauth_server["server"] = new_server
+    # 模拟 #1 的延迟停止线程晚到：带着自己那轮的旧 server 实例来关闭
+    app_main._stop_callback_server(old_server)
+    assert app_main._active_oauth_server.get("server") is new_server  # 新服务器未被误杀
+    assert old_server.shutdown_called
+    assert not new_server.shutdown_called
+    # 新一轮 start 前的无参关闭才关"当前 server"
+    app_main._stop_callback_server()
+    assert app_main._active_oauth_server.get("server") is None
+    assert new_server.shutdown_called
 
 
 def test_codex_oauth_callback_creates_channel(client, monkeypatch):
@@ -1183,3 +1267,27 @@ def test_codex_oauth_created_channel_credentials_file_format(client, monkeypatch
     assert parsed.status == CRED_OK
     assert parsed.token == "at_fake"
     assert parsed.extra["account_id"] == "acc_oauth_test"
+
+
+# ── 火山渠道 AK/SK 可选（arkcli 回退）──────────────────────────
+
+
+def test_create_volcengine_channel_without_ak_sk_allowed(client):
+    """火山的 ak/sk 在 optional_fields 里——新建不填也要过（查询层回退 arkcli）。"""
+    resp = client.post(
+        "/api/channels",
+        json={"type": "volcengine", "name": "火山 arkcli", "enabled": True},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["type"] == "volcengine"
+
+
+def test_create_deepseek_channel_without_api_key_still_rejected(client):
+    """其它渠道的密钥必填约束不受影响（回归保护）。"""
+    resp = client.post(
+        "/api/channels",
+        json={"type": "deepseek", "name": "ds", "enabled": True},
+    )
+    assert resp.status_code == 400
+    assert "必填字段" in resp.json()["detail"]

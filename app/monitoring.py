@@ -224,7 +224,9 @@ class MonitorService:
         while not self._stop_requested:
             observed_revision = self._wake_revision
             try:
-                settings = self._get_settings()["monitor"]
+                # get_settings 默认实现会同步读盘 + 反序列化 config.json，放线程里
+                # 跑，避免阻塞事件循环（磁盘慢时整个服务会卡住）
+                settings = (await asyncio.to_thread(self._get_settings))["monitor"]
             except Exception as e:
                 self._state["last_error"] = f"读取监控设置失败: {e}"
                 self._next_run_at = None
@@ -243,7 +245,7 @@ class MonitorService:
                 # 故障永久停止后续检查。
                 logger.warning("本轮后台监控失败，将在下个周期重试")
             try:
-                interval = int(self._get_settings()["monitor"]["interval_seconds"])
+                interval = int((await asyncio.to_thread(self._get_settings))["monitor"]["interval_seconds"])
             except Exception as e:
                 self._state["last_error"] = f"读取监控设置失败: {e}"
                 self._next_run_at = None
@@ -262,7 +264,7 @@ class MonitorService:
             self._state["last_started_at"] = now_ms
             self._state["last_error"] = None
             try:
-                settings = self._get_settings()["monitor"]
+                settings = (await asyncio.to_thread(self._get_settings))["monitor"]
                 results = await self._query_results(force)
                 summary = await self._evaluate(results, settings, now_ms, reason)
                 self._state["last_result"] = summary
@@ -394,7 +396,7 @@ class MonitorService:
 
     async def status(self) -> dict:
         self._ensure_state_loaded()
-        settings = self._get_settings()["monitor"]
+        settings = (await asyncio.to_thread(self._get_settings))["monitor"]
         alerts = self._state.get("alerts") or {}
         active_alerts = [copy.deepcopy(v) for v in alerts.values() if isinstance(v, dict) and v.get("active")]
         return {

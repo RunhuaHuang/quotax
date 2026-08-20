@@ -10,7 +10,7 @@ import urllib.request
 
 import httpx
 
-from .config import assert_public_http_url
+from .config import assert_public_http_url_async
 
 TIMEOUT_SECONDS = 15.0
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -107,12 +107,23 @@ class ParseError(Exception):
 
 
 async def request_json(
-    method: str, url: str, *, headers: dict | None = None, json_body: dict | None = None
+    method: str,
+    url: str,
+    *,
+    headers: dict | None = None,
+    json_body: dict | None = None,
+    form_body: dict | None = None,
 ) -> dict | list:
-    """发送请求并解析 JSON；非 2xx 抛 ResponseError，JSON 非法抛 ParseError。"""
-    assert_public_http_url(url, field_name="请求 URL")
+    """发送请求并解析 JSON；非 2xx 抛 ResponseError，JSON 非法抛 ParseError。
+
+    json_body 与 form_body 互斥：前者发 JSON，后者发 application/x-www-form-
+    urlencoded（阿里云 OneConsole 网关等要求表单编码的接口用）。
+    """
+    await assert_public_http_url_async(url, field_name="请求 URL")
     client = get_client()
-    status_code, text = await _request_text_bounded(client, method, url, headers=headers, json_body=json_body)
+    status_code, text = await _request_text_bounded(
+        client, method, url, headers=headers, json_body=json_body, form_body=form_body
+    )
     if status_code < 200 or status_code >= 300:
         raise ResponseError(status_code, text[:500])
     try:
@@ -121,9 +132,11 @@ async def request_json(
         raise ParseError(f"响应不是合法 JSON: {e}") from e
 
 
-async def request_text(method: str, url: str, *, headers: dict | None = None, json_body: dict | None = None) -> str:
+async def request_text(
+    method: str, url: str, *, headers: dict | None = None, json_body: dict | None = None
+) -> str:
     """发送请求并返回文本；非 2xx 抛 ResponseError。"""
-    assert_public_http_url(url, field_name="请求 URL")
+    await assert_public_http_url_async(url, field_name="请求 URL")
     client = get_client()
     status_code, text = await _request_text_bounded(client, method, url, headers=headers, json_body=json_body)
     if status_code < 200 or status_code >= 300:
@@ -138,6 +151,7 @@ async def _request_text_bounded(
     *,
     headers: dict | None,
     json_body: dict | None,
+    form_body: dict | None = None,
 ) -> tuple[int, str]:
     """流式读取响应并在超过上限时立即中止。
 
@@ -145,7 +159,9 @@ async def _request_text_bounded(
     上游返回超大 HTML/JSON 时，事后检查仍可能造成内存峰值。使用 stream + bytearray
     把峰值限制在 ``MAX_RESPONSE_BYTES`` 附近，再交给上层做状态码/JSON 处理。
     """
-    async with client.stream(method, url, headers=headers, json=json_body) as response:
+    async with client.stream(
+        method, url, headers=headers, json=json_body, data=form_body
+    ) as response:
         body = bytearray()
         async for chunk in response.aiter_bytes():
             if len(body) + len(chunk) > MAX_RESPONSE_BYTES:

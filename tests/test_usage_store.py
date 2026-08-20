@@ -125,3 +125,86 @@ def test_usage_queries_share_calendar_day_window(isolated_usage_db):
     assert [row["model"] for row in store.query_model_breakdown(days=1)] == ["today-model"]
     assert store.query_request_log(days=1)["rows"][0]["model"] == "today-model"
     assert store.query_models(days=1) == ["today-model"]
+
+
+# ── rebill（只补 0 成本记录）─────────────────────────────────────
+
+
+def _zero_cost_record(uuid: str, model: str, timestamp_ms: int) -> dict:
+    return {
+        "uuid": uuid,
+        "timestamp_ms": timestamp_ms,
+        "model": model,
+        "pricing_model": model,
+        "session_id": "session",
+        "input_tokens": 1_000_000,
+        "output_tokens": 500_000,
+        "cache_creation": 0,
+        "cache_read": 0,
+        "total_cost_usd": "0.000000",  # 真实采集写入的无价记录是 6 位小数格式
+        "has_cost": False,
+    }
+
+
+def test_rebill_recounts_zero_cost_records_and_keeps_unknown_zero(isolated_usage_db):
+    from app.usage.pricing import PricingBook
+
+    book = PricingBook()
+    book.upsert("gpt-4o", 2.5, 10.0, 1.25, 5.0, is_builtin=False)
+    now_ms = int(datetime(2026, 8, 10, tzinfo=UTC).timestamp() * 1000)
+    assert store.upsert_records(
+        "test",
+        [
+            _zero_cost_record("matched", "gpt-4o", now_ms),
+            _zero_cost_record("unknown", "no-such-model", now_ms),
+        ],
+    ) == 2
+
+    result = store.rebill_zero_cost(book)
+    assert result["recounted"] == 1
+    assert result["still_zero"] == 1
+
+    rows = {r["uuid"]: r for r in store.get_conn().execute(
+        "SELECT uuid, has_cost, total_cost_usd FROM usage_records"
+    )}
+    # 有价的补算成功：has_cost 置 1、成本不再是 0（1M input@2.5 + 0.5M output@10 = 7.5）
+    assert rows["matched"]["has_cost"] == 1
+    assert float(rows["matched"]["total_cost_usd"]) > 0
+    # 单价表没匹配上的保持原样
+    assert rows["unknown"]["has_cost"] == 0
+    assert float(rows["unknown"]["total_cost_usd"]) == 0
+
+
+def test_rebill_never_rewrites_already_priced_records(isolated_usage_db):
+    from app.usage.pricing import PricingBook
+
+    book = PricingBook()
+    book.upsert("gpt-4o", 2.5, 10.0, 1.25, 5.0, is_builtin=False)
+    now_ms = int(datetime(2026, 8, 10, tzinfo=UTC).timestamp() * 1000)
+    priced = _zero_cost_record("priced", "gpt-4o", now_ms)
+    priced["total_cost_usd"] = "9.990000"
+    priced["has_cost"] = True
+    assert store.upsert_records("test", [priced]) == 1
+
+    result = store.rebill_zero_cost(book)
+    assert result["recounted"] == 0
+
+    row = store.get_conn().execute(
+        "SELECT has_cost, total_cost_usd FROM usage_records WHERE uuid='priced'"
+    ).fetchone()
+    assert row["has_cost"] == 1
+    assert row["total_cost_usd"] == "9.990000"
+
+
+# ── close（退出时 checkpoint WAL 并关闭连接）─────────────────────
+
+
+def test_close_then_reopen_keeps_data(isolated_usage_db):
+    now_ms = int(datetime(2026, 8, 10, tzinfo=UTC).timestamp() * 1000)
+    assert store.upsert_records("test", [_record("r1", now_ms)]) == 1
+    store.close()
+    # close 后全局连接可重建（惰性），数据仍然完整
+    status = store.get_database_status()
+    assert status["ok"] is True
+    assert status["records"] == 1
+    assert store.query_overview(days=365)["requests"] == 1

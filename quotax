@@ -16,7 +16,18 @@ set -e
 
 # 安装目录（install.sh 写入这个占位，找不到则回退默认路径）
 PERM_DIR="${QUOTAX_HOME:-$HOME/QuotaX}"
+
+# 可选的持久化环境变量文件（反向代理场景放 QUOTAX_HOST / QUOTAX_ALLOWED_HOSTS，
+# 避免每次启动都要手动 export）。set -a 让文件里的 KEY=VALUE 自动 export 给
+# nohup 启动的 uvicorn 子进程。
+if [ -f "$PERM_DIR/quotax.env" ]; then
+  set -a
+  . "$PERM_DIR/quotax.env"
+  set +a
+fi
+
 PORT="${QUOTAX_PORT:-8900}"
+HOST="${QUOTAX_HOST:-127.0.0.1}"
 LOG_FILE="$PERM_DIR/quotax.log"
 PID_FILE="$PERM_DIR/quotax.pid"
 
@@ -24,6 +35,19 @@ if ! [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || ((10#$PORT < 1 || 10#$PORT > 65535)); then
   echo "Error: QUOTAX_PORT 必须是 1 到 65535 之间的整数。" >&2
   exit 2
 fi
+# HOST 进入 uvicorn 参数，限制为 IP/主机名合法字符（含 IPv6 字面量方括号）。
+# 不用 [[ =~ ]]：macOS 系统自带 bash 3.2 对含 \[ 的字面量正则解析不可靠（实测
+# 全部 NOMATCH），改用 glob（case）匹配，所有 bash 版本行为一致。
+case "$HOST" in
+  [\[]*[\]) HOST_INNER="${HOST:1:${#HOST}-2}" ;;  # [::1] → ::1
+  *) HOST_INNER="$HOST" ;;
+esac
+case "$HOST_INNER" in
+  ""|*[!A-Za-z0-9.:-]*)
+    echo "Error: QUOTAX_HOST 只能是 IP 地址或主机名（当前值: $HOST）。" >&2
+    exit 2
+    ;;
+esac
 
 is_quotax_command() {
   local command="$1"
@@ -91,7 +115,7 @@ case "${1:-start}" in
     fi
     # 后台启动 uvicorn，nohup 保证退出终端后服务继续运行。
     mkdir -p "$PERM_DIR"
-    nohup uv run uvicorn app.main:app --host 127.0.0.1 --port "$PORT" > "$LOG_FILE" 2>&1 &
+    nohup uv run uvicorn app.main:app --host "$HOST" --port "$PORT" > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     echo -n "启动 QuotaX（端口 $PORT）"
     # 轮询等待就绪（最多 30 秒）

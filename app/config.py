@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import ipaddress
@@ -62,6 +63,9 @@ class ConfigCorruptedError(RuntimeError):
 # 这些字段名即便出现在某个渠道的 fields 列表里也永远是可选的（新建渠道时不强制必填）。
 # api_key / ak / sk / base_url / workspace_id 才是各渠道自己 fields 列表里出现时的必填项。
 OPTIONAL_FIELD_NAMES = {"region", "organization", "project", "user_id", "workspace_id"}
+# 个别渠道还可以在自己的 PROVIDERS 条目里声明 optional_fields（如火山：AK/SK
+# 留空时查询层自动回退本机 arkcli 的 SSO 登录态），新建时不强制必填。
+GLOBAL_OPTIONAL = ...  # noqa: placeholder removed below
 
 # 渠道类型目录（含各类所需的配置字段、分类、默认名称）
 PROVIDERS: dict[str, dict] = {
@@ -108,6 +112,13 @@ PROVIDERS: dict[str, dict] = {
         "default_name": "Kimi API 余额",
         "manage_url": "https://platform.moonshot.cn/console/balance",
     },
+    "zhipu_balance": {
+        "category": "balance",
+        "label": "智谱 API 余额",
+        "fields": ["api_key"],
+        "default_name": "智谱 API 余额",
+        "manage_url": "https://bigmodel.cn/usercenter/finance",
+    },
     "newapi": {
         "category": "balance",
         "label": "new-api / one-api 中转站",
@@ -144,6 +155,9 @@ PROVIDERS: dict[str, dict] = {
         "manage_url": "https://platform.minimaxi.com/console/personal-info",
     },
     "volcengine": {
+        # AK/SK 可不填：未配置时查询层自动回退本机 arkcli 的 SSO 登录态
+        #（arkcli auth login，见 volcengine._query_via_arkcli）
+        "optional_fields": ["ak", "sk"],
         "category": "coding_plan",
         "label": "火山方舟 Agent/Coding Plan",
         "fields": ["ak", "sk", "region"],
@@ -162,6 +176,15 @@ PROVIDERS: dict[str, dict] = {
         "fields": ["api_key"],
         "default_name": "MiMo Coding Plan",
         "manage_url": "https://platform.xiaomimimo.com/",
+    },
+    "bailian": {
+        # api_key 借用为 Cookie 存储（同 mimo/opencode）；region: cn（默认，大陆
+        # 个人版）/ intl（国际 Model Studio 个人版）
+        "category": "coding_plan",
+        "label": "阿里云百炼 Token Plan",
+        "fields": ["api_key", "region"],
+        "default_name": "百炼 Token Plan",
+        "manage_url": "https://bailian.console.aliyun.com/?tab=plan#/efm/subscription/token-plan/personal",
     },
     # ── 订阅只读类（自动读 CLI 凭据文件）──
     "claude_subscription": {
@@ -207,6 +230,15 @@ PROVIDERS: dict[str, dict] = {
         "fields": ["api_key", "workspace_id"],
         "default_name": "OpenCode 订阅",
         "manage_url": "https://opencode.ai/",
+    },
+    "cursor_subscription": {
+        # 自动读本机 Cursor 的 state.vscdb 登录态（无需任何配置），同 Claude/
+        # Gemini 等订阅渠道的「只读凭据」模式
+        "category": "subscription",
+        "label": "Cursor 订阅",
+        "fields": [],
+        "default_name": "Cursor 订阅",
+        "manage_url": "https://cursor.com/settings",
     },
 }
 
@@ -797,6 +829,13 @@ def _is_private_or_reserved_ip(host: str) -> bool:
         address = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
         return False
+    # 198.18.0.0/15（RFC 2544 基准测试段）是 Clash / sing-box 等代理 TUN
+    # fake-ip 模式的事实标准回传段：开启后所有被代理域名在本机都解析成
+    # 198.18.x.x，真实解析由代理远端完成。把它当作「代理环境的假 IP」放行——
+    # 普通网络下该段不可路由（放行不构成 SSRF 面）；不放行则 fake-ip 用户的
+    # 所有境外渠道全挂（实测：api.anthropic.com → 198.18.1.203）。
+    if address.version == 4 and address in ipaddress.ip_network("198.18.0.0/15"):
+        return False
     return bool(
         address.is_private
         or address.is_loopback
@@ -805,6 +844,40 @@ def _is_private_or_reserved_ip(host: str) -> bool:
         or address.is_multicast
         or address.is_unspecified
     )
+
+
+def _parse_public_url(url: str, *, field_name: str) -> tuple[str, int]:
+    """解析 URL 并做字面主机/IP 检查，返回 (host, port)；非法则抛 SettingsValidationError。
+
+    只校验字面值（域名/字面 IP），不做 DNS 解析——解析交给调用方决定用什么方式
+    （同步 socket.getaddrinfo / 异步 loop.getaddrinfo），避免把阻塞式解析硬塞给
+    不需要它的调用路径。
+    """
+    try:
+        parsed = urlsplit(url)
+    except ValueError as e:
+        raise SettingsValidationError(f"{field_name} 主机名格式不正确") from e
+    # 与旧版 assert_public_http_url 保持一致的 URL 合法性校验（重构进本函数时
+    # 一度丢失，靠 DNS 校验碰巧兜住——fake-ip 环境下会漏放 ftp:// 等非法 scheme）
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise SettingsValidationError(f"{field_name} 必须是完整的 http:// 或 https:// URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise SettingsValidationError(f"{field_name} 不允许在 URL 中携带用户名或密码")
+    if parsed.fragment:
+        raise SettingsValidationError(f"{field_name} 不允许包含 fragment")
+    try:
+        port_value = parsed.port
+    except ValueError as e:
+        raise SettingsValidationError(f"{field_name} 端口号不合法") from e
+    if port_value is not None and not (1 <= port_value <= 65535):
+        raise SettingsValidationError(f"{field_name} 端口号必须在 1-65535 之间")
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise SettingsValidationError(f"{field_name} 缺少主机名")
+    if host in _PRIVATE_HOST_NAMES or _is_private_or_reserved_ip(host):
+        raise SettingsValidationError(f"{field_name} 不允许指向本机、内网或链路本地地址")
+    port = port_value or (443 if parsed.scheme == "https" else 80)
+    return host, port
 
 
 def assert_public_http_url(
@@ -817,21 +890,37 @@ def assert_public_http_url(
     风险。由于解析与实际连接由底层网络栈分两步完成，不能把这项检查描述成绝对
     的 IP 固定。DNS 暂时不可解析时不在保存阶段拒绝配置，让用户仍能先保存离线
     配置，真正请求时再给出网络错误。
+
+    注意：本函数是同步的，内部 socket.getaddrinfo 会阻塞调用线程。异步上下文
+    里请用 assert_public_http_url_async（事件循环版，不会阻塞事件循环）。
     """
-    try:
-        parsed = urlsplit(url)
-    except ValueError as e:
-        raise SettingsValidationError(f"{field_name} 主机名格式不正确") from e
-    host = (parsed.hostname or "").strip().lower().rstrip(".")
-    if not host:
-        raise SettingsValidationError(f"{field_name} 缺少主机名")
-    if host in _PRIVATE_HOST_NAMES or _is_private_or_reserved_ip(host):
-        raise SettingsValidationError(f"{field_name} 不允许指向本机、内网或链路本地地址")
+    host, port = _parse_public_url(url, field_name=field_name)
     if not resolve_dns:
         return
     try:
-        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
-    except (OSError, socket.gaierror):
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:  # socket.gaierror 是 OSError 的子类，无需单独列出
+        return
+    for info in infos:
+        address = info[4][0]
+        if _is_private_or_reserved_ip(address):
+            raise SettingsValidationError(f"{field_name} 解析到了本机、内网或链路本地地址")
+
+
+async def assert_public_http_url_async(url: str, *, field_name: str = "URL") -> None:
+    """async 版 URL 校验：字面 IP 检查同步做，DNS 解析走事件循环的 getaddrinfo。
+
+    loop.getaddrinfo 内部把阻塞的 getaddrinfo 丢到线程池执行，因此不会像
+    assert_public_http_url 那样在事件循环线程上同步解析域名。网络层每次发上游
+    请求前都会做这个校验，如果解析慢（DNS 抽风 / 无网络），同步版会把整个事件
+    循环卡住数秒（期间所有 API 无响应）；这里保证校验本身不阻塞其他协程。
+    """
+    host, port = _parse_public_url(url, field_name=field_name)
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, port, type=socket.SOCK_STREAM
+        )
+    except OSError:  # socket.gaierror 是 OSError 的子类，无需单独列出
         return
     for info in infos:
         address = info[4][0]

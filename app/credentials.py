@@ -76,6 +76,39 @@ def _expired(ts: float | None) -> bool:
 CLAUDE_OAUTH_KEYS = ("claude.ai_oauth", "claudeAiOauth")
 
 
+def _claude_cli_auth_status() -> dict | None:
+    """用 `claude auth status --json` 拿 CLI 自己的登录态（权威来源）。
+
+    参考 CodexBar 的 ClaudeCLIAuthStatusProbe：钥匙串里的 access token 会陈旧，
+    而 CLI 自己最清楚登录有没有效。返回解析后的 JSON dict（含 loggedIn 字段）；
+    CLI 不存在 / 命令失败 / 输出非法时返回 None，调用方退回读钥匙串。
+    """
+    from shutil import which
+
+    if which("claude") is None:
+        return None
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")}
+    env["DISABLE_AUTOUPDATER"] = "1"
+    env["DISABLE_TELEMETRY"] = "1"
+    try:
+        result = subprocess.run(  # noqa: PLW1510
+            ["claude", "auth", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=env,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def read_claude_credentials() -> Credential:
     """来源：macOS Keychain `Claude Code-credentials`，或 ~/.claude/.credentials.json。
 
@@ -92,6 +125,17 @@ def read_claude_credentials() -> Credential:
     """
     source = ""
     content: str | None = None
+
+    # 先问 Claude CLI 自己登录没登录（权威，参考 CodexBar 的 ClaudeCLIAuthStatusProbe）。
+    # CLI 明确报告未登录时直接短路，避免钥匙串里残留的旧 token 被误判为可用。
+    cli_status = _claude_cli_auth_status()
+    if cli_status is not None and cli_status.get("loggedIn") is False:
+        return Credential(
+            "",
+            CRED_NOT_FOUND,
+            "Claude Code 未登录",
+            "Claude Code 未登录（claude CLI 报告），请先运行 claude 登录",
+        )
 
     keychain = _run_security(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
     if keychain:
@@ -168,8 +212,32 @@ def _parse_claude_json(content: str, source: str) -> Credential:
             },
         )
 
-    if _expired(entry.get("expiresAt") or entry.get("expires_at")):
+    # 会话寿命（refresh token）才是「登录是否过期」的唯一正确信号。access token
+    # 是短命的（几十分钟到几小时），Claude CLI 用 refresh token 在后台自动续期，
+    # 但通常不会把新 access token 写回钥匙串——钥匙串里的 expiresAt 早就过期，
+    # 拿它判登录会误报「已过期」。参考 CodexBar：登录态看 refreshTokenExpiresAt。
+    session_expires_at = entry.get("refreshTokenExpiresAt") or entry.get("refresh_token_expires_at")
+    if _expired(session_expires_at):
         return Credential(token, CRED_EXPIRED, source, "Claude 登录已过期，请重新运行 claude 登录")
+
+    # access token 已过期但会话仍有效：不是登出，只是这份 token 不能直接调用量
+    # API。归入 CRED_NO_TOKEN（「无可用的 access token」），让调用方走 PTY 探测——
+    # CLI 自己会用它手里的 refresh token 换新并显示实时用量（与 CodexBar 委托 CLI
+    # 刷新的思路一致）。
+    if _expired(entry.get("expiresAt") or entry.get("expires_at")):
+        return Credential(
+            "",
+            CRED_NO_TOKEN,
+            source,
+            "Claude Code 登录仍有效，但钥匙串里的 access token 已过期"
+            "（Claude CLI 刷新后通常不写回钥匙串）。QuotaX 将改用 Claude CLI 探测实时用量。",
+            extra={
+                "subscription_type": subscription_type,
+                "rate_limit_tier": rate_limit_tier,
+                "scopes": scopes,
+            },
+        )
+
     return Credential(
         token, CRED_OK, source,
         extra={"subscription_type": subscription_type, "rate_limit_tier": rate_limit_tier},
@@ -414,4 +482,77 @@ def read_copilot_credentials() -> Credential:
         CRED_NOT_FOUND,
         "GitHub Copilot 未登录",
         "未找到 Copilot 登录凭据（请先安装并登录 Copilot）",
+    )
+
+
+# ── Cursor（IDE 本地登录态）─────────────────────────────────
+
+
+def _jwt_payload(token: str) -> dict:
+    """无验签地解出 JWT 的 payload 段（base64url）。只用来取 sub/email 等展示
+    信息，不做任何安全判断——token 本身就是刚从本机 Cursor 数据库读出来的。"""
+    import base64
+
+    parts = token.split(".")
+    if len(parts) < 2:
+        return {}
+    pad = "=" * (-len(parts[1]) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(parts[1] + pad)
+        parsed = json.loads(decoded)
+    except (ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def read_cursor_credentials() -> Credential:
+    """只读 Cursor 的本地登录态：state.vscdb（SQLite）ItemTable 里的
+    cursorAuth/accessToken（JWT）。
+
+    参考 CodExBar CursorAppAuth：macOS 在 ~/Library/Application Support/Cursor，
+    Linux 在 ~/.config/Cursor。以只读 + immutable 模式打开，绝不写回（Cursor
+    正在运行时 WAL 可能持有写锁，immutable 读避免互相干扰）。token 里的 sub
+    （用户 ID）用于构造 cursor.com 的 Web 会话 Cookie。
+    """
+    import sqlite3
+
+    home = Path.home()
+    candidates = [
+        home / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb",
+        home / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb",
+    ]
+    for db_path in candidates:
+        if not db_path.exists():
+            continue
+        token: str | None = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True, timeout=2)
+            try:
+                row = conn.execute(
+                    "SELECT value FROM ItemTable WHERE key = ? LIMIT 1",
+                    ("cursorAuth/accessToken",),
+                ).fetchone()
+                if row and isinstance(row[0], str) and row[0].strip():
+                    token = row[0].strip()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            # 数据库被锁 / 损坏：当作该候选不可用，继续下一个
+            continue
+        if not token:
+            continue
+        payload = _jwt_payload(token)
+        sub = payload.get("sub")
+        extra: dict = {}
+        if sub:
+            extra["sub"] = sub
+        if payload.get("email"):
+            extra["email"] = payload["email"]
+        return Credential(token, CRED_OK, str(db_path), extra=extra)
+
+    return Credential(
+        "",
+        CRED_NOT_FOUND,
+        "Cursor 未登录",
+        "未找到 Cursor 登录凭据（请安装并登录 Cursor 后重试探测）",
     )

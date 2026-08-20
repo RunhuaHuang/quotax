@@ -1235,6 +1235,8 @@ function renderDynamicFields(existing = null) {
   // 另需 workspace_id（wrk_xxx）。与 MiMo 同源：官网无 JSON API，靠 SSR 页面
   // + 浏览器 Cookie。
   const isOpenCode = type === "opencode_subscription";
+  // 阿里云百炼同样无公开 JSON API，额度走控制台 OneConsole 网关 + 浏览器 Cookie
+  const isBailian = type === "bailian";
   // 火山渠道的 AK/SK 需要在火山引擎 IAM 控制台创建，提示用户去哪拿
   const isVolcengine = type === "volcengine";
 
@@ -1244,6 +1246,8 @@ function renderDynamicFields(existing = null) {
         fields += field("api_key", t("field.cookie"), t("field.mimoCookiePlaceholder"), true, "text");
       } else if (isOpenCode) {
         fields += field("api_key", t("field.cookie"), t("field.opencodeCookiePlaceholder"), true, "text");
+      } else if (isBailian) {
+        fields += field("api_key", t("field.cookie"), t("field.bailianCookiePlaceholder"), true, "text");
       } else {
         fields += field("api_key", t("field.apiKey"), t("field.apiKeyPlaceholder"));
       }
@@ -1261,12 +1265,14 @@ function renderDynamicFields(existing = null) {
     ? t("hint.mimo")
     : isOpenCode
       ? t("hint.opencode")
-      : isVolcengine
-        ? t("hint.volcengine")
-        : meta.category === "subscription"
-          ? t("hint.subscription")
-          : meta.category === "local"
-            ? t("hint.local")
+      : isBailian
+        ? t("hint.bailian")
+        : isVolcengine
+          ? t("hint.volcengine")
+          : meta.category === "subscription"
+            ? t("hint.subscription")
+            : meta.category === "local"
+              ? t("hint.local")
             : t("hint.balance");
 
   // Codex 渠道：OAuth 在线登录（推荐）+ 可选上传 auth.json（多账号）。
@@ -1417,6 +1423,8 @@ async function onSaveChannel(e) {
   const type = $("#fType").value;
   const meta = providersCatalog[type];
   const isOpenCode = type === "opencode_subscription";
+  // 这三个渠道的 api_key 字段实际存的是浏览器 Cookie，校验提示按 Cookie 措辞
+  const isCookieField = type === "opencode_subscription" || type === "bailian" || type === "mimo";
   const payload = {
     id: editingId || undefined,
     type,
@@ -1429,7 +1437,7 @@ async function onSaveChannel(e) {
   }
 
   const fieldLabel = (r) => {
-    if (r === "api_key") return isOpenCode ? t("field.cookie") : t("field.apiKey");
+    if (r === "api_key") return isCookieField ? t("field.cookie") : t("field.apiKey");
     if (r === "ak") return t("field.ak");
     if (r === "sk") return t("field.sk");
     if (r === "base_url") return t("field.baseUrl");
@@ -1446,8 +1454,11 @@ async function onSaveChannel(e) {
     }
   }
   if (!editingId) {
+    // 火山渠道例外：AK/SK 可不填——后端会自动回退到本机 arkcli 的 SSO 登录态
+    //（arkcli auth login），与 Claude/Cursor 的本机凭据模式同源。
+    const secretsOptional = type === "volcengine";
     for (const r of SECRET_FIELDS) {
-      if (meta.fields.includes(r) && !payload[r]) {
+      if (!secretsOptional && meta.fields.includes(r) && !payload[r]) {
         toast(t("toast.fillRequired", { field: fieldLabel(r) }), "err");
         return;
       }

@@ -17,6 +17,7 @@ BRANCH="main"
 PERM_DIR="$HOME/QuotaX"
 TMP_DIR=$(mktemp -d)
 PORT="${QUOTAX_PORT:-8900}"
+HOST="${QUOTAX_HOST:-127.0.0.1}"
 PID_FILE="$PERM_DIR/quotax.pid"
 
 # 端口值会进入 shell 命令、curl URL 和 uvicorn 参数，必须先限制为纯数字的
@@ -25,6 +26,20 @@ if ! [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || ((10#$PORT < 1 || 10#$PORT > 65535)); then
   echo "Error: QUOTAX_PORT 必须是 1 到 65535 之间的整数。" >&2
   exit 2
 fi
+
+# HOST 进入 uvicorn 参数，限制为 IP/主机名合法字符（含 IPv6 字面量方括号）。
+# 不用 [[ =~ ]]：macOS 系统自带 bash 3.2 对含 \[ 的字面量正则解析不可靠（实测
+# 全部 NOMATCH），改用 glob（case）匹配，所有 bash 版本行为一致。
+case "$HOST" in
+  [\[]*[\]) HOST_INNER="${HOST:1:${#HOST}-2}" ;;  # [::1] → ::1
+  *) HOST_INNER="$HOST" ;;
+esac
+case "$HOST_INNER" in
+  ""|*[!A-Za-z0-9.:-]*)
+    echo "Error: QUOTAX_HOST 只能是 IP 地址或主机名（当前值: $HOST）。" >&2
+    exit 2
+    ;;
+esac
 
 INSTALL_SWAPPED=0
 OLD_DIR="$PERM_DIR"
@@ -362,7 +377,7 @@ if command -v lsof &>/dev/null; then
 fi
 
 # nohup 后台启动，退出本脚本后服务继续运行。
-nohup uv run uvicorn app.main:app --host 127.0.0.1 --port "$PORT" > "$LOG_FILE" 2>&1 &
+nohup uv run uvicorn app.main:app --host "$HOST" --port "$PORT" > "$LOG_FILE" 2>&1 &
 APP_PID=$!
 echo "$APP_PID" > "$PID_FILE"
 

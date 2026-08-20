@@ -6,6 +6,9 @@ Gemini 的 camelCase/snake_case 兼容 helper。不发起任何真实网络请�
 from __future__ import annotations
 
 import asyncio
+import json
+
+import pytest
 
 from app.config import Channel
 from app.models import window as make_window
@@ -1077,6 +1080,11 @@ def test_all_registered_providers_return_valid_channel_result_without_network(mo
         "read_copilot_credentials",
     ):
         monkeypatch.setattr(subscriptions, name, missing)
+    # cursor 的凭据读取在它自己的模块命名空间里（不走 subscriptions），同样替换，
+    # 否则会真读本机 Cursor 的 state.vscdb——测试将依赖所在机器的状态。
+    from app.providers import cursor as cursor_provider
+
+    monkeypatch.setattr(cursor_provider, "read_cursor_credentials", missing)
 
     async def network_forbidden(*_args, **_kwargs):
         raise AssertionError("无凭据契约测试不应发起网络请求")
@@ -1108,3 +1116,485 @@ def test_all_registered_providers_return_valid_channel_result_without_network(mo
             assert quota_window.reset_at is None or quota_window.reset_at > 1_000_000_000_000
         if result.status == "ok":
             assert result.amount or result.windows or result.message
+
+
+# ── 智谱 API 余额（query_zhipu_balance）────────────────────────
+
+
+def _run_zhipu_balance(monkeypatch, resp, headers_seen=None):
+    from app.credentials import CRED_OK, Credential
+    from app.providers import balances
+
+    async def fake_request_json(method, url, *, headers=None, json_body=None, form_body=None):
+        if headers_seen is not None:
+            headers_seen.update(headers or {})
+        return resp
+
+    monkeypatch.setattr(balances, "request_json", fake_request_json)
+    ch = Channel(id="ch_zb", type="zhipu_balance", name="智谱余额", api_key="test-key")
+    return asyncio.run(balances.query_zhipu_balance(ch))
+
+
+def test_zhipu_balance_ok(monkeypatch):
+    # 实测形态（2026-08 抓包）：data.balance 直接是金额数字，其余字段平铺
+    resp = {
+        "code": 200,
+        "msg": "操作成功",
+        "success": True,
+        "data": {
+            "balance": 42.5,
+            "availableBalance": 40.0,
+            "rechargeAmount": 100.0,
+            "giveAmount": 20.0,
+            "totalSpendAmount": 77.5,
+            "frozenBalance": 2.5,
+        },
+    }
+    headers: dict = {}
+    result = _run_zhipu_balance(monkeypatch, resp, headers)
+    assert result.status == "ok"
+    assert result.amount["value"] == 40.0  # 优先可用余额
+    assert result.amount["currency"] == "CNY"
+    # 智谱风格：Authorization 直放 key，不带 Bearer 前缀
+    assert headers.get("Authorization") == "test-key"
+    msg = result.message or ""
+    assert "累计充值 ¥100.00" in msg and "累计消费 ¥77.50" in msg
+
+
+def test_zhipu_balance_wrapped_directly(monkeypatch):
+    """无 data 包裹、balance 为对象的旧形态（linux.do 帖子示例）也要兼容。"""
+    resp = {"balance": {"balance": 12.34}}
+    result = _run_zhipu_balance(monkeypatch, resp)
+    assert result.status == "ok"
+    assert result.amount["value"] == 12.34
+
+
+def test_zhipu_balance_real_shape(monkeypatch):
+    """真实抓包形态回归：balance=0.0、availableBalance=0.0、充值 20 消费 20。"""
+    resp = {
+        "code": 200, "msg": "操作成功", "success": True,
+        "data": {"balance": 0.0, "rechargeAmount": 20.0, "giveAmount": 0.0,
+                 "totalSpendAmount": 20.0, "availableBalance": 0.0, "frozenBalance": 0.0},
+    }
+    result = _run_zhipu_balance(monkeypatch, resp)
+    assert result.status == "ok"
+    assert result.amount["value"] == 0.0
+    assert "累计充值 ¥20.00" in (result.message or "")
+
+
+def test_zhipu_balance_business_error(monkeypatch):
+    result = _run_zhipu_balance(monkeypatch, {"success": False, "code": 401, "msg": "令牌无效"})
+    assert result.status == "error"
+    assert "令牌无效" in (result.message or "")
+
+
+def test_zhipu_balance_missing_key(monkeypatch):
+    from app.providers import balances
+
+    ch = Channel(id="ch_zb2", type="zhipu_balance", name="智谱余额", api_key="")
+    result = asyncio.run(balances.query_zhipu_balance(ch))
+    # _require 统一返回 error（Pydantic 层已挡新建缺失，这里是兜底）
+    assert result.status == "error"
+
+
+# ── 阿里云百炼（bailian）──────────────────────────────────────
+
+
+def test_bailian_parse_ratio_and_embedded_json():
+    """百分比是 0-1 比例（×100）；部分字段的值是内嵌 JSON 字符串，要递归展开。"""
+    from app.providers.bailian import parse_bailian_usage
+
+    data = {
+        "data": json.dumps(
+            {
+                "usage": {
+                    "per5HourPercentage": 0.42,
+                    "per1WeekPercentage": 0.17,
+                    "per5HourResetTime": 1756000000000,
+                    "per1WeekResetTime": "2026-08-22 18:59:00",
+                }
+            }
+        )
+    }
+    parsed = parse_bailian_usage(data)
+    assert parsed["five_hour_used"] == 42.0
+    assert parsed["weekly_used"] == 17.0
+    assert parsed["five_hour_reset_ms"] == 1756000000000
+    assert parsed["weekly_reset_ms"] is not None
+
+
+def test_bailian_parse_direct_percent_values():
+    """兼容个别接口直接返回百分数（>1 直接当百分比）。"""
+    from app.providers.bailian import parse_bailian_usage
+
+    parsed = parse_bailian_usage({"per5HourPercentage": 42, "per1WeekPercentage": 88.5})
+    assert parsed["five_hour_used"] == 42.0
+    assert parsed["weekly_used"] == 88.5
+
+
+def test_bailian_parse_no_usage_raises():
+    from app.providers.bailian import parse_bailian_usage
+
+    with pytest.raises(ValueError):
+        parse_bailian_usage({"foo": "bar"})
+
+
+def _run_bailian(monkeypatch, resp, *, cookie="a=1; login_aliyunid_csrf=csrf123", region=None, http_error=None, captured=None):
+    from app.net import ResponseError
+    from app.providers import bailian
+
+    async def fake_request_json(method, url, *, headers=None, json_body=None, form_body=None):
+        if captured is not None:
+            captured.update({"method": method, "url": url, "headers": headers or {}, "form": form_body})
+        if http_error is not None:
+            raise http_error
+        return resp
+
+    async def fake_sec_token(cookie_header, region_cfg):
+        return "sec-tok"
+
+    monkeypatch.setattr(bailian, "request_json", fake_request_json)
+    monkeypatch.setattr(bailian, "_resolve_sec_token", fake_sec_token)
+    ch = Channel(id="ch_bl", type="bailian", name="百炼", api_key=cookie, region=region)
+    return asyncio.run(bailian.query_bailian(ch))
+
+
+def test_bailian_query_ok(monkeypatch):
+    captured: dict = {}
+    resp = {"data": {"per5HourPercentage": 0.3, "per1WeekPercentage": 0.66}}
+    result = _run_bailian(monkeypatch, resp, captured=captured)
+    assert result.status == "ok"
+    by_label = {w.label: w for w in result.windows}
+    assert by_label["每 5 小时"].used_percent == 30.0
+    assert by_label["每周额度"].remaining_percent == 34.0
+    # 表单 POST：sec_token 注入 + params 信封；CSRF 头来自 login_aliyunid_csrf
+    assert captured["method"] == "POST"
+    assert captured["form"]["sec_token"] == "sec-tok"
+    assert "cornerstoneParam" in captured["form"]["params"]
+    assert captured["headers"].get("x-csrf-token") == "csrf123"
+    assert captured["headers"].get("x-xsrf-token") == "csrf123"
+    assert captured["url"].startswith("https://bailian-cs.console.aliyun.com/data/api.json")
+
+
+def test_bailian_query_intl_region(monkeypatch):
+    captured: dict = {}
+    result = _run_bailian(monkeypatch, {"per5HourPercentage": 0.5}, region="intl", captured=captured)
+    assert result.status == "ok"
+    assert "国际版" in result.plan_name
+    assert captured["url"].startswith("https://bailian-singapore-cs.alibabacloud.com")
+
+
+def test_bailian_query_expired_on_401(monkeypatch):
+    from app.net import ResponseError
+
+    result = _run_bailian(monkeypatch, None, http_error=ResponseError(401, "denied"))
+    assert result.status == "expired"
+    assert "Cookie" in (result.message or "")
+
+
+def test_bailian_query_missing_cookie(monkeypatch):
+    from app.providers import bailian
+
+    ch = Channel(id="ch_bl2", type="bailian", name="百炼", api_key="")
+    result = asyncio.run(bailian.query_bailian(ch))
+    assert result.status == "not_found"
+
+
+def test_bailian_query_unknown_region(monkeypatch):
+    from app.providers import bailian
+
+    ch = Channel(id="ch_bl3", type="bailian", name="百炼", api_key="a=1", region="mars")
+    result = asyncio.run(bailian.query_bailian(ch))
+    assert result.status == "error"
+
+
+# ── Cursor 订阅 ───────────────────────────────────────────────
+
+
+def test_jwt_payload_extracts_sub():
+    from app.credentials import _jwt_payload
+    import base64
+
+    def b64(d):
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+
+    token = f"header.{b64({'sub': 'user-123', 'email': 'a@b.com'})}.sig"
+    payload = _jwt_payload(token)
+    assert payload["sub"] == "user-123"
+    assert payload["email"] == "a@b.com"
+    assert _jwt_payload("not-a-jwt") == {}
+
+
+def _make_fake_state_vscdb(tmp_path, token: str | None):
+    import sqlite3
+
+    db = tmp_path / "state.vscdb"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE ItemTable (key TEXT, value BLOB)")
+    if token is not None:
+        conn.execute("INSERT INTO ItemTable VALUES (?, ?)", ("cursorAuth/accessToken", token))
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_read_cursor_credentials_from_vscdb(monkeypatch, tmp_path):
+    import base64
+
+    from app import credentials
+
+    def b64(d):
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+
+    token = f"h.{b64({'sub': 'user-9', 'email': 'x@y.com'})}.s"
+    db = _make_fake_state_vscdb(tmp_path, token)
+    fake_home = tmp_path / "home"
+    gs = fake_home / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage"
+    gs.mkdir(parents=True)
+    (gs / "state.vscdb").write_bytes(db.read_bytes())
+
+    monkeypatch.setattr(credentials.Path, "home", lambda: fake_home)
+    cred = credentials.read_cursor_credentials()
+    assert cred.status == "ok"
+    assert cred.token == token
+    assert cred.extra["sub"] == "user-9"
+    assert cred.extra["email"] == "x@y.com"
+
+
+def test_read_cursor_credentials_not_found(monkeypatch, tmp_path):
+    from app import credentials
+
+    monkeypatch.setattr(credentials.Path, "home", lambda: tmp_path / "empty-home")
+    cred = credentials.read_cursor_credentials()
+    assert cred.status == "not_found"
+
+
+def test_parse_cursor_usage_summary_plan():
+    from app.providers.cursor import parse_cursor_usage_summary
+
+    data = {
+        "membershipType": "pro",
+        "billingCycleEnd": "2026-09-01T00:00:00Z",
+        "individualUsage": {
+            "plan": {"enabled": True, "used": 2000, "limit": 2000, "remaining": 0, "totalPercentUsed": 87.5},
+            "onDemand": {"enabled": True, "used": 7384, "limit": 10000},
+        },
+    }
+    parsed = parse_cursor_usage_summary(data)
+    assert parsed["membership"] == "pro"
+    assert parsed["plan_used_percent"] == 87.5
+    assert parsed["plan_used_usd"] == 20.0  # cents → USD
+    assert parsed["on_demand_used_usd"] == 73.84
+    assert parsed["cycle_end_ms"] is not None
+
+
+def test_parse_cursor_usage_summary_overall_fallback():
+    """企业/团队成员没有 plan，只有 overall（个人配额上限）——要能用。"""
+    from app.providers.cursor import parse_cursor_usage_summary
+
+    data = {"individualUsage": {"overall": {"used": 500, "limit": 10000, "totalPercentUsed": 5.0}}}
+    parsed = parse_cursor_usage_summary(data)
+    assert parsed["plan_used_percent"] == 5.0
+    assert parsed["plan_limit_usd"] == 100.0
+
+
+def test_parse_cursor_usage_summary_empty_raises():
+    from app.providers.cursor import parse_cursor_usage_summary
+
+    with pytest.raises(ValueError):
+        parse_cursor_usage_summary({"individualUsage": {}})
+
+
+def _run_cursor(monkeypatch, resp, *, http_error=None, captured=None):
+    import base64
+
+    from app.credentials import CRED_OK, Credential
+    from app.providers import cursor as cursor_provider
+
+    def b64(d):
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+
+    token = f"h.{b64({'sub': 'user-77', 'email': 'u@v.com'})}.s"
+    monkeypatch.setattr(
+        cursor_provider,
+        "read_cursor_credentials",
+        lambda: Credential(token, CRED_OK, "test-vscdb", extra={"sub": "user-77", "email": "u@v.com"}),
+    )
+
+    from app.net import ResponseError
+
+    async def fake_request_json(method, url, *, headers=None, json_body=None, form_body=None):
+        if captured is not None:
+            captured.update({"url": url, "headers": headers or {}})
+        if http_error is not None:
+            raise http_error
+        return resp
+
+    monkeypatch.setattr(cursor_provider, "request_json", fake_request_json)
+    ch = Channel(id="ch_cur", type="cursor_subscription", name="Cursor")
+    return asyncio.run(cursor_provider.query_cursor(ch))
+
+
+def test_query_cursor_ok(monkeypatch):
+    captured: dict = {}
+    resp = {
+        "membershipType": "pro",
+        "billingCycleEnd": "2026-09-01T00:00:00Z",
+        "individualUsage": {"plan": {"enabled": True, "used": 1500, "limit": 2000, "totalPercentUsed": 75.0}},
+    }
+    result = _run_cursor(monkeypatch, resp, captured=captured)
+    assert result.status == "ok"
+    assert result.plan_name == "Cursor Pro"
+    w = result.windows[0]
+    assert w.used_percent == 75.0
+    assert w.used_label == "$15.00"
+    # 会话 Cookie：WorkosCursorSessionToken=<sub>%3A%3A<token>（:: 编码为 %3A%3A）
+    assert captured["headers"]["Cookie"].startswith("WorkosCursorSessionToken=user-77%3A%3A")
+    assert "u@v.com" in (result.message or "")
+
+
+def test_query_cursor_401_maps_expired(monkeypatch):
+    from app.net import ResponseError
+
+    result = _run_cursor(monkeypatch, None, http_error=ResponseError(401, "denied"))
+    assert result.status == "expired"
+    assert "Cursor" in (result.message or "")
+
+
+# ── 火山 arkcli 回退（对照 CodExBar DoubaoUsageFetcher 协议）────────
+
+
+def _arkcli_fixture() -> dict:
+    """arkcli usage plan --format json 的结构化样本：个人/团队 × Coding/Agent。"""
+    return {
+        "viewer": {"auth_method": "volc_passport"},
+        "items": [
+            {
+                "product": "coding-plan",
+                "subscribed": True,
+                "updated_at": 1756000000000,
+                "periods": [
+                    {"label": "5-hour", "percent": 12.5, "reset_at": "2026-08-20T15:00:00Z"},
+                    {"label": "weekly", "percent": 44.0, "reset_at": 1756000000},
+                ],
+            },
+            {
+                "product": "coding-plan-team",
+                "subscribed": True,
+                "periods": [{"label": "weekly", "percent": 8.0, "reset_at": 1756000000000}],
+            },
+            {
+                "product": "agent-plan",
+                "subscribed": True,
+                "periods": [{"label": "monthly", "percent": 66.0}],
+            },
+            {"product": "agent-plan-team", "subscribed": False, "periods": []},
+            {"product": "something-else", "subscribed": True, "periods": [{"label": "weekly", "percent": 1}]},
+        ],
+    }
+
+
+def test_arkcli_parse_personal_and_team_windows():
+    windows = volcengine.parse_arkcli_usage(_arkcli_fixture())
+    by_key = {w.key: w for w in windows}
+    # 个人 Coding：key 带 coding_ 前缀（main.py 拆卡依赖）
+    assert by_key["coding_five_hour"].used_percent == 12.5
+    assert by_key["coding_five_hour"].reset_at is not None
+    assert by_key["coding_weekly"].remaining_percent == 56.0
+    # 团队 Coding：key 带 coding_team_ 前缀 + label 带团队标记
+    assert by_key["coding_team_weekly"].used_percent == 8.0
+    assert "团队" in by_key["coding_team_weekly"].label
+    # Agent 月度窗口
+    assert by_key["agent_monthly"].used_percent == 66.0
+    # 未订阅的 team-agent 与未知产品都不产生窗口
+    assert "agent_team_monthly" not in by_key
+    assert len(windows) == 4
+
+
+def test_arkcli_parse_auth_method_none_raises_expired():
+    fixture = _arkcli_fixture()
+    fixture["viewer"] = {"auth_method": "none"}
+    with pytest.raises(volcengine.ArkcliError) as e:
+        volcengine.parse_arkcli_usage(fixture)
+    assert e.value.status == "expired"
+
+
+def test_arkcli_parse_no_subscribed_usage_raises_with_item_error():
+    with pytest.raises(volcengine.ArkcliError) as e:
+        volcengine.parse_arkcli_usage(
+            {"viewer": {"auth_method": "passport"}, "items": [{"product": "coding-plan", "subscribed": True, "periods": [], "error": "quota service unavailable"}]}
+        )
+    assert e.value.status == "error"
+    assert "quota service unavailable" in e.value.message
+
+
+def _run_volcengine_arkcli(monkeypatch, *, ak="", sk="", fixture=None, arkcli_error=None):
+    def fake_run():
+        if arkcli_error is not None:
+            raise arkcli_error
+        return fixture
+
+    monkeypatch.setattr(volcengine, "run_arkcli_usage_plan", fake_run)
+    ch = Channel(id="ch_vs", type="volcengine", name="火山", ak=ak, sk=sk)
+    return asyncio.run(volcengine.query_volcengine(ch))
+
+
+def test_query_volcengine_falls_back_to_arkcli_without_ak_sk(monkeypatch):
+    result = _run_volcengine_arkcli(monkeypatch, fixture=_arkcli_fixture())
+    assert result.status == "ok"
+    assert result.source == "arkcli usage plan"
+    # 拆卡需要的 plan_names（含团队版标记）
+    extra = result.extra or {}
+    assert extra["agent_plan_name"] == "火山 Agent Plan"
+    assert "团队版" in extra["coding_plan_name"]
+    assert any(w.key == "coding_team_weekly" for w in result.windows)
+
+
+def test_query_volcengine_arkcli_not_installed_maps_not_found(monkeypatch):
+    result = _run_volcengine_arkcli(
+        monkeypatch, arkcli_error=volcengine.ArkcliError("not_found", "未找到 arkcli CLI")
+    )
+    assert result.status == "not_found"
+
+
+def test_query_volcengine_arkcli_not_logged_in_maps_expired(monkeypatch):
+    result = _run_volcengine_arkcli(
+        monkeypatch, arkcli_error=volcengine.ArkcliError("expired", "arkcli 未登录")
+    )
+    assert result.status == "expired"
+
+
+def test_run_arkcli_auth_error_marker_in_stderr(monkeypatch):
+    """非零退出 + stderr 含未登录关键词 → expired（CodExBar isArkcliAuthenticationError）。"""
+    import subprocess as sp
+
+    class FakeCompleted:
+        returncode = 1
+        stdout = ""
+        stderr = "Error: not logged in, please login first"
+
+    monkeypatch.setattr(volcengine, "_resolve_arkcli_path", lambda: "/fake/arkcli")
+    monkeypatch.setattr(volcengine.subprocess, "run", lambda *a, **k: FakeCompleted())
+    with pytest.raises(volcengine.ArkcliError) as e:
+        volcengine.run_arkcli_usage_plan()
+    assert e.value.status == "expired"
+
+
+def test_run_arkcli_missing_binary(monkeypatch):
+    monkeypatch.setattr(volcengine, "_resolve_arkcli_path", lambda: None)
+    with pytest.raises(volcengine.ArkcliError) as e:
+        volcengine.run_arkcli_usage_plan()
+    assert e.value.status == "not_found"
+
+
+def test_read_arkcli_credentials_ok_and_not_found(monkeypatch):
+    monkeypatch.setattr(volcengine, "run_arkcli_usage_plan", lambda: _arkcli_fixture())
+    cred = volcengine.read_arkcli_credentials()
+    assert cred.status == "ok"
+
+    def boom():
+        raise volcengine.ArkcliError("not_found", "未找到 arkcli")
+
+    monkeypatch.setattr(volcengine, "run_arkcli_usage_plan", boom)
+    cred = volcengine.read_arkcli_credentials()
+    assert cred.status == "not_found"

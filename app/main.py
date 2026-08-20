@@ -30,6 +30,7 @@ from .credentials import CRED_NO_TOKEN, CRED_OK
 from .models import ChannelResult, fail
 from .net import aclose, friendly_error
 from .providers import channel_category, query_channel
+from .providers import volcengine as volcengine_provider
 from .usage import collect as usage_collect
 from .usage import pricing as usage_pricing
 from .usage import store as usage_store
@@ -168,7 +169,7 @@ async def lifespan(_app: FastAPI):
         except Exception:
             logger.exception("启动时自动采集用量统计失败")
         try:
-            retention_days = config_store.get_settings()["monitor"]["retention_days"]
+            retention_days = (await asyncio.to_thread(config_store.get_settings))["monitor"]["retention_days"]
             await asyncio.to_thread(usage_store.cleanup_old_records, retention_days)
         except Exception:
             logger.exception("启动时清理过期用量记录失败")
@@ -179,7 +180,7 @@ async def lifespan(_app: FastAPI):
         while True:
             await asyncio.sleep(21_600)
             try:
-                retention_days = config_store.get_settings()["monitor"]["retention_days"]
+                retention_days = (await asyncio.to_thread(config_store.get_settings))["monitor"]["retention_days"]
                 await asyncio.to_thread(usage_store.cleanup_old_records, retention_days)
             except Exception:
                 logger.exception("定期清理过期用量记录失败")
@@ -197,6 +198,9 @@ async def lifespan(_app: FastAPI):
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        # 关 SQLite 全局连接并 checkpoint WAL（-wal/-shm 落回主库），避免退出后
+        # 遗留膨胀的 WAL 临时文件；collect/cleanup 后台任务已在上面取消并等待结束
+        await asyncio.to_thread(usage_store.close)
         await aclose()
 
 
@@ -220,18 +224,38 @@ app = FastAPI(title="QuotaX", lifespan=lifespan)
 # 显式设置或覆盖它）。即使 DNS 把 evil.com 解析到了 127.0.0.1，浏览器发出的
 # 请求 Host 头仍然是 "evil.com"（或 "evil.com:<port>"），不会变成
 # "127.0.0.1"——所以只要挡住 Host 头不在白名单里的请求，就能挡住这类攻击。
-_ALLOWED_HOSTS = {
-    "127.0.0.1",
-    "localhost",
-    "::1",
-    # Starlette TestClient（httpx 的 ASGITransport）默认发送的 Host 头固定是
-    # "testserver"，测试代码不会也不需要显式设置它。本项目 100+ 个测试全部走
-    # TestClient，不放行这个值的话会全部返回 403。这不是需要额外环境变量开关
-    # 才能豁免的生产风险："testserver" 是一个不含点的单标签名，公网 DNS 无法
-    # 把它解析到攻击者的服务器，残余风险仅限于用户自己在本地 hosts/内网 DNS 里
-    # 把这个名字配置指向本机的极端场景，和本工具"个人本机使用"的定位不冲突。
-    "testserver",
-}
+def _load_allowed_hosts(env: dict[str, str]) -> set[str]:
+    """基础本机白名单 + 环境变量 QUOTAX_ALLOWED_HOSTS 追加的条目。
+
+    反向代理场景（如 Lucky/nginx 把服务发布到自有域名）必须显式放行代理转发的
+    Host：QUOTAX_ALLOWED_HOSTS 是逗号分隔的主机名/IP（不带端口——端口在比较前
+    已被 _host_without_port 剥掉），小写化后并入白名单。配合启动脚本的
+    QUOTAX_HOST=0.0.0.0 一起使用（见 quotax 脚本的 quotax.env 加载）。
+
+    注意：放行 Host 只是不让 DNS rebinding 防护拦截该域名，不是访问控制——
+    本服务无认证、/api/config/export 会返回明文密钥，公网暴露务必在上游反代
+    （Lucky 的安全规则 / BasicAuth / IP 白名单）加访问控制。
+    """
+    hosts = {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+        # Starlette TestClient（httpx 的 ASGITransport）默认发送的 Host 头固定是
+        # "testserver"，测试代码不会也不需要显式设置它。本项目 100+ 个测试全部走
+        # TestClient，不放行这个值的话会全部返回 403。这不是需要额外环境变量开关
+        # 才能豁免的生产风险："testserver" 是一个不含点的单标签名，公网 DNS 无法
+        # 把它解析到攻击者的服务器，残余风险仅限于用户自己在本地 hosts/内网 DNS 里
+        # 把这个名字配置指向本机的极端场景，和本工具"个人本机使用"的定位不冲突。
+        "testserver",
+    }
+    for item in (env.get("QUOTAX_ALLOWED_HOSTS") or "").split(","):
+        normalized = item.strip().lower()
+        if normalized:
+            hosts.add(normalized)
+    return hosts
+
+
+_ALLOWED_HOSTS = _load_allowed_hosts(os.environ)
 
 
 def _host_without_port(host_header: str) -> str:
@@ -417,7 +441,8 @@ async def providers():
 @app.get("/api/channels")
 async def list_channels():
     """渠道列表（密钥打码）。"""
-    return [c.to_dict(secret=False) for c in config_store.list_channels()]
+    channels = await asyncio.to_thread(config_store.list_channels)
+    return [c.to_dict(secret=False) for c in channels]
 
 
 # ── 订阅渠道自动探测 ──────────────────────────────────────────
@@ -434,6 +459,10 @@ _SUBSCRIPTION_DETECTORS: dict[str, tuple] = {
     "grok_subscription": (credentials_store.read_grok_credentials, "Grok 订阅"),
     "codex_subscription": (credentials_store.read_codex_credentials, "Codex 订阅"),
     "copilot_subscription": (credentials_store.read_copilot_credentials, "GitHub Copilot"),
+    "cursor_subscription": (credentials_store.read_cursor_credentials, "Cursor 订阅"),
+    # 火山：arkcli SSO 登录态探测（无 AK/SK 也能开箱建渠道；查询层自动回退
+    # arkcli，见 volcengine._query_via_arkcli）
+    "volcengine": (volcengine_provider.read_arkcli_credentials, "火山方舟"),
 }
 
 
@@ -501,12 +530,16 @@ async def create_or_update_channel(payload: ChannelPayload):
     if payload.id:
         payload.id = _canonical_channel_id(payload.id)
 
-    is_new = not payload.id or config_store.get_channel(payload.id) is None
+    # get_channel / upsert_channel 都涉及 config.json 全量读盘+反序列化，放线程里
+    # 避免阻塞事件循环（磁盘慢时整个服务会卡住）
+    is_new = not payload.id or await asyncio.to_thread(config_store.get_channel, payload.id) is None
     if is_new:
+        provider_meta = config_store.PROVIDERS[payload.type]
+        optional = set(provider_meta.get("optional_fields", ()))
         required = [
             f
-            for f in config_store.PROVIDERS[payload.type].get("fields", [])
-            if f not in config_store.OPTIONAL_FIELD_NAMES
+            for f in provider_meta.get("fields", [])
+            if f not in config_store.OPTIONAL_FIELD_NAMES and f not in optional
         ]
         missing = [f for f in required if not getattr(payload, f, None)]
         if missing:
@@ -519,7 +552,9 @@ async def create_or_update_channel(payload: ChannelPayload):
         # model_fields_set：请求体里显式出现过的字段名（区分"没提供"和"提供了
         # 空值"）。比如前端启用/停用开关只发 {"id","type","enabled"}，name/
         # base_url 等字段不该被这次更新清空——见 config_store.upsert_channel。
-        channel = config_store.upsert_channel(data, provided_fields=payload.model_fields_set)
+        channel = await asyncio.to_thread(
+            config_store.upsert_channel, data, provided_fields=payload.model_fields_set
+        )
     except (TypeError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     await _invalidate_cache(channel.id)
@@ -531,19 +566,22 @@ async def remove_channel(channel_id: str):
     # 前端展示的火山 Agent/Coding 子卡带有后缀；删除入口虽然当前配置列表传的是
     # 原始 ID，但 API 也应与编辑、停用、密钥读取和历史查询保持一致。普通渠道若
     # 真实 ID 恰好以 _agent/_coding 结尾，canonical_channel_id 会优先保留原 ID。
-    channel_id = _canonical_channel_id(channel_id)
-    # 删除渠道前先拿到它关联的上传凭据文件，渠道删掉后就查不到了
-    channel = config_store.get_channel(channel_id)
-    if not config_store.delete_channel(channel_id):
+    # 删除渠道前先拿到它关联的上传凭据文件，渠道删掉后就查不到了。config 读写
+    # 和历史清理都是磁盘 I/O，统一放线程里执行，避免阻塞事件循环。
+    channel_id = await asyncio.to_thread(_canonical_channel_id, channel_id)
+    channel = await asyncio.to_thread(config_store.get_channel, channel_id)
+    if not await asyncio.to_thread(config_store.delete_channel, channel_id):
         raise HTTPException(status_code=404, detail="渠道不存在")
     await _invalidate_cache(channel_id)
-    history_store.delete_channel_history(channel_id)
+    await asyncio.to_thread(history_store.delete_channel_history, channel_id)
     try:
-        settings = config_store.get_settings()
+        settings = await asyncio.to_thread(config_store.get_settings)
         thresholds = dict(settings["monitor"].get("thresholds") or {})
         if channel_id in thresholds:
             thresholds.pop(channel_id, None)
-            config_store.update_settings({"monitor": {"thresholds": thresholds}})
+            await asyncio.to_thread(
+                config_store.update_settings, {"monitor": {"thresholds": thresholds}}
+            )
     except Exception:
         logger.exception("删除渠道后清理监控阈值失败")
     try:
@@ -568,8 +606,8 @@ async def get_channel_secret(channel_id: str):
     """返回指定渠道的明文密钥（仅本机无认证访问，供编辑表单"显示密钥"使用）。"""
     # 火山子渠道 id 带 _agent/_coding 后缀，归一到真实 config id（只在精确匹配
     # 失败、且剥出来的 id 确实是 volcengine 渠道时才会被改写，见函数文档）。
-    base_id = _canonical_channel_id(channel_id)
-    channel = config_store.get_channel(base_id)
+    base_id = await asyncio.to_thread(_canonical_channel_id, channel_id)
+    channel = await asyncio.to_thread(config_store.get_channel, base_id)
     if not channel:
         raise HTTPException(status_code=404, detail="渠道不存在")
     secret = {}
@@ -622,13 +660,20 @@ async def upload_codex_credentials(channel_id: str, payload: CodexCredentialPayl
         path, rel_path = config_store.codex_credentials_path(channel.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    existed = path.exists()
     try:
         _write_private_text_atomic(path, content)
     except BaseException:
-        try:
-            os.unlink(str(path))
-        except OSError:
-            pass
+        # 原子写入（os.replace）失败不会破坏已存在的旧凭据文件——replace 要么
+        # 成功要么不执行，路径上不会留下半成品。因此只在"写入前文件不存在"时
+        # 才清理目标路径；如果这里无条件 unlink，同一渠道重新上传时一次磁盘
+        # 写入失败（磁盘满/权限）会把原本完好的旧凭据一起删掉，渠道从"旧凭据
+        # 可用"变成"凭据文件不存在"。
+        if not existed:
+            try:
+                os.unlink(str(path))
+            except OSError:
+                pass
         raise
 
     extra = dict(channel.extra)
@@ -925,7 +970,10 @@ def _start_callback_server(loop: object) -> None:
             # 处理完即停服务器（回调是一次性的），释放 1455 端口给下一次 OAuth
             # HTTPServer.shutdown() 必须从 serve_forever() 所在线程之外调用；Handler
             # 正运行在服务线程里，如果直接调用会自锁死，端口也无法正常释放。
-            _schedule_callback_server_stop()
+            # 必须把正在服务的 server 实例（self.server）传进去：停止线程只关这一
+            # 轮的服务器。若从共享 dict 取"当前值"，上一轮的延迟停止线程可能误杀
+            # 紧接着开始的下一轮 OAuth 刚启动的新服务器（见 _stop_callback_server）。
+            _schedule_callback_server_stop(self.server)
 
     def _run():
         try:
@@ -943,9 +991,19 @@ def _start_callback_server(loop: object) -> None:
     time.sleep(0.15)
 
 
-def _stop_callback_server() -> None:
-    """关闭 1455 端口的回调服务器，释放端口。"""
-    httpd = _active_oauth_server.pop("server", None)
+def _stop_callback_server(httpd: object | None = None) -> None:
+    """关闭 1455 端口的回调服务器，释放端口。
+
+    只关闭调用方指定的 server 实例：延迟停止线程必须精确绑定自己那一轮的服务器。
+    若不传参数（codex_oauth_start 启动新一轮前关闭旧服务器），才从共享 dict 取
+    "当前值"——配合身份比较（``get("server") is httpd``），上一轮的延迟停止线程
+    即使晚到，也不会误杀新一轮刚启动、已经替换进 dict 的新服务器（否则第二次
+    OAuth 的回调将无人接收、静默挂死到超时）。
+    """
+    if httpd is None:
+        httpd = _active_oauth_server.pop("server", None)
+    elif _active_oauth_server.get("server") is httpd:
+        _active_oauth_server.pop("server", None)
     if httpd is not None:
         try:
             httpd.shutdown()
@@ -954,11 +1012,13 @@ def _stop_callback_server() -> None:
             pass
 
 
-def _schedule_callback_server_stop() -> None:
-    """从独立线程关闭回调服务器，避免 Handler 在线程内自调用 shutdown 死锁。"""
+def _schedule_callback_server_stop(httpd: object) -> None:
+    """从独立线程关闭指定的回调服务器，避免 Handler 在线程内自调用 shutdown 死锁。"""
     import threading
 
-    threading.Thread(target=_stop_callback_server, daemon=True, name="quotax-oauth-stop").start()
+    threading.Thread(
+        target=_stop_callback_server, args=(httpd,), daemon=True, name="quotax-oauth-stop"
+    ).start()
 
 
 @app.post("/api/auth/codex/start")
@@ -1186,13 +1246,15 @@ async def quotas(force: bool = False, ids: str | None = None):
     `?ids=ch_a&force=1` 只强刷 ch_a，其余渠道的缓存条目不受影响——因为缓存本来
     就按 id 分别存取，这里只是不去处理没被选中的渠道，不会主动清掉它们的缓存。
     """
-    channels = config_store.list_channels()
+    channels = await asyncio.to_thread(config_store.list_channels)
     if ids:
         # 归一化 _agent/_coding 后缀：火山渠道在 /api/quotas 返回层被拆成两张卡
         # （id 带 _agent/_coding），前端"刷新此渠道"按钮发的 ids 会带后缀，必须
         # 归一回 config id 才能匹配到渠道，否则单卡刷新火山子卡时返回空、卡上的
-        # 数据永远更新不了。
-        wanted = {_canonical_channel_id(x.strip()) for x in ids.split(",") if x.strip()}
+        # 数据永远更新不了。归一化内部会逐个 get_channel 读盘，放线程里执行。
+        wanted = await asyncio.to_thread(
+            lambda: {_canonical_channel_id(x.strip()) for x in ids.split(",") if x.strip()}
+        )
         channels = [c for c in channels if c.id in wanted]
     enabled = [c for c in channels if c.enabled]
 
@@ -1312,7 +1374,7 @@ async def usage_status_endpoint():
 @app.post("/api/usage/cleanup")
 async def usage_cleanup_endpoint(force: bool = True):
     """按设置中的保留天数清理旧记录；手动调用默认立即执行。"""
-    retention_days = config_store.get_settings()["monitor"]["retention_days"]
+    retention_days = (await asyncio.to_thread(config_store.get_settings))["monitor"]["retention_days"]
     return await asyncio.to_thread(usage_store.cleanup_old_records, retention_days, force=force)
 
 
@@ -1382,7 +1444,7 @@ async def usage_filters(days: int = 30):
 @app.get("/api/usage/pricing")
 async def usage_pricing_get():
     """读取当前单价表（内置 + 持久化的用户修改 + LiteLLM 拉取项）。"""
-    book = usage_collect.get_book()
+    book = await asyncio.to_thread(usage_collect.get_book)  # 首次调用会走 SQLite load_pricing，放线程里
     return {"entries": book.entries()}
 
 
@@ -1394,7 +1456,7 @@ async def usage_pricing_put(payload: dict):
 
     写入后落盘持久化。空字段视为 0（不计费）。
     """
-    book = usage_collect.get_book()
+    book = await asyncio.to_thread(usage_collect.get_book)  # 首次调用会走 SQLite load_pricing，放线程里
     try:
         book.upsert(
             payload.get("model_key"),
@@ -1413,7 +1475,7 @@ async def usage_pricing_put(payload: dict):
 @app.delete("/api/usage/pricing/{model_key}")
 async def usage_pricing_delete(model_key: str):
     """删除自定义单价；内置模型若被覆盖则恢复默认。"""
-    book = usage_collect.get_book()
+    book = await asyncio.to_thread(usage_collect.get_book)  # 首次调用会走 SQLite load_pricing，放线程里
     # 找原始条目判断是否内置
     entries = {e["model_key"]: e for e in book.entries()}
     target = entries.get(usage_pricing.normalize_key(model_key))
@@ -1429,7 +1491,7 @@ async def usage_pricing_delete(model_key: str):
 @app.post("/api/usage/pricing/{model_key}/restore")
 async def usage_pricing_restore(model_key: str):
     """恢复指定内置模型的默认价格。"""
-    book = usage_collect.get_book()
+    book = await asyncio.to_thread(usage_collect.get_book)  # 首次调用会走 SQLite load_pricing，放线程里
     if not book.restore_default(model_key):
         raise HTTPException(status_code=400, detail="该模型没有可恢复的内置默认价格")
     await asyncio.to_thread(usage_store.save_pricing, book)
@@ -1442,7 +1504,7 @@ async def usage_pricing_litellm():
 
     网络失败时单价表保持不变，返回 error 说明原因。
     """
-    book = usage_collect.get_book()
+    book = await asyncio.to_thread(usage_collect.get_book)  # 首次调用会走 SQLite load_pricing，放线程里
     result = await asyncio.to_thread(usage_pricing.update_from_litellm, book)
     if result["error"] is None:
         await asyncio.to_thread(usage_store.save_pricing, book)
@@ -1452,7 +1514,7 @@ async def usage_pricing_litellm():
 @app.post("/api/usage/pricing/rebill")
 async def usage_pricing_rebill():
     """用当前单价表重算所有"当初无价记为 0"的记录成本（只补 0，不改已有价）。"""
-    book = usage_collect.get_book()
+    book = await asyncio.to_thread(usage_collect.get_book)  # 首次调用会走 SQLite load_pricing，放线程里
     return await asyncio.to_thread(usage_store.rebill_zero_cost, book)
 
 

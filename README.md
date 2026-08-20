@@ -80,9 +80,9 @@ quotax
 
 | 分类 | 渠道 | 认证方式 |
 | --- | --- | --- |
-| 余额 | DeepSeek / 阶跃星辰 / 硅基流动 / OpenRouter / Novita / Kimi API / new-api·one-api 中转站 | 填 API Key |
-| Coding Plan | Kimi For Coding / 智谱 GLM Coding（个人+团队）/ MiniMax Token Plan / 火山方舟 Agent·Coding Plan（AK/SK）/ ZenMux / 小米 MiMo | 填 API Key / AK·SK / Cookie |
-| 订阅用量 | Claude Pro·Max / Gemini AI Studio / Grok SuperGrok·X / ChatGPT Codex / GitHub Copilot / OpenCode Zen·Go | Claude/Gemini/Grok/Codex/Copilot **自动读取本机 CLI 登录**；OpenCode 填 **Cookie + 工作区 ID** |
+| 余额 | DeepSeek / 阶跃星辰 / 硅基流动 / OpenRouter / Novita / Kimi API / 智谱 API 余额 / new-api·one-api 中转站 | 填 API Key |
+| Coding Plan | Kimi For Coding / 智谱 GLM Coding（个人+团队）/ MiniMax Token Plan / 火山方舟 Agent·Coding Plan（AK/SK **或 arkcli 登录态**，含团队版窗口）/ ZenMux / 小米 MiMo / 阿里云百炼 Token Plan | 填 API Key / AK·SK / Cookie |
+| 订阅用量 | Claude Pro·Max / Gemini AI Studio / Grok SuperGrok·X / ChatGPT Codex / GitHub Copilot / OpenCode Zen·Go / Cursor 订阅 | Claude/Gemini/Grok/Codex/Copilot/Cursor **自动读取本机 CLI·IDE 登录**；OpenCode 填 **Cookie + 工作区 ID**；百炼填 **Cookie**（region：cn 大陆版 / intl 国际版） |
 | 本地统计 | Claude Code / OpenCode 本地已用 token（+ OpenCode 费用，如果有） | 无（读本机文件/数据库） |
 
 ![配置弹窗](docs/config-modal.png)
