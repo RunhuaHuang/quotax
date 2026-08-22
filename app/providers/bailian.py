@@ -91,8 +91,14 @@ async def _resolve_sec_token(cookie_header: str, region: dict) -> str | None:
     if direct:
         return direct
     try:
+        # dashboard URL 是 SPA 路由（带 #/... fragment），fragment 只对浏览器有意义、
+        # HTTP 客户端根本不会发送；但 URL 校验器（assert_public_http_url）会把带
+        # fragment 的 URL 当非法输入拒绝——发请求前必须剥掉，否则这条兜底路径
+        # 100% 在校验阶段就失败（异常被下面吞掉，表现为 cookie 里没现成
+        # sec_token 的账号永远只能裸试网关）。
+        page_url = region["dashboard"].split("#", 1)[0]
         html = await request_text(
-            "GET", region["dashboard"], headers={"Cookie": cookie_header, "Accept": "text/html"}
+            "GET", page_url, headers={"Cookie": cookie_header, "Accept": "text/html"}
         )
     except Exception:
         return None

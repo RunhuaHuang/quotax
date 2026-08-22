@@ -68,6 +68,11 @@ async def _discover_workspace_id(cookie_header: str) -> str | None:
     headers["Cookie"] = cookie_header
     try:
         html = await request_text("GET", f"{OPENCODE_BASE}/zen", headers=headers)
+    except ResponseError:
+        # 未登录访问 /zen 会被 302 到 /auth/authorize（follow_redirects=False）。
+        # 这不是「找不到工作区 ID」——必须原样上抛让调用方经 _error_result 翻译成
+        # expired，否则用户会拿着「去地址栏找 wrk_xxx」的错误指引白忙一场。
+        raise
     except Exception:
         return None
     m = re.search(r"(wrk_[A-Za-z0-9]+)", html)
@@ -178,7 +183,12 @@ async def query_opencode(channel: Channel) -> ChannelResult:
             m = re.search(r"(wrk_[A-Za-z0-9]+)", workspace_id)
             workspace_id = m.group(1) if m else workspace_id
     else:
-        workspace_id = await _discover_workspace_id(cookie_header)
+        try:
+            workspace_id = await _discover_workspace_id(cookie_header)
+        except ResponseError as e:
+            # /zen 探测时发现登录态失效（302/401/403）——按 expired 报，与主查询
+            # 页面的 _error_result 语义一致
+            return _error_result(base, e)
         if not workspace_id:
             return fail(
                 "error",

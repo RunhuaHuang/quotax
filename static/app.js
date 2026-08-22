@@ -1652,8 +1652,10 @@ function applyLang() {
     openHistoryModal();
     loadHistory();
   }
-  // 通知用量视图重绘（usage.js 监听同一个 window 事件）
-  document.dispatchEvent(new CustomEvent("quotax:usage-lang-change"));
+  // 通知用量视图重绘。必须派发在 window 上：CustomEvent 默认不冒泡，派发在
+  // document 只会命中 document 自身的监听器，usage.js 注册在 window 上的监听
+  // 器（冒泡相位）永远收不到——用量页会停留在旧语言。
+  window.dispatchEvent(new CustomEvent("quotax:usage-lang-change"));
 }
 
 /* ── 设置弹窗 ─────────────────────────────────────────── */

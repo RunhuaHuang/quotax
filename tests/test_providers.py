@@ -1598,3 +1598,80 @@ def test_read_arkcli_credentials_ok_and_not_found(monkeypatch):
     monkeypatch.setattr(volcengine, "run_arkcli_usage_plan", boom)
     cred = volcengine.read_arkcli_credentials()
     assert cred.status == "not_found"
+
+
+# ── 回归：本轮修复的四个缺陷 ─────────────────────────────────────
+
+
+def test_bailian_sec_token_fetch_strips_fragment(monkeypatch):
+    """sec_token 兜底抓取的 URL 必须剥掉 #/... fragment。
+
+    _REGIONS 的 dashboard 是 SPA 路由（带 fragment），URL 校验器会拒绝带 fragment
+    的 URL——修复前这条兜底路径 100% 在校验阶段就失败（被 except 吞掉表现为
+    「Cookie 里没现成 sec_token 的账号永远裸试网关」）。
+    """
+    from app.providers import bailian
+
+    captured: dict = {}
+
+    async def fake_request_text(method, url, *, headers=None, json_body=None):
+        captured["url"] = url
+        return '<script>var sec_token = "tok-abc12345";</script>'
+
+    monkeypatch.setattr(bailian, "request_text", fake_request_text)
+    token = asyncio.run(bailian._resolve_sec_token("a=1", bailian._REGIONS["cn"]))
+    assert token == "tok-abc12345"
+    assert "#" not in captured["url"]
+    assert captured["url"].startswith("https://bailian.console.aliyun.com/")
+
+
+def test_opencode_discover_workspace_redirect_means_expired(monkeypatch):
+    """未登录时 /zen 探测被 302——必须报 expired（Cookie 失效），而不是误导用户
+    去「地址栏找 wrk_xxx 手动填入」（修复前 302 被吞成 None 走了 error 文案）。"""
+    from app.net import ResponseError
+    from app.providers import opencode
+
+    async def fake_request_text(method, url, *, headers=None, json_body=None):
+        raise ResponseError(302, "")
+
+    monkeypatch.setattr(opencode, "request_text", fake_request_text)
+    ch = Channel(id="ch_oc2", type="opencode_subscription", name="OpenCode", api_key="auth=abc")
+    result = asyncio.run(opencode.query_opencode(ch))
+    assert result.status == "expired"
+    assert "Cookie" in result.message
+
+
+def test_opencode_discover_workspace_extracts_wrk_from_zen(monkeypatch):
+    """workspace_id 留空时自动发现正常路径：/zen HTML 里的 wrk_xxx 提取后用于 /go。"""
+    from app.providers import opencode
+
+    async def fake_request_text(method, url, *, headers=None, json_body=None):
+        if url.endswith("/zen"):
+            return '<html>data-ws="wrk_abc123"</html>'
+        assert "wrk_abc123" in url, f"workspace id 未注入 /go URL: {url}"
+        return _FAKE_OC_HTML
+
+    monkeypatch.setattr(opencode, "request_text", fake_request_text)
+    ch = Channel(id="ch_oc3", type="opencode_subscription", name="OpenCode", api_key="auth=abc")
+    result = asyncio.run(opencode.query_opencode(ch))
+    assert result.status == "ok"
+
+
+def test_siliconflow_domain_detection_uses_host_not_suffix(monkeypatch):
+    """base_url 带路径（https://api.siliconflow.com/v1）时也必须选中国际站域名——
+    修复前 endswith(".com") 误判成国内站，国际站 Key 全部误报「API Key 无效」。"""
+    from app.providers import balances
+
+    captured: dict = {}
+
+    async def fake_request_json(method, url, *, headers=None, json_body=None, form_body=None):
+        captured["url"] = url
+        return {"data": {"totalBalance": "10.00"}}
+
+    monkeypatch.setattr(balances, "request_json", fake_request_json)
+    ch = Channel(
+        id="ch_sf", type="siliconflow", name="硅基", api_key="sk-x", base_url="https://api.siliconflow.com/v1"
+    )
+    result = asyncio.run(balances.query_siliconflow(ch))
+    assert result.status == "ok"
+    assert captured["url"].startswith("https://api.siliconflow.com/")

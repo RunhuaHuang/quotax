@@ -197,7 +197,10 @@ async def lifespan(_app: FastAPI):
         for task in pending:
             task.cancel()
         if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+            # cancel 打不断已在 to_thread 线程里跑的同步工作（如首次安装的用量
+            # 全量采集——本机日志大时可能几分钟），无脑 gather 会让进程退不出去
+            # （Ctrl+C 无响应）。限时等待后放弃，剩余线程随进程退出一起结束。
+            await asyncio.wait(pending, timeout=5)
         # 关 SQLite 全局连接并 checkpoint WAL（-wal/-shm 落回主库），避免退出后
         # 遗留膨胀的 WAL 临时文件；collect/cleanup 后台任务已在上面取消并等待结束
         await asyncio.to_thread(usage_store.close)
@@ -528,7 +531,9 @@ async def create_or_update_channel(payload: ChannelPayload):
     # _canonical_channel_id 的文档字符串，普通渠道 id 恰好以 _agent/_coding
     # 结尾的情况不会被误伤。
     if payload.id:
-        payload.id = _canonical_channel_id(payload.id)
+        # canonical_channel_id 内部可能逐个 get_channel（config.json 全量读盘+反序列化），
+        # 与下方 get_channel 同理放线程里，避免阻塞事件循环
+        payload.id = await asyncio.to_thread(_canonical_channel_id, payload.id)
 
     # get_channel / upsert_channel 都涉及 config.json 全量读盘+反序列化，放线程里
     # 避免阻塞事件循环（磁盘慢时整个服务会卡住）
@@ -639,7 +644,7 @@ async def upload_codex_credentials(channel_id: str, payload: CodexCredentialPayl
     权限 600，与 config.json 同策略），渠道 extra.codex_auth_file 记录相对路径；
     query_codex 优先读这份文件，否则读本机 Codex CLI 登录态。
     """
-    channel = config_store.get_channel(channel_id)
+    channel = await asyncio.to_thread(config_store.get_channel, channel_id)
     if channel is None:
         raise HTTPException(status_code=404, detail="渠道不存在")
     if channel.type != "codex_subscription":
@@ -660,16 +665,23 @@ async def upload_codex_credentials(channel_id: str, payload: CodexCredentialPayl
         path, rel_path = config_store.codex_credentials_path(channel.id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
-    existed = path.exists()
-    try:
+
+    def _store_credentials() -> bool:
+        """exists 检查 + 原子写盘同线程执行：保持"先记录 existed 再写"的顺序
+        （失败清理依据它决策），且 fsync 不阻塞事件循环。返回写入前是否已存在。"""
+        existed = path.exists()
         _write_private_text_atomic(path, content)
+        return existed
+
+    try:
+        existed = await asyncio.to_thread(_store_credentials)
     except BaseException:
         # 原子写入（os.replace）失败不会破坏已存在的旧凭据文件——replace 要么
         # 成功要么不执行，路径上不会留下半成品。因此只在"写入前文件不存在"时
         # 才清理目标路径；如果这里无条件 unlink，同一渠道重新上传时一次磁盘
         # 写入失败（磁盘满/权限）会把原本完好的旧凭据一起删掉，渠道从"旧凭据
         # 可用"变成"凭据文件不存在"。
-        if not existed:
+        if not await asyncio.to_thread(lambda: path.exists()):
             try:
                 os.unlink(str(path))
             except OSError:
@@ -679,7 +691,8 @@ async def upload_codex_credentials(channel_id: str, payload: CodexCredentialPayl
     extra = dict(channel.extra)
     extra["codex_auth_file"] = rel_path
     try:
-        config_store.upsert_channel(
+        await asyncio.to_thread(
+            config_store.upsert_channel,
             {"id": channel.id, "type": channel.type, "extra": extra},
             provided_fields={"id", "type", "extra"},
         )
@@ -812,6 +825,9 @@ def _write_private_text_atomic(path: Path, content: str) -> None:
 # 第二次 start 时若上一个还在跑会端口冲突）。新流程开始前先关掉旧的。
 _oauth_server_lock = asyncio.Lock()
 _active_oauth_server: dict = {}
+# 回调服务器无人认领的超时（秒）：与 oauth_store 的 flow TTL（600s）对齐——
+# flow 过期后即使回调延迟到达也换不了 token，服务器没必要再等。
+_OAUTH_CALLBACK_TIMEOUT_SECONDS = 600
 
 
 async def _process_oauth_callback(code: str | None, state: str | None, error: str | None) -> str:
@@ -868,29 +884,33 @@ async def _process_oauth_callback(code: str | None, state: str | None, error: st
 
     try:
         tokens = await oauth_store.exchange_code(code, verifier)
-        # 生成 auth.json 并新建 codex 渠道（复用上传凭据的存储/查询链路）
+        # 生成 auth.json 并新建 codex 渠道（复用上传凭据的存储/查询链路）。
+        # upsert_channel / 写凭据文件都是含 fsync 的同步磁盘 I/O，包 to_thread
+        # 避免阻塞事件循环——本协程经 run_coroutine_threadsafe 跑在主循环上。
         auth_content = oauth_store.tokens_to_auth_json(tokens)
         name = f"Codex ({tokens.email})" if tokens.email else "Codex (OAuth)"
-        channel = config_store.upsert_channel(
+        channel = await asyncio.to_thread(
+            config_store.upsert_channel,
             {"type": "codex_subscription", "name": name, "enabled": True},
             provided_fields={"type", "name", "enabled"},
         )
         created_channel_id = channel.id
         credential_path, rel_path = config_store.codex_credentials_path(channel.id)
         try:
-            _write_private_text_atomic(credential_path, auth_content)
+            await asyncio.to_thread(_write_private_text_atomic, credential_path, auth_content)
         except BaseException:
-            _rollback_created_channel()
+            await asyncio.to_thread(_rollback_created_channel)
             raise
         extra = dict(channel.extra)
         extra["codex_auth_file"] = rel_path
         try:
-            config_store.upsert_channel(
+            await asyncio.to_thread(
+                config_store.upsert_channel,
                 {"id": channel.id, "type": channel.type, "extra": extra},
                 provided_fields={"id", "type", "extra"},
             )
         except BaseException:
-            _rollback_created_channel()
+            await asyncio.to_thread(_rollback_created_channel)
             raise
         association_committed = True
         await _invalidate_cache(channel.id)
@@ -911,7 +931,7 @@ async def _process_oauth_callback(code: str | None, state: str | None, error: st
         return _build_oauth_result_html("授权失败", _esc_html(str(e)))
     except Exception:
         if created_channel_id is not None and not association_committed:
-            _rollback_created_channel()
+            await asyncio.to_thread(_rollback_created_channel)
         logger.exception("OAuth 回调处理失败")
         _store_oauth_result(base_state, {
             "status": "error",
@@ -984,6 +1004,19 @@ def _start_callback_server(loop: object) -> None:
         except OSError:
             # 端口被占（用户可能同时在用 Codex CLI 登录）——记下，start 端点会据此报错
             _active_oauth_server["error"] = "port_in_use"
+            return
+
+        # 超时兜底：用户在授权页放弃登录（关标签页）是最常见流程，此时没有任何
+        # 回调到达——若不设超时，这个空转的 daemon 线程会无限期占住 1455 端口，
+        # 用户之后用官方 Codex CLI 登录（回调同样硬编码 localhost:1455）会绑定
+        # 失败且无从关联排查。到点仍未收到回调就按实例精确关闭（绑定本轮 httpd，
+        # 不会误杀后续新一轮的服务器）。正常完成时 Handler 已先行关闭，Timer 对
+        # 已停的 server 再 shutdown 无害（serve_forever 已退出，立即返回）。
+        threading.Timer(
+            _OAUTH_CALLBACK_TIMEOUT_SECONDS,
+            _schedule_callback_server_stop,
+            args=(httpd,),
+        ).start()
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -1031,8 +1064,9 @@ async def codex_oauth_start():
     /api/auth/codex/poll 轮询拿到结果。
     """
     async with _oauth_server_lock:
-        # 先关掉上一次未完成的回调服务器（端口唯一，不关会端口冲突）
-        _stop_callback_server()
+        # 先关掉上一次未完成的回调服务器（端口唯一，不关会端口冲突）。
+        # shutdown() 要等 serve_forever 的 0.5s poll 轮感知退出标志，放线程避免阻塞循环
+        await asyncio.to_thread(_stop_callback_server)
         _active_oauth_server.clear()
         # 在主事件循环上下文拿到 loop，传给工作线程里的回调服务器（它要靠这个 loop
         # 把 async 的 _process_oauth_callback 调度回来）。to_thread 的工作线程里
@@ -1580,7 +1614,14 @@ async def history(days: int = 30, ids: str | None = None):
     前端改成传火山子卡的带后缀 id，不归一就会查不到对应渠道的历史）。
     """
     days = min(max(days, 1), 365)
-    wanted = {_canonical_channel_id(x.strip()) for x in ids.split(",") if x.strip()} if ids else None
+    # 归一内部会逐个 get_channel 读盘，与 quotas 端点同理放线程里执行
+    wanted = (
+        await asyncio.to_thread(
+            lambda: {_canonical_channel_id(x.strip()) for x in ids.split(",") if x.strip()}
+        )
+        if ids
+        else None
+    )
     return await asyncio.to_thread(history_store.get_history, wanted, days)
 
 

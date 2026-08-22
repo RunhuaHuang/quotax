@@ -135,7 +135,11 @@ async def query_siliconflow(channel: Channel) -> ChannelResult:
     }
     if (err := _require(channel.api_key, "API Key", base)) is not None:
         return err
-    domain = "api.siliconflow.com" if (channel.base_url or "").endswith(".com") else "api.siliconflow.cn"
+    # base_url 只用于区分国际站（.com）/国内站（.cn）——不是请求目标。判断必须看
+    # host 而不是整串 endswith(".com")：用户填 https://api.siliconflow.com/v1
+    # （带路径）时 endswith 会误判成国内站，国际站 Key 全部误报「API Key 无效」。
+    base_host = urlparse(channel.base_url or "").hostname or ""
+    domain = "api.siliconflow.com" if ".com" in base_host else "api.siliconflow.cn"
     try:
         data = await request_json(
             "GET",

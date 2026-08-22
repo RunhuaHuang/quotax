@@ -98,6 +98,13 @@ async function loadAll() {
   const ov = usageState.overview;
   if (ov && !ov.total_tokens && !ov.requests) {
     await collectNow();
+    // collectNow 失败（采集接口报错）或因并发中早退时不会走到它的成功路径
+    // （reloadAll → loaded=true），这里必须兜底把视图落到可交互状态——
+    // 否则骨架屏永久卡在「加载中」，页面里连重试的采集按钮都没有。
+    if (!usageState.loaded) {
+      usageState.loaded = true;
+      renderUsage();
+    }
     return;
   }
   usageState.loaded = true;
