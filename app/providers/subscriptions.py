@@ -155,7 +155,16 @@ async def query_claude(channel: Channel) -> ChannelResult:
         # token，查不了官方用量窗口。尝试用 PTY 跑 claude CLI 的 /usage——CLI 自己
         # 有 Keychain 访问权限，能在终端里显示出用量面板。PTY 是同步阻塞 I/O，
         # 用 to_thread 包裹避免阻塞事件循环。参考 CodexBar 的 ClaudeStatusProbe。
-        pty_result = await asyncio.to_thread(_try_pty_usage, base)
+        # 外层再套 wait_for 硬超时：PTY 探测内部任何环节卡住时协程侧必须按时
+        # 放弃，否则会把 /api/quotas 的 gather 整体拖死（所有渠道陪着等一个
+        # Claude 卡片）。内部超时 20s + 调度开销，30s 足够覆盖正常路径。
+        # 超时按「PTY 不可用」降级为 info + 本地统计，不视为渠道错误。
+        try:
+            pty_result = await asyncio.wait_for(
+                asyncio.to_thread(_try_pty_usage, base), timeout=30
+            )
+        except asyncio.TimeoutError:
+            pty_result = None
         if pty_result is not None:
             return pty_result
         # PTY 也不可用（CLI 未安装 / 未登录 / 解析不到用量）：降级为 info + 本地统计

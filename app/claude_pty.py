@@ -321,12 +321,17 @@ def fetch_usage_via_pty(timeout: float = 20) -> ClaudePTYUsage | None:
             if sent_enter and elapsed > 7:
                 text_check = strip_ansi(output.decode("utf-8", errors="replace"))
                 if "Current session" in text_check or "Current week" in text_check:
-                    # 再多读 0.5 秒确保面板渲染完整
-                    time.sleep(0.5)
-                    try:
-                        output += os.read(master, 65536)
-                    except OSError:
-                        pass
+                    # 再等最多 0.5 秒收面板尾部数据。必须 select 等到可读再读：
+                    # 面板渲染完成后 claude TUI 静止等待用户输入，PTY 缓冲区不会
+                    # 再有数据，此刻裸 os.read 会永久阻塞在系统调用上——而清理
+                    # 用的 killpg 在 finally 里、位于这次 read 之后，永远执行不到，
+                    # 查询线程与 claude 子进程会一起挂死，拖住整个 /api/quotas。
+                    r, _, _ = select.select([master], [], [], 0.5)
+                    if r:
+                        try:
+                            output += os.read(master, 65536)
+                        except OSError:
+                            pass
                     break
     finally:
         # 杀整个进程组（claude 可能 spawn 子进程）
