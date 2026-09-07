@@ -75,6 +75,40 @@ def test_system_proxy_reads_macos_settings(monkeypatch):
     assert net._system_proxy() is None  # 无代理时不配置，行为与之前一致
 
 
+def test_client_rebuilt_when_system_proxy_changes(monkeypatch):
+    """回归：系统代理变化后 get_client 必须重建全局 client。
+
+    背景：全局 client 曾把首次创建时读到的系统代理固化整个进程生命周期。
+    用户随后关掉系统代理（如 Clash 从系统代理切到 TUN 模式）后，老 client
+    仍往已停止监听的本地代理端口发请求，导致所有渠道（含境内直连接口）
+    一起以 ConnectError 失败，只能重启服务恢复。
+    """
+    from app import net
+
+    def set_proxy(url):
+        monkeypatch.setattr(urllib.request, "getproxies", lambda: ({"https": url} if url else {}))
+
+    monkeypatch.setattr(net, "_client", None)
+    monkeypatch.setattr(net, "_client_proxy", None)
+
+    set_proxy(None)
+    direct = net.get_client()
+    assert net._client_proxy is None
+
+    set_proxy("http://127.0.0.1:7890")
+    proxied = net.get_client()
+    assert proxied is not direct  # 代理从无到有：重建
+    assert net._client_proxy == "http://127.0.0.1:7890"
+
+    again = net.get_client()
+    assert again is proxied  # 代理未变：复用，不重建
+
+    set_proxy(None)
+    direct2 = net.get_client()
+    assert direct2 is not proxied  # 代理关掉：再次重建，回到直连
+    assert net._client_proxy is None
+
+
 def test_unknown_error_passthrough():
     assert friendly_error(ValueError("自定义错误")) == "自定义错误"
     assert friendly_error(RuntimeError()) == "RuntimeError"

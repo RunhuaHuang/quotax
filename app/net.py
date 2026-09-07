@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
 import ssl
@@ -16,6 +17,7 @@ TIMEOUT_SECONDS = 15.0
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 _client: httpx.AsyncClient | None = None
+_client_proxy: str | None = None  # 创建当前 _client 时生效的系统代理
 _client_lock = threading.Lock()
 
 
@@ -64,27 +66,46 @@ def friendly_error(e: Exception) -> str:
 
 def get_client() -> httpx.AsyncClient:
     global _client
-    if _client is None or _client.is_closed:
+    # 系统代理与创建时不一致（用户开/关了代理工具，或从系统代理切到 TUN 模式）
+    # 必须重建 client：旧 client 固化的代理端口可能已不再监听，继续复用会让
+    # 所有渠道的请求都以 ConnectError 失败——包括境内在配置上本可直连的接口。
+    if _client is None or _client.is_closed or _client_proxy != _system_proxy():
         with _client_lock:
             # 双重检查：避免多个协程同时进入时创建出多个 client
-            if _client is None or _client.is_closed:
-                kwargs: dict = {
-                    "timeout": httpx.Timeout(TIMEOUT_SECONDS),
-                    # 默认不跟随重定向：base_url 是用户自填的（new-api/one-api 中转站、
-                    # Kimi API、ZenMux 等），如果开着 follow_redirects，一个恶意或配置
-                    # 错误的 base_url 可以 3xx 跳转到任意主机，httpx 会把 Authorization
-                    # 头也带过去——相当于把用户的 API Key 泄露给跳转目标。所有渠道的
-                    # 官方接口地址都是写死的 https 直连域名，本来就不需要重定向。
-                    "follow_redirects": False,
-                    "headers": {"User-Agent": "quota-board/1.0"},
-                }
-                # 系统代理：用户开代理工具后，境外接口（chatgpt.com 等）的 TLS 握手可能
-                # 被网络环境干扰，走系统代理可恢复；没有代理时与之前行为完全一致。
-                proxy = _system_proxy()
-                if proxy:
-                    kwargs["proxy"] = proxy
-                _client = httpx.AsyncClient(**kwargs)
+            if _client is None or _client.is_closed or _client_proxy != _system_proxy():
+                _rebuild_client_locked()
     return _client
+
+
+def _rebuild_client_locked() -> None:
+    """按当前系统代理重建全局 client（调用方必须已持有 _client_lock）。"""
+    global _client, _client_proxy
+    old = _client
+    if old is not None and not old.is_closed:
+        # AsyncClient 只能异步关闭。get_client 只在事件循环线程内被调用，把
+        # 旧 client 的收尾丢回循环执行；万一没有运行中的循环就交给 GC。
+        try:
+            asyncio.get_running_loop().create_task(old.aclose())
+        except RuntimeError:
+            pass
+    _client = None  # 构造中途抛异常时，下次调用会重新走创建路径
+    kwargs: dict = {
+        "timeout": httpx.Timeout(TIMEOUT_SECONDS),
+        # 默认不跟随重定向：base_url 是用户自填的（new-api/one-api 中转站、
+        # Kimi API、ZenMux 等），如果开着 follow_redirects，一个恶意或配置
+        # 错误的 base_url 可以 3xx 跳转到任意主机，httpx 会把 Authorization
+        # 头也带过去——相当于把用户的 API Key 泄露给跳转目标。所有渠道的
+        # 官方接口地址都是写死的 https 直连域名，本来就不需要重定向。
+        "follow_redirects": False,
+        "headers": {"User-Agent": "quota-board/1.0"},
+    }
+    # 系统代理：用户开代理工具后，境外接口（chatgpt.com 等）的 TLS 握手可能
+    # 被网络环境干扰，走系统代理可恢复；没有代理时与之前行为完全一致。
+    proxy = _system_proxy()
+    if proxy:
+        kwargs["proxy"] = proxy
+    _client = httpx.AsyncClient(**kwargs)
+    _client_proxy = proxy
 
 
 async def aclose() -> None:
