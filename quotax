@@ -44,7 +44,7 @@ case "$HOST" in
 esac
 case "$HOST_INNER" in
   ""|*[!A-Za-z0-9.:-]*)
-    echo "Error: QUOTAX_HOST 只能是 IP 地址或主机名（当前值: $HOST）。" >&2
+    echo "Error: QUOTAX_HOST 只能是 IP 地址或主机名（当前值: ${HOST}）。" >&2
     exit 2
     ;;
 esac
@@ -117,7 +117,7 @@ case "${1:-start}" in
     mkdir -p "$PERM_DIR"
     nohup uv run uvicorn app.main:app --host "$HOST" --port "$PORT" > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
-    echo -n "启动 QuotaX（端口 $PORT）"
+    echo -n "启动 QuotaX（端口 ${PORT}）"
     # 轮询等待就绪（最多 30 秒）
     for _ in $(seq 1 30); do
       if is_running; then

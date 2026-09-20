@@ -123,7 +123,7 @@ _bg_tasks: set[asyncio.Task] = set()
 try:
     APP_VERSION = version("quota-board")
 except PackageNotFoundError:
-    APP_VERSION = "1.2.0"
+    APP_VERSION = "1.2.1"
 
 
 def _spawn_background(coro) -> None:

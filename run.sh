@@ -21,7 +21,7 @@ case "$HOST" in
 esac
 case "$HOST_INNER" in
   ""|*[!A-Za-z0-9.:-]*)
-    echo "Error: QUOTAX_HOST 只能是 IP 地址或主机名（当前值: $HOST）。" >&2
+    echo "Error: QUOTAX_HOST 只能是 IP 地址或主机名（当前值: ${HOST}）。" >&2
     exit 2
     ;;
 esac

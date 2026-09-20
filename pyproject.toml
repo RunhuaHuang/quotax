@@ -1,6 +1,6 @@
 [project]
 name = "quota-board"
-version = "1.2.0"
+version = "1.2.1"
 description = "统一查看各 AI 渠道余额、订阅用量与 Coding Plan 额度的本地 WebUI"
 readme = "README.md"
 # 代码实际下限是 3.11（用了 datetime.UTC，3.11+ 才有）。放宽版本要求让 uv 优先

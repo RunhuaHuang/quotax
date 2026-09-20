@@ -36,7 +36,7 @@ case "$HOST" in
 esac
 case "$HOST_INNER" in
   ""|*[!A-Za-z0-9.:-]*)
-    echo "Error: QUOTAX_HOST 只能是 IP 地址或主机名（当前值: $HOST）。" >&2
+    echo "Error: QUOTAX_HOST 只能是 IP 地址或主机名（当前值: ${HOST}）。" >&2
     exit 2
     ;;
 esac
@@ -75,7 +75,7 @@ rollback_install() {
     # 第二次目录交换可能在 mv "$NEW_DIR" "$OLD_DIR" 处失败，此时
     # $PERM_DIR 根本不存在；不能让这一步的失败阻断旧版本恢复。
     if [ -e "$PERM_DIR" ] && ! mv "$PERM_DIR" "$failed_dir" 2>/dev/null; then
-      echo "警告：无法移走失败的新目录 $PERM_DIR；旧版本仍保留在 $BACKUP_DIR。" >&2
+      echo "警告：无法移走失败的新目录 ${PERM_DIR}；旧版本仍保留在 ${BACKUP_DIR}。" >&2
       return 0
     fi
     if mv "$BACKUP_DIR" "$PERM_DIR" 2>/dev/null; then
@@ -84,7 +84,7 @@ rollback_install() {
       INSTALL_SWAPPED=0
       echo "已回滚到升级前版本；新版本临时目录已移除。" >&2
     else
-      echo "警告：自动回滚未完成；旧版本备份仍位于 $BACKUP_DIR（请勿删除）。" >&2
+      echo "警告：自动回滚未完成；旧版本备份仍位于 ${BACKUP_DIR}（请勿删除）。" >&2
     fi
   else
     # 首次安装没有旧版本可恢复，至少移除未完成的新目录，避免下次误用半成品。
@@ -195,7 +195,7 @@ stop_existing_quotax() {
     kill -0 "$pid" 2>/dev/null || continue
     command=$(ps -p "$pid" -o command= 2>/dev/null || true)
     if is_quotax_command "$command"; then
-        echo "正在停止旧版 QuotaX（PID $pid）..."
+        echo "正在停止旧版 QuotaX（PID ${pid}）..."
         kill "$pid" 2>/dev/null || true
         for _ in $(seq 1 10); do
           kill -0 "$pid" 2>/dev/null || break
@@ -221,7 +221,7 @@ stop_existing_quotax
 # 这些是 .gitignore 排除的个人数据，绝不能被覆盖丢失。
 PRESERVE_DIR="$TMP_DIR/preserve"
 mkdir -p "$PRESERVE_DIR"
-PRESERVE_FILES=(config.json monitor-state.json usage.db usage.db-shm usage.db-wal)
+PRESERVE_FILES=(config.json quotax.env monitor-state.json usage.db usage.db-shm usage.db-wal)
 PRESERVE_DIRS=(history credentials)
 if [ -d "$PERM_DIR" ]; then
   for f in "${PRESERVE_FILES[@]}"; do
@@ -230,7 +230,7 @@ if [ -d "$PERM_DIR" ]; then
   for d in "${PRESERVE_DIRS[@]}"; do
     [ -d "$PERM_DIR/$d" ] && cp -R "$PERM_DIR/$d" "$PRESERVE_DIR/$d"
   done
-  echo "已备份现有用户数据（config.json / monitor-state.json / usage.db / history/）。"
+  echo "已备份现有用户数据（config.json / quotax.env / monitor-state.json / usage.db / history/）。"
 fi
 
 # --- 原子安装：先拷到临时目录，校验后再交换，避免拷贝中途失败导致安装损坏 ---
@@ -273,7 +273,9 @@ for f in "${PRESERVE_FILES[@]}"; do
       RESTORE_FAILED=1
       break
     fi
-    [ "$f" = "config.json" ] && chmod 600 "$PERM_DIR/$f" 2>/dev/null || true
+    case "$f" in
+      config.json|quotax.env) chmod 600 "$PERM_DIR/$f" 2>/dev/null || true ;;
+    esac
   fi
 done
 if [ "$RESTORE_FAILED" -eq 0 ]; then
@@ -360,7 +362,7 @@ uv sync --quiet
 # --- 启动服务 ---
 # 后台启动 uvicorn，输出重定向到日志文件；端口被占用时给出提示。
 LOG_FILE="$PERM_DIR/quotax.log"
-echo "启动 QuotaX（端口 $PORT）..."
+echo "启动 QuotaX（端口 ${PORT}）..."
 
 # 简单轮转：每次启动前若日志超过 5 MiB，保留一份 .1，避免长期后台运行无限增长。
 if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 5242880 ]; then
@@ -371,7 +373,7 @@ fi
 if command -v lsof &>/dev/null; then
   OCCUPIED_PID=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null | head -1 || true)
   if [ -n "$OCCUPIED_PID" ]; then
-    echo "Error: 端口 $PORT 正被其它程序占用（PID $OCCUPIED_PID），未启动 QuotaX。" >&2
+    echo "Error: 端口 ${PORT} 正被其它程序占用（PID ${OCCUPIED_PID}），未启动 QuotaX。" >&2
     exit 1
   fi
 fi
@@ -388,7 +390,7 @@ for _ in $(seq 1 30); do
   # HTTP 200，否则端口上已有其它 Web 服务时会被误判为 QuotaX 已启动。
   if ! kill -0 "$APP_PID" 2>/dev/null; then
     echo ""
-    echo "Error: 服务启动失败，日志见 $LOG_FILE：" >&2
+    echo "Error: 服务启动失败，日志见 ${LOG_FILE}：" >&2
     tail -20 "$LOG_FILE" >&2 2>/dev/null || true
     exit 1
   fi
@@ -405,7 +407,7 @@ echo ""
 
 # --- 尝试打开浏览器 ---
 if [ -z "${READY:-}" ]; then
-  echo "Error: 服务在 30 秒内未通过健康检查，日志见 $LOG_FILE。" >&2
+  echo "Error: 服务在 30 秒内未通过健康检查，日志见 ${LOG_FILE}。" >&2
   tail -20 "$LOG_FILE" >&2 2>/dev/null || true
   exit 1
 fi
