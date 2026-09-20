@@ -65,7 +65,6 @@ def friendly_error(e: Exception) -> str:
 
 
 def get_client() -> httpx.AsyncClient:
-    global _client
     # 系统代理与创建时不一致（用户开/关了代理工具，或从系统代理切到 TUN 模式）
     # 必须重建 client：旧 client 固化的代理端口可能已不再监听，继续复用会让
     # 所有渠道的请求都以 ConnectError 失败——包括境内在配置上本可直连的接口。

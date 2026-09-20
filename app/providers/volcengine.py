@@ -61,11 +61,10 @@ def _canonical_query(action: str, region: str) -> str:
     return "&".join(f"{_uri_encode(k)}={_uri_encode(v)}" for k, v in pairs)
 
 
-def _sign(ak: str, sk: str, region: str, action: str) -> tuple[str, str, str]:
+def _sign(ak: str, sk: str, region: str, action: str, body: bytes = b"") -> tuple[str, str, str]:
     now = datetime.now(UTC)
     x_date = now.strftime("%Y%m%dT%H%M%SZ")
     short_date = now.strftime("%Y%m%d")
-    body = b""
     x_content_sha256 = _sha256_hex(body)
 
     # 行顺序必须和 SIGNED_HEADERS 里的字典序一致：content-type, host,
@@ -90,8 +89,9 @@ def _sign(ak: str, sk: str, region: str, action: str) -> tuple[str, str, str]:
     return authorization, x_date, x_content_sha256
 
 
-async def _openapi_call(region: str, ak: str, sk: str, action: str) -> dict:
-    authorization, x_date, x_content_sha256 = _sign(ak, sk, region, action)
+async def _openapi_call(region: str, ak: str, sk: str, action: str, json_body: dict | None = None) -> dict:
+    body = json.dumps(json_body, separators=(",", ":")).encode() if json_body is not None else b""
+    authorization, x_date, x_content_sha256 = _sign(ak, sk, region, action, body)
     url = f"https://{HOST}/?{_canonical_query(action, region)}"
     text = await request_text(
         "POST",
@@ -103,6 +103,7 @@ async def _openapi_call(region: str, ak: str, sk: str, action: str) -> dict:
             "Content-Type": CONTENT_TYPE,
             "Host": HOST,
         },
+        json_body=json_body,
     )
     try:
         return json.loads(text)
@@ -147,6 +148,42 @@ def _error_of(body: dict) -> tuple[str, str] | None:
     if not code and not msg:
         return None
     return code, msg
+
+
+async def _detect_coding_tier(region: str, ak: str, sk: str) -> str | None:
+    """探测 Coding Plan 的订阅档位（lite / pro）。
+
+    GetCodingPlanUsage 只返回各周期已用百分比，不带档位；档位在订阅交易记录
+    ListSubscribeTrade 里（InfoList[].BizInfo，实测 {"BizInfo":"lite",...}）。
+    请求参数 ResourceTypes/ResourceNames/BizInfos 三者都必填：CodingPlan 的
+    ResourceName 是空串，BizInfos 用官方档位枚举 lite/pro 通配探测。协议细节
+    对照官方 ark-cli 二进制（--plan-tier 帮助：coding-plan: lite|pro）。
+
+    任何失败（网络异常/错误码/无 Running 记录）都返回 None 软降级——档位只是
+    展示增强，绝不能因为它拖垮整个 Coding Plan 的用量展示。未来火山新增档位
+    不在 lite/pro 枚举里时，同样静默降级为不带档位显示。
+    """
+    try:
+        body = await _openapi_call(
+            region,
+            ak,
+            sk,
+            "ListSubscribeTrade",
+            json_body={"ResourceTypes": ["CodingPlan"], "ResourceNames": [""], "BizInfos": ["lite", "pro"]},
+        )
+    except Exception:
+        return None
+    if _error_of(body) is not None:
+        return None
+    info_list = (body.get("Result") or {}).get("InfoList")
+    if not isinstance(info_list, list):
+        return None
+    for info in info_list:
+        if isinstance(info, dict) and str(info.get("Status") or "") == "Running":
+            tier = str(info.get("BizInfo") or "").strip()
+            if tier:
+                return tier
+    return None
 
 
 async def query_volcengine(channel: Channel) -> ChannelResult:
@@ -219,7 +256,12 @@ async def query_volcengine(channel: Channel) -> ChannelResult:
     except Exception as e:
         soft_errors.append(f"Coding Plan: {friendly_error(e)}")
 
-    windows, plan_name, plan_names = _merge_plans(agent_windows, coding_windows, agent_plan_type)
+    # 3) Coding Plan 档位探测（仅在查到 Coding Plan 用量时才多这一次请求）
+    coding_plan_tier: str | None = None
+    if coding_windows:
+        coding_plan_tier = await _detect_coding_tier(region, channel.ak, channel.sk)
+
+    windows, plan_name, plan_names = _merge_plans(agent_windows, coding_windows, agent_plan_type, coding_plan_tier)
     if not windows:
         if soft_errors:
             return fail("error", "；".join(soft_errors), **base)
@@ -235,7 +277,7 @@ async def query_volcengine(channel: Channel) -> ChannelResult:
 
 
 def _merge_plans(
-    agent_windows: list, coding_windows: list, agent_plan_type: str | None
+    agent_windows: list, coding_windows: list, agent_plan_type: str | None, coding_plan_tier: str | None = None
 ) -> tuple[list, str, dict[str, str]]:
     """合并 Agent Plan 与 Coding Plan 的窗口，并带出每个套餐各自的真实名称。
 
@@ -246,16 +288,18 @@ def _merge_plans(
 
     返回 (windows, plan_name, plan_names)：
     - plan_name：两个套餐名用 " · " 拼接的完整串（如 "火山 Agent Plan small ·
-      火山 Coding Plan"），渠道没有被拆卡展示时直接当整体 plan_name 用；
+      火山 Coding Plan lite"），渠道没有被拆卡展示时直接当整体 plan_name 用；
     - plan_names：{"agent_plan_name": ..., "coding_plan_name": ...}（只在对应
       套餐确实查到数据时才有这个 key）。app/main.py 把火山渠道拆成 Agent/Coding
-      两张独立卡片时，需要每张卡各自的真实套餐名——尤其 Agent Plan 的名字里带
-      PlanType 档位（如 "火山 Agent Plan small"），不能像最初实现那样把两张卡的
-      plan_name 硬编码成通用的 "Agent Plan"/"Coding Plan" 丢掉档位信息，也不能
-      把这里拼接出的完整串塞给两张卡（那样两张卡会显示同一串、还各自带着对方
-      套餐的名字，串味）。让 provider 层把结构化的单套餐名称通过这个返回值带
-      出去，main.py 直接取用对应的 key，不用再从拼接串里反着解析——那样解析
-      本身就是脆弱的（万一某个套餐名字里也出现" · "就解析错位了）。
+      两张独立卡片时，需要每张卡各自的真实套餐名——Agent Plan 的名字带
+      PlanType 档位（GetAFPUsage 的 "small"），Coding Plan 的档位（lite/pro）
+      GetCodingPlanUsage 不返回，由 ListSubscribeTrade 探测补上（探测失败则
+      不带档位）。不能像最初实现那样把两张卡的 plan_name 硬编码成通用的
+      "Agent Plan"/"Coding Plan" 丢掉档位信息，也不能把这里拼接出的完整串塞给
+      两张卡（那样两张卡会显示同一串、还各自带着对方套餐的名字，串味）。让
+      provider 层把结构化的单套餐名称通过这个返回值带出去，main.py 直接取用
+      对应的 key，不用再从拼接串里反着解析——那样解析本身就是脆弱的（万一
+      某个套餐名字里也出现" · "就解析错位了）。
     """
     windows = [dataclasses.replace(w, key=f"agent_{w.key}", label=f"Agent {w.label}") for w in agent_windows]
     windows += [dataclasses.replace(w, key=f"coding_{w.key}", label=f"Coding {w.label}") for w in coding_windows]
@@ -266,7 +310,7 @@ def _merge_plans(
         plan_names["agent_plan_name"] = agent_name
         names.append(agent_name)
     if coding_windows:
-        coding_name = "火山 Coding Plan"
+        coding_name = f"火山 Coding Plan {coding_plan_tier}" if coding_plan_tier else "火山 Coding Plan"
         plan_names["coding_plan_name"] = coding_name
         names.append(coding_name)
     return windows, " · ".join(names), plan_names

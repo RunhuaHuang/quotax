@@ -79,12 +79,18 @@ async def _discover_workspace_id(cookie_header: str) -> str | None:
     return m.group(1) if m else None
 
 # 提取 SSR 页面内嵌的额度序列化字符串。resetInSec 是「距离重置还剩多少秒」，
-# usagePercent 是「已用百分比」（整数 0-100）。status 字段（如 "ok"）这里不
-# 捕获——只关心数字。$R[N] 是 RSC 的引用占位，数字 N 每次请求可能不同。
-# 实测真实页面片段：rollingUsage:$R[31]={status:"ok",resetInSec:18000,usagePercent:0}
-# 注意 $R 前面没有反斜杠（之前误写成 \$R 导致完全不匹配）。
+# usagePercent 是「已用百分比」（2026-08 起可为小数，如 87.9）。status 字段
+# （如 "ok"）这里不捕获——只关心数字。$R[N] 是 RSC 的引用占位，数字 N 每次
+# 请求可能不同。
+# 实测真实页面片段（新格式，usagePercent 后还跟 usage/limit 绝对 token 数）：
+# rollingUsage:$R[35]={status:"ok",resetInSec:18000,usagePercent:0,usage:0,limit:...}
+# monthlyUsage:$R[37]={status:"ok",resetInSec:760742,usagePercent:87.9,usage:5272296480,limit:6000000000}
+# 旧格式 usagePercent 是整数且直接以 } 结尾（无 usage/limit），仍需兼容。
+# 注意 $R 前面没有反斜杠（之前误写成 \$R 导致完全不匹配）；结尾不锚定 }，
+# 否则新格式（后面还有 ,usage:,limit: 字段）整段匹配失败。
 _USAGE_RE = re.compile(
-    r'(\w+)Usage:\$R\[\d+\]=\{status:"[a-zA-Z]+",resetInSec:(\d+),usagePercent:(\d+)\}'
+    r'(\w+)Usage:\$R\[\d+\]=\{status:"[a-zA-Z]+",resetInSec:(\d+),usagePercent:(\d+(?:\.\d+)?)'
+    r'(?:,usage:(\d+))?(?:,limit:(\d+))?'
 )
 
 # 周期 → (QuotaWindow.key, 展示标签)
@@ -120,6 +126,19 @@ def _error_result(base: dict, e: Exception) -> ChannelResult:
     return fail("error", friendly_error(e), **base)
 
 
+def _fmt_count(v: int | None) -> str | None:
+    """把绝对用量/额度格式化成紧凑形式（5,272,296,480 → "5.27B"）。"""
+    if v is None:
+        return None
+    if v >= 1_000_000_000:
+        return f"{v / 1_000_000_000:.2f}B"
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.1f}K"
+    return str(v)
+
+
 def parse_opencode_usage(html: str, fetched_at_ms: int) -> list:
     """从 SSR 页面 HTML 中正则提取三个周期的额度窗口。
 
@@ -132,7 +151,11 @@ def parse_opencode_usage(html: str, fetched_at_ms: int) -> list:
     windows = []
     seen_kinds: set[str] = set()
     for m in _USAGE_RE.finditer(html):
-        kind, reset_in_sec, used_percent = m.group(1).lower(), int(m.group(2)), int(m.group(3))
+        kind = m.group(1).lower()
+        reset_in_sec = int(m.group(2))
+        used_percent = float(m.group(3))
+        usage = int(m.group(4)) if m.group(4) else None
+        limit = int(m.group(5)) if m.group(5) else None
         # 同一个周期可能因页面结构出现多次（如 rollingUsage 在不同区块各嵌一次），
         # 只取第一次匹配，避免重复窗口。
         if kind in seen_kinds:
@@ -141,7 +164,7 @@ def parse_opencode_usage(html: str, fetched_at_ms: int) -> list:
         key, label = _PERIOD_MAP.get(kind, (None, None))
         if key is None:
             continue
-        used_pct = max(0.0, min(100.0, float(used_percent)))
+        used_pct = max(0.0, min(100.0, used_percent))
         reset_at = fetched_at_ms + reset_in_sec * 1000
         windows.append(
             window(
@@ -149,6 +172,8 @@ def parse_opencode_usage(html: str, fetched_at_ms: int) -> list:
                 label,
                 used_percent=used_pct,
                 remaining_percent=max(0.0, 100 - used_pct),
+                used_label=_fmt_count(usage),
+                max_label=_fmt_count(limit),
                 reset_at=reset_at,
             )
         )

@@ -123,7 +123,7 @@ _bg_tasks: set[asyncio.Task] = set()
 try:
     APP_VERSION = version("quota-board")
 except PackageNotFoundError:
-    APP_VERSION = "0.1.0"
+    APP_VERSION = "1.2.0"
 
 
 def _spawn_background(coro) -> None:
@@ -666,15 +666,12 @@ async def upload_codex_credentials(channel_id: str, payload: CodexCredentialPayl
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    def _store_credentials() -> bool:
-        """exists 检查 + 原子写盘同线程执行：保持"先记录 existed 再写"的顺序
-        （失败清理依据它决策），且 fsync 不阻塞事件循环。返回写入前是否已存在。"""
-        existed = path.exists()
+    def _store_credentials() -> None:
+        """原子写盘放到工作线程，避免 fsync 阻塞事件循环。"""
         _write_private_text_atomic(path, content)
-        return existed
 
     try:
-        existed = await asyncio.to_thread(_store_credentials)
+        await asyncio.to_thread(_store_credentials)
     except BaseException:
         # 原子写入（os.replace）失败不会破坏已存在的旧凭据文件——replace 要么
         # 成功要么不执行，路径上不会留下半成品。因此只在"写入前文件不存在"时

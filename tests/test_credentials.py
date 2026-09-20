@@ -17,9 +17,7 @@ from app.credentials import (
     CRED_NOT_FOUND,
     CRED_OK,
     CRED_PARSE_ERROR,
-    _claude_cli_auth_status,
     _parse_claude_json,
-    read_claude_credentials,
 )
 
 

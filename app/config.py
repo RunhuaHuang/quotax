@@ -65,7 +65,6 @@ class ConfigCorruptedError(RuntimeError):
 OPTIONAL_FIELD_NAMES = {"region", "organization", "project", "user_id", "workspace_id"}
 # 个别渠道还可以在自己的 PROVIDERS 条目里声明 optional_fields（如火山：AK/SK
 # 留空时查询层自动回退本机 arkcli 的 SSO 登录态），新建时不强制必填。
-GLOBAL_OPTIONAL = ...  # noqa: placeholder removed below
 
 # 渠道类型目录（含各类所需的配置字段、分类、默认名称）
 PROVIDERS: dict[str, dict] = {

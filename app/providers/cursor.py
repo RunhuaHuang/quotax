@@ -22,7 +22,6 @@ from ..credentials import CRED_NOT_FOUND, CRED_OK, read_cursor_credentials
 from ..models import ChannelResult, fail, finite_float, ok, to_ts, window
 from ..net import ParseError, ResponseError, request_json
 
-
 _MEMBERSHIP_LABELS = {
     "free": "Free",
     "pro": "Pro",

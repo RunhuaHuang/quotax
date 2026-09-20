@@ -113,7 +113,7 @@ def _expand_embedded(value, depth: int = 0):
         return value
     if isinstance(value, str):
         stripped = value.strip()
-        if stripped.startswith("{") or stripped.startswith("["):
+        if stripped.startswith(("{", "[")):
             try:
                 return _expand_embedded(json.loads(stripped), depth + 1)
             except (ValueError, TypeError):

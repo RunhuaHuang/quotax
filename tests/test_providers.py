@@ -67,6 +67,86 @@ def test_kimi_coding_skips_malformed_window_detail(monkeypatch):
     assert len(result.windows) == 2
 
 
+def test_kimi_coding_parses_new_ratio_pools_including_monthly(monkeypatch):
+    async def fake_request_json(*args, **kwargs):
+        return {
+            # 旧版计数窗口与新版比例池故意给不同数值，确认比例池优先。
+            "usage": {"remaining": 10, "used": 90, "resetTime": "2026-09-20T00:00:00Z"},
+            "limits": [
+                {
+                    "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                    "detail": {"remaining": 20, "used": 80, "limit": 100},
+                }
+            ],
+            "usages": {
+                "limit_5h": {"used_ratio": 0.05, "reset_time": "2026-09-19T20:00:00Z"},
+                "limit_7d": {"used_ratio": 0.25, "reset_time": "2026-09-24T00:00:00Z"},
+                "limit_month_total": {"used_ratio": 0.5306, "reset_time": "2026-10-15T00:00:00Z"},
+                # Total usage 已存在时，Coding 专属月池不能重复生成第二条 monthly。
+                "limit_month_code": {"used_ratio": 0.1, "reset_time": "2026-10-15T00:00:00Z"},
+            },
+        }
+
+    monkeypatch.setattr(coding_plans, "request_json", fake_request_json)
+    result = asyncio.run(
+        coding_plans.query_kimi_coding(
+            Channel(id="kimi-1", type="kimi_coding", name="Kimi", api_key="sk-test")
+        )
+    )
+    assert result.status == "ok"
+    by_key = {item.key: item for item in result.windows}
+    assert by_key["five_hour"].used_percent == 5.0
+    assert by_key["weekly"].used_percent == 25.0
+    assert by_key["monthly"].used_percent == 53.1
+    assert by_key["monthly"].remaining_percent == 46.9
+    assert by_key["monthly"].reset_at is not None
+
+
+def test_kimi_coding_enriches_monthly_from_subscription_stats(monkeypatch):
+    """部分 Coding key 的 API 只给 5h/7d，网页订阅统计补出月度总使用量。"""
+    calls = []
+
+    async def fake_request_json(method, url, *, headers=None, json_body=None, form_body=None):
+        calls.append((method, url, headers, json_body))
+        if url.endswith("/coding/v1/usages"):
+            return {
+                "usages": {
+                    "limit_5h": {"used_ratio": 0.0},
+                    "limit_7d": {"used_ratio": 0.3029},
+                }
+            }
+        assert url.endswith("MembershipService/GetSubscriptionStats")
+        return {
+            "subscriptionBalance": {
+                # 官网「总使用量」取共享订阅池 amountUsedRatio；Coding 专属池
+                # 的比例故意不同，确认不会误用 kimiCodeUsedRatio。
+                "kimiCodeUsedRatio": 0.1862,
+                "amountUsedRatio": 0.1872,
+                "expireTime": "2026-09-27T00:00:00Z",
+            }
+        }
+
+    monkeypatch.setattr(coding_plans, "request_json", fake_request_json)
+    result = asyncio.run(
+        coding_plans.query_kimi_coding(
+            Channel(
+                id="kimi-cxy",
+                type="kimi_coding",
+                name="kimi-cxy",
+                api_key="sk-test",
+                extra={"web_auth_token": "eyJtest"},
+            )
+        )
+    )
+    assert result.status == "ok"
+    by_key = {item.key: item for item in result.windows}
+    assert by_key["monthly"].used_percent == 18.7
+    assert by_key["monthly"].remaining_percent == 81.3
+    assert by_key["monthly"].reset_at is not None
+    assert len(calls) == 2
+    assert calls[1][2]["Authorization"] == "Bearer eyJtest"
+
+
 def test_parse_zhipu_data_success_with_five_hour_and_weekly():
     data = {
         "success": True,
@@ -210,7 +290,7 @@ def _run_volcengine(monkeypatch, responses):
     from app.config import Channel
     from app.providers import volcengine
 
-    async def fake_openapi(region, ak, sk, action):
+    async def fake_openapi(region, ak, sk, action, json_body=None):
         return responses[action]
 
     monkeypatch.setattr(volcengine, "_openapi_call", fake_openapi)
@@ -226,12 +306,29 @@ _AFP_RESP = {
     }
 }
 _CODING_RESP = {"Result": {"QuotaUsage": [{"Level": "week", "Percent": 55.0}]}}
+# ListSubscribeTrade 探测响应（真实结构节选）：BizInfo 就是档位（lite/pro）
+_TRADE_RESP = {
+    "Result": {
+        "InfoList": [
+            {
+                "ResourceType": "CodingPlan",
+                "BizInfo": "lite",
+                "Status": "Running",
+                "InstanceID": "tsi-20260714085405-q729p",
+            }
+        ]
+    }
+}
 
 
 def test_query_volcengine_merges_agent_and_coding(monkeypatch):
     result = _run_volcengine(
         monkeypatch,
-        {"GetAFPUsage": _AFP_RESP, "GetCodingPlanUsage": _CODING_RESP},
+        {
+            "GetAFPUsage": _AFP_RESP,
+            "GetCodingPlanUsage": _CODING_RESP,
+            "ListSubscribeTrade": _TRADE_RESP,
+        },
     )
     assert result.status == "ok"
     labels = {w.label for w in result.windows}
@@ -240,12 +337,50 @@ def test_query_volcengine_merges_agent_and_coding(monkeypatch):
     keys = {w.key for w in result.windows}
     assert keys == {"agent_five_hour", "agent_weekly", "coding_weekly"}
     assert "火山 Agent Plan small" in result.plan_name
-    assert "火山 Coding Plan" in result.plan_name
+    assert "火山 Coding Plan lite" in result.plan_name
     assert result.message is None
     # 任务 3 回归：main.py 拆卡时需要这两个结构化字段各自还原真实套餐名（含
-    # PlanType 档位），不能只依赖拼接后的 plan_name 反过来解析。
+    # 档位），不能只依赖拼接后的 plan_name 反过来解析。
     assert result.extra["agent_plan_name"] == "火山 Agent Plan small"
+    assert result.extra["coding_plan_name"] == "火山 Coding Plan lite"
+
+
+def test_query_volcengine_coding_tier_probe_failure_degrades_gracefully(monkeypatch):
+    """档位探测失败（异常/错误响应）必须软降级：Coding Plan 用量照常展示，
+    套餐名不带档位，而不是把整张卡拖成 error。"""
+    result = _run_volcengine(
+        monkeypatch,
+        {
+            "GetAFPUsage": _AFP_RESP,
+            "GetCodingPlanUsage": _CODING_RESP,
+            # fake_openapi 对缺失的 action 抛 KeyError，模拟探测请求失败
+        },
+    )
+    assert result.status == "ok"
+    assert {w.label for w in result.windows} == {"Agent 每 5 小时", "Agent 每周额度", "Coding 每周额度"}
     assert result.extra["coding_plan_name"] == "火山 Coding Plan"
+    assert result.message is None  # 探测失败不算错误，不进 soft_errors
+
+
+def test_query_volcengine_coding_tier_skips_non_running_trades(monkeypatch):
+    """已退订/过期的交易记录（Status != Running）不能当当前档位。"""
+    result = _run_volcengine(
+        monkeypatch,
+        {
+            "GetAFPUsage": {"Result": {}},
+            "GetCodingPlanUsage": _CODING_RESP,
+            "ListSubscribeTrade": {
+                "Result": {
+                    "InfoList": [
+                        {"BizInfo": "pro", "Status": "Expired"},
+                        {"BizInfo": "lite", "Status": "Running"},
+                    ]
+                }
+            },
+        },
+    )
+    assert result.status == "ok"
+    assert result.extra["coding_plan_name"] == "火山 Coding Plan lite"
 
 
 def test_query_volcengine_agent_only(monkeypatch):
@@ -277,13 +412,20 @@ def test_query_volcengine_coding_only(monkeypatch):
 def test_merge_plans_returns_structured_plan_names_for_both():
     agent_windows = [make_window("five_hour", "每 5 小时", used_percent=10, remaining_percent=90)]
     coding_windows = [make_window("weekly", "每周额度", used_percent=20, remaining_percent=80)]
-    windows, plan_name, plan_names = volcengine._merge_plans(agent_windows, coding_windows, "small")
-    assert plan_name == "火山 Agent Plan small · 火山 Coding Plan"
+    windows, plan_name, plan_names = volcengine._merge_plans(agent_windows, coding_windows, "small", "lite")
+    assert plan_name == "火山 Agent Plan small · 火山 Coding Plan lite"
     assert plan_names == {
         "agent_plan_name": "火山 Agent Plan small",
-        "coding_plan_name": "火山 Coding Plan",
+        "coding_plan_name": "火山 Coding Plan lite",
     }
     assert len(windows) == 2
+
+
+def test_merge_plans_coding_tier_none_keeps_plain_name():
+    coding_windows = [make_window("weekly", "每周额度", used_percent=20, remaining_percent=80)]
+    _windows, plan_name, plan_names = volcengine._merge_plans([], coding_windows, None, None)
+    assert plan_name == "火山 Coding Plan"  # 探测失败时不带档位后缀
+    assert plan_names == {"coding_plan_name": "火山 Coding Plan"}
 
 
 def test_merge_plans_agent_only_omits_coding_key():
@@ -762,14 +904,15 @@ def test_query_zhipu_team_missing_api_key_is_reported_clearly():
 # 缺 Cookie / 缺工作区 ID / 页面结构变更（解析不到数据）五条路径。所有测试均
 # monkeypatch 模块级 request_text，不发起真实网络请求。
 
-# 模拟 opencode.ai /go 页面里内嵌的真实 RSC 数据结构（节选关键片段）
+# 模拟 opencode.ai /go 页面里内嵌的真实 RSC 数据结构（节选关键片段）。
+# 2026-08 实测新格式：usagePercent 可为小数，其后还跟 usage/limit 绝对 token 数。
 _FAKE_OC_HTML = """
 <!DOCTYPE html><html><head><title>opencode</title></head><body>
 <script>self.$R=self.$R||[];</script>
 <script>_$HY.r["rollingUsage[\"wrk_test\"]"]=$R[10]=r=>(r?"rollingUsage":null)</script>
-rollingUsage:$R[123]={status:"active",resetInSec:86400,usagePercent:42}
-weeklyUsage:$R[124]={status:"active",resetInSec:432000,usagePercent:67}
-monthlyUsage:$R[125]={status:"active",resetInSec:2592000,usagePercent:35}
+rollingUsage:$R[123]={status:"active",resetInSec:86400,usagePercent:42,usage:1260000000,limit:3000000000}
+weeklyUsage:$R[124]={status:"active",resetInSec:432000,usagePercent:67,usage:2010000000,limit:3000000000}
+monthlyUsage:$R[125]={status:"active",resetInSec:2592000,usagePercent:35,usage:2100000000,limit:6000000000}
 <script>_$HY.fe()</script>
 </body></html>
 """
@@ -818,6 +961,27 @@ def test_query_opencode_parses_three_periods_from_ssr_html(monkeypatch):
     assert by_key["five_hour"].used_percent == 42.0
     # reset_at 是「抓取时刻 + resetInSec」，这里只验证 resetInSec 的大小关系正确
     assert by_label["每 5 小时"].reset_at > by_label["每周额度"].reset_at - 432000 * 1000
+    # 新格式带 usage/limit 绝对 token 数，应展示为紧凑的 used/max label
+    assert by_label["每月额度"].used_label == "2.10B"
+    assert by_label["每月额度"].max_label == "6.00B"
+
+
+def test_query_opencode_parses_legacy_ssr_format_without_usage_fields(monkeypatch):
+    """旧格式（usagePercent 为整数、直接以 } 结尾、无 usage/limit）仍需兼容。"""
+    legacy_html = """
+    rollingUsage:$R[31]={status:"ok",resetInSec:18000,usagePercent:0}
+    weeklyUsage:$R[32]={status:"ok",resetInSec:471500,usagePercent:50}
+    monthlyUsage:$R[33]={status:"ok",resetInSec:760742,usagePercent:87.9}
+    """
+    result = _run_opencode(monkeypatch, html_response=legacy_html)
+    assert result.status == "ok"
+    by_label = {w.label: w for w in result.windows}
+    assert set(by_label) == {"每 5 小时", "每周额度", "每月额度"}
+    assert by_label["每月额度"].used_percent == 87.9
+    assert by_label["每 5 小时"].used_percent == 0.0
+    # 旧格式没有绝对用量，label 应为空而非报错
+    assert by_label["每月额度"].used_label is None
+    assert by_label["每月额度"].max_label is None
 
 
 def test_query_opencode_redirect_means_not_logged_in(monkeypatch):
@@ -1122,7 +1286,6 @@ def test_all_registered_providers_return_valid_channel_result_without_network(mo
 
 
 def _run_zhipu_balance(monkeypatch, resp, headers_seen=None):
-    from app.credentials import CRED_OK, Credential
     from app.providers import balances
 
     async def fake_request_json(method, url, *, headers=None, json_body=None, form_body=None):
@@ -1240,7 +1403,6 @@ def test_bailian_parse_no_usage_raises():
 
 
 def _run_bailian(monkeypatch, resp, *, cookie="a=1; login_aliyunid_csrf=csrf123", region=None, http_error=None, captured=None):
-    from app.net import ResponseError
     from app.providers import bailian
 
     async def fake_request_json(method, url, *, headers=None, json_body=None, form_body=None):
@@ -1312,8 +1474,9 @@ def test_bailian_query_unknown_region(monkeypatch):
 
 
 def test_jwt_payload_extracts_sub():
-    from app.credentials import _jwt_payload
     import base64
+
+    from app.credentials import _jwt_payload
 
     def b64(d):
         return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
@@ -1420,8 +1583,6 @@ def _run_cursor(monkeypatch, resp, *, http_error=None, captured=None):
         "read_cursor_credentials",
         lambda: Credential(token, CRED_OK, "test-vscdb", extra={"sub": "user-77", "email": "u@v.com"}),
     )
-
-    from app.net import ResponseError
 
     async def fake_request_json(method, url, *, headers=None, json_body=None, form_body=None):
         if captured is not None:
@@ -1566,8 +1727,6 @@ def test_query_volcengine_arkcli_not_logged_in_maps_expired(monkeypatch):
 
 def test_run_arkcli_auth_error_marker_in_stderr(monkeypatch):
     """非零退出 + stderr 含未登录关键词 → expired（CodExBar isArkcliAuthenticationError）。"""
-    import subprocess as sp
-
     class FakeCompleted:
         returncode = 1
         stdout = ""

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from ..config import Channel
 from ..models import ChannelResult, fail, finite_float, ok, to_ts, window
 from ..net import ParseError, ResponseError, request_json
@@ -24,6 +26,103 @@ def _error_result(base: dict, e: Exception) -> ChannelResult:
     from ..net import friendly_error
 
     return fail("error", friendly_error(e), **base)
+
+
+def _parse_kimi_ratio_windows(data: dict) -> dict[str, object]:
+    """解析 Kimi 新版 ``usages`` 比例窗口。
+
+    Kimi 新版接口会在 ``usages`` 下返回 0~1 的已用比例；其中
+    ``limit_month_total`` 就是官网显示的月度 Total usage。旧版的
+    ``usage``/``limits`` 计数窗口仍需保留作兼容，因此调用方会让这些比例窗口
+    覆盖同名的旧窗口。
+    """
+    usages = data.get("usages")
+    if not isinstance(usages, dict):
+        return {}
+
+    definitions = (
+        ("limit_5h", "five_hour", "每 5 小时"),
+        ("limit_7d", "weekly", "每周额度"),
+        ("limit_month_total", "monthly", "每月额度"),
+    )
+    # 某些响应只给 Coding 专属月池；Total usage 优先，缺失时再使用它，
+    # 且绝不把两个同周期的月池重复展示成两条月额度。
+    if not isinstance(usages.get("limit_month_total"), dict) and isinstance(
+        usages.get("limit_month_code"), dict
+    ):
+        definitions = definitions[:-1] + (("limit_month_code", "monthly", "每月额度"),)
+
+    parsed: dict[str, object] = {}
+    for source_key, key, label in definitions:
+        detail = usages.get(source_key)
+        if not isinstance(detail, dict):
+            continue
+        ratio = finite_float(detail.get("used_ratio"), None)
+        if ratio is None or ratio < 0:
+            continue
+        # 官方口径是 0~1；对偶发的 0~100 值也宽容处理，并统一限制在合法百分比。
+        used = ratio * 100 if ratio <= 1 else ratio
+        used = max(0.0, min(100.0, used))
+        parsed[key] = window(
+            key,
+            label,
+            used_percent=used,
+            remaining_percent=100 - used,
+            reset_at=to_ts(detail.get("reset_time")),
+        )
+    return parsed
+
+
+async def _query_kimi_subscription_monthly(token: str) -> object | None:
+    """从 Kimi 网页订阅统计补充 Coding 月度总使用量。
+
+    ``/coding/v1/usages`` 对部分 Coding key（例如 kimi-cxy）只返回 5 小时和
+    7 天池；官网订阅页的月度「总使用量」来自网页登录态调用的
+    ``MembershipService/GetSubscriptionStats``，字段是
+    ``subscriptionBalance.amountUsedRatio``（官网订阅页的「总使用量」；不是
+    Coding 专属的 ``kimiCodeUsedRatio``）。网页 token 通过渠道 extra 的
+    ``web_auth_token`` 或 ``KIMI_AUTH_TOKEN`` 提供，补充请求失败时保留 API key
+    查询结果，不影响 5 小时/周额度显示。
+    """
+    token = str(token or "").strip()
+    if not token:
+        return None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    try:
+        stats = await request_json(
+            "POST",
+            "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscriptionStats",
+            headers=headers,
+            json_body={},
+        )
+    except Exception:
+        # 网页登录态是可选 enrichment；过期或暂时不可用不能让 API key 额度失败。
+        return None
+    if not isinstance(stats, dict):
+        return None
+    balance = stats.get("subscriptionBalance")
+    if not isinstance(balance, dict):
+        return None
+    # CodexBar 与官网的口径都是共享订阅池的 Total usage。
+    ratio = finite_float(balance.get("amountUsedRatio"), None)
+    if ratio is None or ratio < 0:
+        # 旧版响应若没有总池，才退回 Coding 专属比例。
+        ratio = finite_float(balance.get("kimiCodeUsedRatio"), None)
+    if ratio is None or ratio < 0:
+        return None
+    used = ratio * 100 if ratio <= 1 else ratio
+    used = max(0.0, min(100.0, used))
+    return window(
+        "monthly",
+        "每月额度",
+        used_percent=used,
+        remaining_percent=100 - used,
+        reset_at=to_ts(balance.get("expireTime")),
+    )
 
 
 # ── Kimi For Coding ─────────────────────────────────────────
@@ -56,7 +155,7 @@ async def query_kimi_coding(channel: Channel) -> ChannelResult:
 
     windows = []
     usage = data.get("usage") or {}
-    if isinstance(usage, dict):
+    if isinstance(usage, dict) and usage:
         remaining_raw = usage.get("remaining")
         remaining = finite_float(remaining_raw, 0.0) or 0.0
         used_raw = usage.get("used")
@@ -114,6 +213,23 @@ async def query_kimi_coding(channel: Channel) -> ChannelResult:
                 reset_at=to_ts(detail.get("resetTime")),
             )
         )
+
+    # 新版 Kimi API 的比例池（包括 limit_month_total）比旧版计数窗口更完整，
+    # 因此同名窗口由它覆盖；其余旧版/自定义窗口照常保留。
+    ratio_windows = _parse_kimi_ratio_windows(data)
+    if ratio_windows:
+        windows = [w for w in windows if w.key not in ratio_windows]
+        windows.extend(ratio_windows.values())
+
+    # API key 响应缺少月池时，使用同一账号的 Kimi 网页登录态补充官网订阅页
+    # 的 Coding 总使用量。月池由网页统计覆盖同名值，避免重复展示。
+    extra = channel.extra if isinstance(channel.extra, dict) else {}
+    web_token = extra.get("web_auth_token") or os.environ.get("KIMI_AUTH_TOKEN")
+    if isinstance(web_token, str) and web_token.strip() and "monthly" not in ratio_windows:
+        monthly = await _query_kimi_subscription_monthly(web_token)
+        if monthly is not None:
+            windows = [w for w in windows if w.key != "monthly"]
+            windows.append(monthly)
 
     if not windows:
         return fail("error", "Kimi 未返回订阅额度数据", **base)

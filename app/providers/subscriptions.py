@@ -163,7 +163,7 @@ async def query_claude(channel: Channel) -> ChannelResult:
             pty_result = await asyncio.wait_for(
                 asyncio.to_thread(_try_pty_usage, base), timeout=30
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pty_result = None
         if pty_result is not None:
             return pty_result
