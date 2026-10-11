@@ -1,0 +1,61 @@
+name: Test and package
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: uv sync --locked
+      - run: uv run --locked ruff check app tests scripts
+      - run: uv run --locked pytest -q
+        env:
+          QUOTABOARD_CONFIG: ${{ runner.temp }}/quotax-tests/config.json
+          QUOTABOARD_USAGE_DB: ${{ runner.temp }}/quotax-tests/usage.db
+          QUOTABOARD_HISTORY_DIR: ${{ runner.temp }}/quotax-tests/history
+      - run: node --test tests/frontend/refresh-controller.test.mjs tests/frontend/usage-refresh.test.mjs tests/frontend/view-utils.test.mjs
+      - if: runner.os != 'Windows'
+        run: bash -n install.sh quotax run.sh
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/install.ps1", [ref]$null, [ref]$parseErrors) | Out-Null
+          if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+      - run: uv build --wheel
+      - run: uv run --locked python scripts/package_release.py
+      - name: Install and smoke-test wheel outside source tree
+        shell: bash
+        run: |
+          uv venv "$RUNNER_TEMP/quotax-wheel"
+          if [ "$RUNNER_OS" = Windows ]; then
+            python_bin="$RUNNER_TEMP/quotax-wheel/Scripts/python.exe"
+          else
+            python_bin="$RUNNER_TEMP/quotax-wheel/bin/python"
+          fi
+          uv pip install --python "$python_bin" dist/*.whl
+          cp scripts/smoke_package.py "$RUNNER_TEMP/quotax-smoke.py"
+          cd "$RUNNER_TEMP"
+          "$python_bin" quotax-smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quotax-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            dist/*.whl
+            dist/*-source.zip
+            dist/*.sha256

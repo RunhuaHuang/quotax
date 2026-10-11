@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 
 import pytest
@@ -475,8 +476,9 @@ def test_upload_codex_credentials_writes_file_and_links_channel(client, isolated
     # 凭据文件真实写入 config 同目录 credentials/ 下，且权限 600
     path = isolated_config.parent / "credentials" / f"codex_{ch['id']}.json"
     assert path.exists()
-    assert (path.parent.stat().st_mode & 0o777) == 0o700
-    assert (path.stat().st_mode & 0o777) == 0o600
+    if os.name != "nt":
+        assert (path.parent.stat().st_mode & 0o777) == 0o700
+        assert (path.stat().st_mode & 0o777) == 0o600
     assert "eyJtest-token-123" in path.read_text(encoding="utf-8")
 
     # 渠道 extra 已关联相对路径
@@ -1032,7 +1034,7 @@ def test_load_allowed_hosts_normalizes_case_and_ignores_empty():
     assert len(hosts) == 5  # 4 个基础 + 1 个归一化后的条目，空段不产生条目
 
 
-def test_env_allowed_host_passes_middleware(client, monkeypatch):
+def test_env_allowed_host_requires_authentication(client, monkeypatch):
     """端到端：环境变量放行的域名请求应通过中间件（模拟 Lucky 反代转发）。"""
     from app import main as app_main
 
@@ -1042,7 +1044,7 @@ def test_env_allowed_host_passes_middleware(client, monkeypatch):
         )
     )
     resp = client.get("/api/health", headers={"Host": "quotax.prismaistudio.xyz:663"})
-    assert resp.status_code == 200
+    assert resp.status_code == 403
     # 未放行的域名依然 403——扩展白名单不是关闭防护
     resp = client.get("/api/health", headers={"Host": "evil.com"})
     assert resp.status_code == 403

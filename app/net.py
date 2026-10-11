@@ -12,6 +12,7 @@ import urllib.request
 import httpx
 
 from .config import assert_public_http_url_async
+from .refresh_policy import record_http_error
 
 TIMEOUT_SECONDS = 15.0
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -120,6 +121,7 @@ class ResponseError(Exception):
         super().__init__(f"HTTP {status}")
         self.status = status
         self.body = body
+        record_http_error(status)
 
 
 class ParseError(Exception):
@@ -182,6 +184,8 @@ async def _request_text_bounded(
     async with client.stream(
         method, url, headers=headers, json=json_body, data=form_body
     ) as response:
+        if response.status_code >= 400:
+            record_http_error(response.status_code, response.headers.get("Retry-After"))
         body = bytearray()
         async for chunk in response.aiter_bytes():
             if len(body) + len(chunk) > MAX_RESPONSE_BYTES:

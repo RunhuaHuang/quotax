@@ -5,7 +5,7 @@
 // 本文件是独立 ES module（与 app.js 作用域隔离），自带 $ / esc / fmtTime 等工具，
 // 不依赖 app.js 暴露全局变量——避免加载顺序耦合。
 
-import { t, getLang } from "./i18n.js?v=9";
+import { t, getLang } from "./i18n.js?v=12";
 
 const $ = (sel) => document.querySelector(sel);
 const USAGE_DAYS_KEY = "quotaboard_prefs.usage_days";
@@ -22,17 +22,26 @@ let usageState = {
   filters: { sources: [], models: [] },
   collecting: false,
 };
+let usageLastLoadedAt = 0;
+let usageRefreshPromise = null;
+let usageRefreshForced = false;
+let usageRefreshUpgrade = null;
+let usageCollectionPromise = null;
+let usageLoadError = null;
+let usageDisplayedQuery = null;
 let usageRequestRevision = 0;
 let usageAbortController = null;
 
 function beginUsageRequest() {
+  usageLoadError = null;
   usageRequestRevision += 1;
   if (usageAbortController) usageAbortController.abort();
   const controller = new AbortController();
   usageAbortController = controller;
   return {
+    data: { overview: usageState.overview, trend: usageState.trend, models: usageState.models, log: usageState.log, filters: usageState.filters },
     revision: usageRequestRevision,
-    signal: controller.signal,
+    signal: AbortSignal.any([controller.signal, AbortSignal.timeout(60_000)]),
     days: usageState.days,
     source: usageState.source,
     model: usageState.model,
@@ -41,7 +50,20 @@ function beginUsageRequest() {
 }
 
 function isCurrentUsageRequest(ctx) {
-  return Boolean(ctx) && ctx.revision === usageRequestRevision && !ctx.signal.aborted;
+  return Boolean(ctx) && ctx.revision === usageRequestRevision;
+}
+
+function commitUsageRequest(ctx) {
+  if (!isCurrentUsageRequest(ctx)) return;
+  if (!usageLoadError) {
+    Object.assign(usageState, ctx.data);
+    usageDisplayedQuery = { days: ctx.days, source: ctx.source, model: ctx.model, metric: ctx.metric };
+    usageLastLoadedAt = Date.now();
+  } else if (usageDisplayedQuery) {
+    // The retained numbers must keep the filter labels they were calculated for.
+    Object.assign(usageState, usageDisplayedQuery);
+    saveUsagePrefs();
+  }
 }
 
 function usageParams(ctx, extra = {}) {
@@ -65,16 +87,25 @@ function saveUsagePrefs() {
   } catch { /* noop */ }
 }
 
-// 监听视图切换：进入用量视图时首次加载
-document.addEventListener("quotax:view-change", (e) => {
-  if (e.detail.view === "usage") {
-    if (!usageState.loaded) {
-      loadUsagePrefs();
-      loadAll();
-    } else {
-      renderUsage();
-    }
+// Re-entering a view checks age instead of permanently keeping the first snapshot.
+export function refreshUsageView(force = false) {
+  if (usageRefreshPromise) {
+    if (usageRefreshUpgrade) return usageRefreshUpgrade;
+    if (!force || usageRefreshForced) return usageRefreshPromise;
+    usageRefreshUpgrade = usageRefreshPromise.catch(() => {}).then(() => refreshUsageView(true))
+      .finally(() => { usageRefreshUpgrade = null; });
+    return usageRefreshUpgrade;
   }
+  if (!force && usageState.loaded && Date.now() - usageLastLoadedAt < 30_000) return Promise.resolve();
+  loadUsagePrefs();
+  usageRefreshForced = force;
+  usageRefreshPromise = (force ? collectNow() : usageState.loaded ? reloadAll() : loadAll())
+    .finally(() => { usageRefreshPromise = null; });
+  return usageRefreshPromise;
+}
+
+document.addEventListener("quotax:view-change", (e) => {
+  if (e.detail.view === "usage") refreshUsageView();
 });
 
 // 语言切换时重绘用量视图（由 app.js 的 applyLang 统一派发，避免重复监听）
@@ -95,8 +126,9 @@ async function loadAll() {
   if (!isCurrentUsageRequest(ctx)) return;
   // 首次加载如果发现没数据，自动触发一次采集（可能服务刚启动、采集还在后台
   // 跑，或本机 CLI 日志还没被扫过）。采集是幂等的，重复跑不会产生重复记录。
+  commitUsageRequest(ctx);
   const ov = usageState.overview;
-  if (ov && !ov.total_tokens && !ov.requests) {
+  if (!usageLoadError && ov && !ov.total_tokens && !ov.requests) {
     await collectNow();
     // collectNow 失败（采集接口报错）或因并发中早退时不会走到它的成功路径
     // （reloadAll → loaded=true），这里必须兜底把视图落到可交互状态——
@@ -117,9 +149,9 @@ async function loadOverview(ctx = beginUsageRequest()) {
     const res = await fetch(`/api/usage/overview?${p}`, { signal: ctx.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    if (isCurrentUsageRequest(ctx)) usageState.overview = data;
+    if (isCurrentUsageRequest(ctx)) ctx.data.overview = data;
   } catch (e) {
-    if (e?.name !== "AbortError" && isCurrentUsageRequest(ctx)) usageState.overview = null;
+    if (e?.name !== "AbortError" && ctx.revision === usageRequestRevision) usageLoadError = e.message;
   }
 }
 
@@ -129,9 +161,9 @@ async function loadTrend(ctx = beginUsageRequest()) {
     const res = await fetch(`/api/usage/trend?${p}`, { signal: ctx.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    if (isCurrentUsageRequest(ctx)) usageState.trend = data;
+    if (isCurrentUsageRequest(ctx)) ctx.data.trend = data;
   } catch (e) {
-    if (e?.name !== "AbortError" && isCurrentUsageRequest(ctx)) usageState.trend = [];
+    if (e?.name !== "AbortError" && ctx.revision === usageRequestRevision) usageLoadError = e.message;
   }
 }
 
@@ -141,9 +173,9 @@ async function loadModels(ctx = beginUsageRequest()) {
     const res = await fetch(`/api/usage/models?${p}`, { signal: ctx.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    if (isCurrentUsageRequest(ctx)) usageState.models = data;
+    if (isCurrentUsageRequest(ctx)) ctx.data.models = data;
   } catch (e) {
-    if (e?.name !== "AbortError" && isCurrentUsageRequest(ctx)) usageState.models = [];
+    if (e?.name !== "AbortError" && ctx.revision === usageRequestRevision) usageLoadError = e.message;
   }
 }
 
@@ -156,12 +188,12 @@ async function loadLog({ append = false } = {}, ctx = beginUsageRequest()) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const page = await res.json();
     if (!isCurrentUsageRequest(ctx)) return;
-    usageState.log = append
+    ctx.data.log = append
       ? { ...page, rows: [...currentRows, ...(page.rows || [])], offset: offset }
       : page;
   } catch (e) {
-    if (e?.name !== "AbortError" && !append && isCurrentUsageRequest(ctx)) {
-      usageState.log = { rows: [], limit: 200, offset: 0, has_more: false };
+    if (e?.name !== "AbortError" && isCurrentUsageRequest(ctx)) {
+      usageLoadError = e.message;
     }
   }
 }
@@ -171,24 +203,28 @@ async function loadFilters(ctx = beginUsageRequest()) {
     const res = await fetch(`/api/usage/filters?days=${ctx.days}`, { signal: ctx.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    if (isCurrentUsageRequest(ctx)) usageState.filters = data;
+    if (isCurrentUsageRequest(ctx)) ctx.data.filters = data;
   } catch (e) {
     if (e?.name !== "AbortError" && isCurrentUsageRequest(ctx)) {
-      usageState.filters = { sources: [], models: [] };
+      usageLoadError = e.message;
     }
   }
 }
 
-async function collectNow() {
-  if (usageState.collecting) return;
+function collectNow() {
+  if (!usageCollectionPromise) usageCollectionPromise = performCollection().finally(() => { usageCollectionPromise = null; });
+  return usageCollectionPromise;
+}
+
+async function performCollection() {
   usageState.collecting = true;
-  const ctx = beginUsageRequest();
+  // Collection changes server state and must survive read/filter cancellation.
+  const signal = AbortSignal.timeout(60_000);
   const btn = $("#usageCollectBtn");
   if (btn) { btn.disabled = true; btn.textContent = t("usage.collecting"); }
   try {
-    const res = await fetch("/api/usage/collect", { method: "POST", signal: ctx.signal });
+    const res = await fetch("/api/usage/collect", { method: "POST", signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    if (!isCurrentUsageRequest(ctx)) return;
     await reloadAll();
   } catch (e) {
     if (e?.name !== "AbortError") toast(t("usage.collectFailed", { msg: e.message }), "err");
@@ -260,6 +296,13 @@ function renderUsage() {
     renderPricingNote(),
   ];
   v.innerHTML = parts.join("");
+  if (usageLoadError) {
+    const warning = document.createElement("div");
+    warning.className = "local-empty";
+    warning.setAttribute("role", "alert");
+    warning.textContent = t("usage.loadFailed", { msg: usageLoadError });
+    v.prepend(warning);
+  }
   bindUsageEvents();
 }
 
@@ -514,7 +557,7 @@ function bindUsageEvents() {
     more.textContent = t("usage.loadingMore");
     const ctx = beginUsageRequest();
     await loadLog({ append: true }, ctx);
-    if (isCurrentUsageRequest(ctx)) renderUsage();
+    if (isCurrentUsageRequest(ctx)) { commitUsageRequest(ctx); renderUsage(); }
   });
 }
 
@@ -528,6 +571,7 @@ async function reloadAll() {
     loadFilters(ctx),
   ]);
   if (!isCurrentUsageRequest(ctx)) return;
+  commitUsageRequest(ctx);
   usageState.loaded = true;
   renderUsage();
 }

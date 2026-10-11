@@ -47,3 +47,7 @@ quotax.log.1
 
 # 无关目录
 kitesurf-bench/
+
+# Persistent launcher environment may contain access passwords
+quotax.env
+quotax.pid

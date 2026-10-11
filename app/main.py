@@ -15,7 +15,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,11 +26,13 @@ from . import credentials as credentials_store
 from . import history as history_store
 from . import local_usage, monitoring
 from . import oauth as oauth_store
+from .access import check_access
 from .credentials import CRED_NO_TOKEN, CRED_OK
 from .models import ChannelResult, fail
 from .net import aclose, friendly_error
 from .providers import channel_category, query_channel
 from .providers import volcengine as volcengine_provider
+from .refresh_policy import retry_delay_ms, upstream_error
 from .usage import collect as usage_collect
 from .usage import pricing as usage_pricing
 from .usage import store as usage_store
@@ -77,15 +79,22 @@ def _canonical_channel_id(channel_id: str) -> str:
     return config_store.canonical_channel_id(channel_id)
 
 
-# 结果缓存：按渠道 id 分别缓存，成功 5 分钟 / 失败 15 分钟。
-# 成功结果缓存 5 分钟：额度数据本身变化不快，5 分钟足够新鲜，且大幅减少对上游
-# 接口的请求频率（避免触发 Anthropic / OpenAI 等的速率限制 429）。
-# 失败结果缓存 15 分钟：错误（尤其 429 限流）不宜快速重试——15 秒重试只会持续
-# 撞限流，15 分钟给上游足够冷却时间。用户需要立刻重试时点「刷新」按钮（force=1
-# 绕过缓存）即可。
-QUOTA_CACHE_TTL_MS = 300_000
-QUOTA_ERROR_CACHE_TTL_MS = 900_000
-DATA_STALE_AFTER_MS = 600_000
+# Callers choose acceptable data age; failures have a separate retry deadline.
+CHANNEL_TIMEOUT_SECONDS = 45
+MAX_QUERY_CONCURRENCY = 4
+_query_slots: asyncio.Semaphore | None = None
+_query_slots_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _query_semaphore() -> asyncio.Semaphore:
+    global _query_slots, _query_slots_loop
+    loop = asyncio.get_running_loop()
+    if _query_slots_loop is not loop:
+        _query_slots_loop = loop
+        _query_slots = asyncio.Semaphore(MAX_QUERY_CONCURRENCY)
+    return _query_slots
+
+
 _cache: dict[str, tuple[float, dict]] = {}
 # 在飞的查询 task，按渠道 id 登记。值是 (task, 发起时的配置代际)——复用一个仍在
 # 运行的 task 前必须比对代际：若期间发生过 import_config / 编辑渠道（_generation
@@ -94,6 +103,7 @@ _cache: dict[str, tuple[float, dict]] = {}
 # 发起的查询。代际校验同时存在于两处：复用判断（_get_channel_result）和写缓存
 # （_query_and_cache），前者挡住"响应返回旧结果"，后者挡住"旧结果污染缓存"。
 _inflight: dict[str, tuple[asyncio.Task, int]] = {}
+_query_tasks: set[asyncio.Task] = set()
 _cache_lock = asyncio.Lock()
 
 # 配置代际：每次配置变动（编辑渠道 / 导入配置）时单调递增。查询 task 在发起时
@@ -123,20 +133,22 @@ _bg_tasks: set[asyncio.Task] = set()
 try:
     APP_VERSION = version("quota-board")
 except PackageNotFoundError:
-    APP_VERSION = "1.2.1"
+    APP_VERSION = "1.3.0"
 
 
-def _spawn_background(coro) -> None:
+def _spawn_background(coro) -> asyncio.Task:
     """提交一个后台任务并持有强引用，防止被 GC；完成后自动从集合移除。"""
     task = asyncio.create_task(coro)
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
+    return task
 
 
 async def _cancel_inflight_queries() -> None:
     """应用退出时终止被 shield 保护的共享上游查询，避免关闭 HTTP 客户端后仍运行。"""
     async with _cache_lock:
-        tasks = list({entry[0] for entry in _inflight.values() if not entry[0].done()})
+        tasks = list({task for task in _query_tasks if not task.done()}
+                     | {entry[0] for entry in _inflight.values() if not entry[0].done()})
         _inflight.clear()
     for task in tasks:
         task.cancel()
@@ -144,8 +156,20 @@ async def _cancel_inflight_queries() -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+_usage_collection_task: asyncio.Task | None = None
+
+
+async def _collect_usage_shared() -> dict:
+    """Concurrent startup, timer and browser callers share one filesystem scan."""
+    global _usage_collection_task
+    if _usage_collection_task is None or _usage_collection_task.done():
+        _usage_collection_task = _spawn_background(asyncio.to_thread(usage_collect.collect_all))
+    return await asyncio.shield(_usage_collection_task)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    await asyncio.to_thread(config_store.initialize_storage)
     # 启动时自动探测本机已登录的订阅 CLI（Claude / Gemini / Grok / Codex /
     # Copilot），为尚未配置的类型自动创建渠道——订阅渠道不需要填密钥，用户不该
     # 为了「看到已登录的 CLI」还要手动到配置弹窗里逐个添加。探测在线程里跑，
@@ -165,7 +189,7 @@ async def lifespan(_app: FastAPI):
     # 多次触发不会并发争用游标。
     async def _collect_usage_on_startup() -> None:
         try:
-            await asyncio.to_thread(usage_collect.collect_all)
+            await _collect_usage_shared()
         except Exception:
             logger.exception("启动时自动采集用量统计失败")
         try:
@@ -175,15 +199,14 @@ async def lifespan(_app: FastAPI):
             logger.exception("启动时清理过期用量记录失败")
 
     async def _usage_maintenance_loop() -> None:
-        # 首次清理由上面的启动采集任务负责；之后每 6 小时检查一次，存储层自身保证
-        # 24 小时内最多真正执行一次，长期运行也不会让历史库无限增长。
         while True:
-            await asyncio.sleep(21_600)
+            await asyncio.sleep(60)
             try:
+                await _collect_usage_shared()
                 retention_days = (await asyncio.to_thread(config_store.get_settings))["monitor"]["retention_days"]
                 await asyncio.to_thread(usage_store.cleanup_old_records, retention_days)
             except Exception:
-                logger.exception("定期清理过期用量记录失败")
+                logger.exception("定期采集/清理用量记录失败，将在下个周期重试")
 
     _spawn_background(_collect_usage_on_startup())
     _spawn_background(_usage_maintenance_loop())
@@ -193,14 +216,17 @@ async def lifespan(_app: FastAPI):
     finally:
         await monitor_service.stop()
         await _cancel_inflight_queries()
-        pending = [task for task in _bg_tasks if not task.done()]
+        collection = _usage_collection_task
+        pending = [task for task in _bg_tasks if not task.done() and task is not collection]
         for task in pending:
             task.cancel()
         if pending:
-            # cancel 打不断已在 to_thread 线程里跑的同步工作（如首次安装的用量
-            # 全量采集——本机日志大时可能几分钟），无脑 gather 会让进程退不出去
-            # （Ctrl+C 无响应）。限时等待后放弃，剩余线程随进程退出一起结束。
             await asyncio.wait(pending, timeout=5)
+        # Cancelling to_thread only cancels its waiter, not its database writes.
+        # Drain the shared collection before closing SQLite. Python also waits for
+        # executor threads at process exit, so abandoning it would not exit faster.
+        if collection is not None:
+            await asyncio.gather(asyncio.shield(collection), return_exceptions=True)
         # 关 SQLite 全局连接并 checkpoint WAL（-wal/-shm 落回主库），避免退出后
         # 遗留膨胀的 WAL 临时文件；collect/cleanup 后台任务已在上面取消并等待结束
         await asyncio.to_thread(usage_store.close)
@@ -212,7 +238,7 @@ app = FastAPI(title="QuotaX", lifespan=lifespan)
 
 # ── DNS rebinding 防护：Host 请求头白名单 ────────────────────────
 #
-# 背景：本服务无任何认证，只监听 127.0.0.1，但 GET /api/config/export?
+# 背景：默认本机访问不要求密码，但 GET /api/config/export?
 # include_secrets=true 会返回明文 API Key（config_store.export_config 的
 # docstring 早就点名了这个风险，但一直没有实际防护）。仅仅"监听在 127.0.0.1"
 # 不是安全边界：一个恶意网页可以用 DNS rebinding 攻击——先用一个攻击者控制的
@@ -236,8 +262,7 @@ def _load_allowed_hosts(env: dict[str, str]) -> set[str]:
     QUOTAX_HOST=0.0.0.0 一起使用（见 quotax 脚本的 quotax.env 加载）。
 
     注意：放行 Host 只是不让 DNS rebinding 防护拦截该域名，不是访问控制——
-    本服务无认证、/api/config/export 会返回明文密钥，公网暴露务必在上游反代
-    （Lucky 的安全规则 / BasicAuth / IP 白名单）加访问控制。
+    check_access 还要求远程访问设置 QUOTAX_ACCESS_PASSWORD；反向代理必须启用 HTTPS。
     """
     hosts = {
         "127.0.0.1",
@@ -293,7 +318,18 @@ async def _enforce_host_whitelist(request: Request, call_next):
             status_code=403,
             content={"detail": f"非法的请求来源（Host: {host_header}），出于防 DNS rebinding 攻击考虑仅允许本机访问"},
         )
-    return await call_next(request)
+    denied = check_access(request)
+    if denied is not None:
+        return denied
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "service": "quotax"}
 
 
 def _format_validation_error(exc: RequestValidationError) -> str:
@@ -608,7 +644,7 @@ async def remove_channel(channel_id: str):
 
 @app.get("/api/channels/{channel_id}/secret")
 async def get_channel_secret(channel_id: str):
-    """返回指定渠道的明文密钥（仅本机无认证访问，供编辑表单"显示密钥"使用）。"""
+    """返回指定渠道的明文密钥（受统一访问保护，供编辑表单"显示密钥"使用）。"""
     # 火山子渠道 id 带 _agent/_coding 后缀，归一到真实 config id（只在精确匹配
     # 失败、且剥出来的 id 确实是 volcengine 渠道时才会被改写，见函数文档）。
     base_id = await asyncio.to_thread(_canonical_channel_id, channel_id)
@@ -1166,37 +1202,50 @@ def split_multi_plan_result(channel: config_store.Channel, res: dict) -> list[di
 
 
 async def _query_and_cache(channel: config_store.Channel, gen: int) -> dict:
+    token = upstream_error.set(None)
     try:
-        result = await query_channel(channel)
-        payload = result.to_dict()
-    except Exception as e:  # query_channel 内部已经兜底大部分异常，这里是双重保险
-        payload = fail(
-            "error",
-            friendly_error(e),
-            id=channel.id,
-            type=channel.type,
-            name=channel.name,
-            category=channel_category(channel.type),
-        ).to_dict()
+        # Bound queue wait and all calls made by the provider, not just a socket read.
+        async with asyncio.timeout(CHANNEL_TIMEOUT_SECONDS):
+            async with _query_semaphore():
+                result = await query_channel(channel)
+                payload = result.to_dict()
+    except Exception as e:
+        message = "渠道查询超时，请稍后重试" if isinstance(e, TimeoutError) else friendly_error(e)
+        payload = fail("error", message, id=channel.id, type=channel.type,
+                       name=channel.name, category=channel_category(channel.type)).to_dict()
+    finally:
+        error = upstream_error.get()
+        upstream_error.reset(token)
+    now = int(time.time() * 1000)
     async with _cache_lock:
-        # 代际校验：task 发起到完成期间若发生过配置变动（import_config 覆盖密钥、
-        # 编辑渠道等），_generation 已被 bump，此时这条结果（可能用旧密钥查到）
-        # 已过期，丢弃它不写缓存——下一次请求缓存未命中会触发新查询。代际仍一致
-        # 才写入，保证缓存的永远是当前配置下的结果。
         if gen == _generation:
-            _cache[channel.id] = (time.time() * 1000, payload)
-    # 只把成功结果追加进历史趋势。用后台任务 fire-and-forget——磁盘 I/O 不应
-    # 阻塞 API 响应（趋势记录是附加价值，写慢了也不该让额度查询变慢）。
-    # record_result 内部已 catch 所有异常，后台任务不会抛未捕获错误。
-    # 通过 _spawn_background 持有强引用，避免 Task 被 GC（裸 create_task 有此风险）。
-    # 注意：代际过期的结果仍然记历史——它确实是某个时刻真实查到的数据点，只是
-    # 不该占用"当前配置下最新结果"的缓存槽位。
-    _spawn_background(asyncio.to_thread(history_store.record_result, channel.id, payload))
+            previous = _cache.get(channel.id, (0, {}))[1]
+            failures = 0 if payload["status"] == "ok" else previous.get("refresh", {}).get("failures", 0) + 1
+            refresh = {
+                "attempted_at": now,
+                "last_success_at": payload.get("updated_at") if not failures else None,
+                "failures": failures,
+                "upstream_status": (error or {}).get("status"),
+                "next_retry_at": (now + retry_delay_ms(payload["status"], failures, error, now)
+                                  if failures or (error or {}).get("status") == 429 else None),
+            }
+            if failures and previous.get("status") in {"ok", "stale"}:
+                # Keep last good numbers, but never evaluate them as a fresh monitoring result.
+                refresh["last_success_at"] = previous.get("updated_at")
+                payload = {**previous, "status": "stale", "message": payload.get("message"),
+                           "error_status": payload["status"]}
+            payload = {**payload, "refresh": refresh}
+            _cache[channel.id] = (now, payload)
+            # Deleted/reconfigured channels must not regain obsolete history entries.
+            if payload["status"] == "ok":
+                _spawn_background(asyncio.to_thread(history_store.record_result, channel.id, payload))
     return payload
 
 
-async def _get_channel_result(channel: config_store.Channel, force: bool) -> tuple[dict, bool]:
-    """单渠道查询：按 id 分别缓存（成功 5 分钟 / 失败 15 分钟），并做请求合并——同一
+async def _get_channel_result(
+    channel: config_store.Channel, force: bool, max_age_seconds: int = 300
+) -> tuple[dict, bool]:
+    """单渠道查询：成功数据使用调用方有效期、失败按重试期限缓存，并做请求合并——同一
     渠道正在查询时，后来的调用者等待同一个结果，而不是重复发起、并发打上游
     （比如多标签页同时打开时各自触发一次刷新）。
 
@@ -1204,13 +1253,17 @@ async def _get_channel_result(channel: config_store.Channel, force: bool) -> tup
     """
     now = time.time() * 1000
     async with _cache_lock:
-        if not force:
-            cached = _cache.get(channel.id)
-            if cached is not None:
-                cached_at, cached_result = cached
-                ttl = QUOTA_CACHE_TTL_MS if cached_result.get("status") == "ok" else QUOTA_ERROR_CACHE_TTL_MS
-                if now - cached_at < ttl:
+        cached = _cache.get(channel.id)
+        if cached is not None:
+            cached_at, cached_result = cached
+            refresh = cached_result.get("refresh", {})
+            retry_at = refresh.get("next_retry_at")
+            if retry_at:
+                # Manual retry can bypass transient errors, never an upstream rate limit.
+                if now < retry_at and (not force or refresh.get("upstream_status") == 429):
                     return cached_result, True
+            elif not force and cached_result.get("status") == "ok" and now - cached_at < max_age_seconds * 1000:
+                return cached_result, True
         # 复用 _inflight 里的 task 前，必须先检查它是否已经 done。
         # 否则会发生一个微妙的脏数据路径：某次请求的 awaiter 在 task 跑完前被取消
         # （客户端断连），finally 里观察到 task.done()=False 不摘除它；task 之后在
@@ -1229,6 +1282,10 @@ async def _get_channel_result(channel: config_store.Channel, force: bool) -> tup
             # import_config / 编辑渠道（_generation 被 bump），这条结果视为已过期
             # 而丢弃，不污染缓存（见 _query_and_cache 的代际校验）。
             task = asyncio.ensure_future(_query_and_cache(channel, _generation))
+            # A reconfiguration can replace _inflight[id] while its shielded old
+            # task still runs. Retain both so shutdown cancels every HTTP query.
+            _query_tasks.add(task)
+            task.add_done_callback(_query_tasks.discard)
             _inflight[channel.id] = (task, _generation)
         else:
             task = entry[0]
@@ -1264,7 +1321,10 @@ async def _get_channel_result(channel: config_store.Channel, force: bool) -> tup
 
 
 @app.get("/api/quotas")
-async def quotas(force: bool = False, ids: str | None = None):
+async def quotas(
+    force: bool = False, ids: str | None = None,
+    max_age_seconds: int = Query(default=300, ge=30, le=86400),
+):
     """并行查询所有渠道，返回统一结果。
 
     停用渠道直接标 disabled、不发网络请求；启用渠道各自按 id 缓存/合并请求；
@@ -1277,6 +1337,8 @@ async def quotas(force: bool = False, ids: str | None = None):
     `?ids=ch_a&force=1` 只强刷 ch_a，其余渠道的缓存条目不受影响——因为缓存本来
     就按 id 分别存取，这里只是不去处理没被选中的渠道，不会主动清掉它们的缓存。
     """
+    if not isinstance(max_age_seconds, int):
+        max_age_seconds = 300
     channels = await asyncio.to_thread(config_store.list_channels)
     if ids:
         # 归一化 _agent/_coding 后缀：火山渠道在 /api/quotas 返回层被拆成两张卡
@@ -1289,7 +1351,7 @@ async def quotas(force: bool = False, ids: str | None = None):
         channels = [c for c in channels if c.id in wanted]
     enabled = [c for c in channels if c.enabled]
 
-    gathered = await asyncio.gather(*(_get_channel_result(c, force) for c in enabled), return_exceptions=True)
+    gathered = await asyncio.gather(*(_get_channel_result(c, force, max_age_seconds) for c in enabled), return_exceptions=True)
 
     by_id: dict[str, dict] = {}
     all_from_cache = True
@@ -1321,7 +1383,10 @@ async def quotas(force: bool = False, ids: str | None = None):
                 "hit": from_cache,
                 "source": "cache" if from_cache else "live",
                 "age_ms": age_ms,
-                "stale": age_ms is None or age_ms > DATA_STALE_AFTER_MS,
+                "stale": payload.get("status") == "stale" or age_ms is None or age_ms > max_age_seconds * 1000,
+                "next_query_at": (payload.get("refresh", {}).get("next_retry_at")
+                                  or ((payload.get("refresh", {}).get("attempted_at") or updated_at or response_now)
+                                      + max_age_seconds * 1000)),
             }
             by_id[channel.id] = payload
             all_from_cache = all_from_cache and from_cache
@@ -1332,7 +1397,7 @@ async def quotas(force: bool = False, ids: str | None = None):
             result_channels.append(_disabled_result(c))
             continue
         res = by_id.get(c.id)
-        if not res or res.get("status") != "ok":
+        if not res or res.get("status") not in {"ok", "stale"}:
             if res:
                 result_channels.append(res)
             continue
@@ -1347,7 +1412,8 @@ async def quotas(force: bool = False, ids: str | None = None):
 
 async def _monitor_query_results(force: bool) -> list[dict]:
     """后台监控复用 /api/quotas 的缓存、in-flight 合并和多套餐拆分语义。"""
-    response = await quotas(force=force, ids=None)
+    settings = await asyncio.to_thread(config_store.get_settings)
+    response = await quotas(force=force, ids=None, max_age_seconds=settings["monitor"]["interval_seconds"])
     return response["channels"]
 
 
@@ -1359,12 +1425,32 @@ monitor_service = monitoring.MonitorService(_monitor_query_results)
 # ── 本地已用统计 ─────────────────────────────────────────────
 
 
+_local_usage_tasks: dict[tuple[str, int], asyncio.Task] = {}
+_local_usage_cache: dict[tuple[str, int], tuple[float, dict]] = {}
+
+
 @app.get("/api/local-usage")
 async def local_usage_endpoint(days: int = 14):
     """多数据源本地已用统计（目前含 Claude Code transcript + OpenCode），供
     Claude 订阅没有可用 access token 时的兜底展示，也可单独查看。"""
     days = min(max(days, 1), 90)
-    return await asyncio.to_thread(local_usage.get_local_usage, days)
+    key = (str(config_store.CONFIG_PATH), days)
+    cached = _local_usage_cache.get(key)
+    if cached and time.monotonic() - cached[0] < 30:
+        return cached[1]
+    task = _local_usage_tasks.get(key)
+    if task is None or task.done():
+        async def collect():
+            result = await asyncio.to_thread(local_usage.get_local_usage, days)
+            _local_usage_cache[key] = (time.monotonic(), result)
+            return result
+        task = _spawn_background(collect())
+        _local_usage_tasks[key] = task
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if task.done() and _local_usage_tasks.get(key) is task:
+            _local_usage_tasks.pop(key, None)
 
 
 @app.get("/api/opencode-usage")
@@ -1389,7 +1475,7 @@ async def usage_collect_endpoint():
     幂等：重复调用只处理增量（每个文件记 mtime + line_offset 游标）。
     采集在 to_thread 里跑（文件 / SQLite I/O 是同步阻塞）。
     """
-    return await asyncio.to_thread(usage_collect.collect_all)
+    return await _collect_usage_shared()
 
 
 @app.get("/api/usage/status")

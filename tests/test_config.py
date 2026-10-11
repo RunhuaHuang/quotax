@@ -350,7 +350,8 @@ def test_opencode_workspace_id_roundtrip_and_preserved_on_minimal_edit(isolated_
 def test_save_raw_sets_permissions_600(isolated_config):
     config_store._save_raw({"channels": []})
     mode = stat.S_IMODE(os.stat(config_store.CONFIG_PATH).st_mode)
-    assert mode == 0o600
+    if os.name != "nt":  # Windows uses inherited profile ACLs, not POSIX mode bits.
+        assert mode == 0o600
 
 
 def test_save_raw_leaves_no_tmp_file_behind(isolated_config):

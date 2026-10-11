@@ -1,8 +1,8 @@
-"""渠道配置存储：config.json 保存在项目根目录，权限 600。
+"""渠道配置存储：config.json 保存在独立用户数据目录，POSIX 权限 600。
 
 只有 API Key / 火山 AK/SK / 中转站地址这类需要用户手动填写的敏感信息
 才会存进这里；订阅类渠道（Claude / Gemini / Grok / Codex / Copilot）
-一律直接读取各 CLI 自己的凭据文件，本项目不复制、不写入任何凭据。
+默认读取各 CLI 自己的凭据文件；主动上传/OAuth 的 Codex 凭据独立保存。
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import paths
+
 logger = logging.getLogger(__name__)
 
 # config.json 是一个小型本地配置仓库，但 FastAPI 的同步端点、to_thread 后台任务、
@@ -35,16 +37,17 @@ logger = logging.getLogger(__name__)
 # 这类嵌套读取，且符合本项目“单进程本机服务”的部署模型。
 _config_lock = threading.RLock()
 
-# 配置文件路径：默认项目根目录的 config.json；可用环境变量 QUOTABOARD_CONFIG
+# 配置文件路径：默认用户数据目录的 config.json；可用环境变量 QUOTABOARD_CONFIG
 # 覆盖（主要用于本地自测/集成测试时指向临时目录，绝不touched 用户真实配置）。
 # pytest 测试请直接 monkeypatch.setattr(config, "CONFIG_PATH", tmp_path / "x.json")，
 # 不必依赖这个环境变量——模块里的函数都是运行时才读 CONFIG_PATH 这个全局名字，
 # 猴子补丁改了之后立刻生效。
-CONFIG_PATH = (
-    Path(os.environ["QUOTABOARD_CONFIG"])
-    if os.environ.get("QUOTABOARD_CONFIG")
-    else Path(__file__).resolve().parent.parent / "config.json"
-)
+CONFIG_PATH = paths.config_path()
+
+
+def initialize_storage() -> None:
+    paths.prepare_storage(CONFIG_PATH)
+
 
 # 历史趋势数据目录：与 config.json 同目录下的 history/ 子目录，存 JSONL 趋势记录。
 # 用 QUOTABOARD_CONFIG 派生（而不是单独环境变量）——这样测试时只要指了 CONFIG_PATH，
@@ -561,6 +564,7 @@ def _redact_sensitive(value, *, key: str | None = None):
 
 
 def _load_raw() -> dict:
+    initialize_storage()
     if not CONFIG_PATH.exists():
         return {"channels": []}
     try:
@@ -605,6 +609,7 @@ def _save_raw(data: dict) -> None:
     替换——避免进程崩溃/并发写导致文件半写坏，也避免明文密钥在磁盘上短暂裸奔。
     任何一步失败都清理临时文件，不留半成品。
     """
+    initialize_storage()
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = CONFIG_PATH.with_name(f".{CONFIG_PATH.name}.{uuid.uuid4().hex[:8]}.tmp")
     fd = os.open(str(tmp_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)

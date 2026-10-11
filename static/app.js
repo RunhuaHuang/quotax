@@ -3,7 +3,10 @@
 // 不依赖 DOM/localStorage 的纯函数抽到 view-utils.js（可被 node:test 直接
 // import 测试），这里只 import 使用，避免同一份逻辑两处维护。
 import { normalizeThreeWindows, canonicalChannelId, channelBreachesThreshold, noPercentData, fmtReset } from "./view-utils.js?v=9";
-import { t, thas, toggleLang, getLang } from "./i18n.js?v=9";
+import { t, thas, toggleLang, getLang } from "./i18n.js?v=12";
+
+import { createQuotaRefresher, createPoller } from "./refresh-controller.js?v=12";
+import { refreshUsageView } from "./usage.js?v=12";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -89,22 +92,27 @@ function statusText(status) {
   return thas(key) ? t(key) : status;
 }
 const STATUS_TAG_CLASS = {
-  ok: "ok", info: "info", expired: "expired", error: "error", not_found: "not_found", disabled: "disabled",
+  ok: "ok", stale: "error", loading: "info", info: "info", expired: "expired", error: "error", not_found: "not_found", disabled: "disabled",
 };
 
 let providersCatalog = {};
 let categories = {};
 let channels = [];
+let channelLoadRevision = 0;
+let channelsLoaded = false;
 let quotas = [];
 let localUsage = null;
 let editingId = null;
-let autoRefreshTimer = null;
+let activeView = "quota";
+let quotaRounds = 0;
+let quotaTransportFailures = 0;
+let lastCheckedAt = null;
+let localUsageRequest = null;
 let dashboardLoadedOnce = false;
 let monitorStatus = null;
 let monitorStatusRequestRevision = 0;
 let monitorStatusAbortController = null;
-let quotaRequestRevision = 0;
-let quotaAbortController = null;
+
 
 const DEFAULT_BACKEND_SETTINGS = {
   monitor: {
@@ -127,11 +135,7 @@ let settingsSaveRevision = 0;
 
 const PREFS_KEY = "quotaboard_prefs";
 
-/* 自动刷新间隔（毫秒）。默认 5 分钟——自动刷新是"兜底保活"，用户想立刻看
-   最新数据时点顶栏「刷新」按钮即可强制全刷（force=1 绕过后端缓存，真查所有
-   渠道）。后端成功缓存 5 分钟 / 失败缓存 15 分钟（避免频繁请求触发上游 429 限流）。
-   间隔大于等于缓存 TTL 时定时刷新才能拿到新数据；间隔小于 TTL 时刷新会命中缓存
-   （节省上游请求），点「刷新」按钮可强制绕过。用户可在设置里调整频率。 */
+/* Interval controls acceptable data age; errors use the server retry deadline. */
 const REFRESH_INTERVALS = [
   { value: 0, labelKey: "refresh.off" },
   { value: 30_000, labelKey: "refresh.30s" },
@@ -174,6 +178,7 @@ function savePrefs(patch) {
 
 async function init() {
   bindEvents();
+  $("#autoRefresh").checked = loadPrefs().autoRefresh !== false && getRefreshInterval() > 0;
   applyStoredTheme(); // 尽早应用主题，避免首屏闪烁
   updateAutoRefreshLabel(); // 首屏就显示「自动刷新 · 5 分钟」（在 applyStaticI18n 之前，
                             // 因为该 label 不带 data-i18n，不会被 i18n 覆盖）
@@ -193,7 +198,8 @@ async function init() {
   await loadSettings();
   // 快照恢复时 providersCatalog 可能还没就绪（类型标签用 fallback），这里重绘修正
   if (dashboardLoadedOnce) renderDashboard();
-  await Promise.all([loadChannels(), refreshQuotas(true), loadLocalUsage()]);
+  await loadChannels();
+  await Promise.all([refreshQuotas(false), loadLocalUsage()]);
   setupAutoRefresh();
   updateAutoRefreshLabel();
   setupVisibilityAutoRefresh();
@@ -202,7 +208,7 @@ async function init() {
 }
 
 function bindEvents() {
-  $("#btnRefresh").addEventListener("click", () => refreshQuotas(true));
+  $("#btnRefresh").addEventListener("click", () => refreshCurrentView(true));
   $("#btnConfig").addEventListener("click", openConfigModal);
   $("#btnCloseModal").addEventListener("click", closeConfigModal);
   $("#configModal").addEventListener("click", (e) => {
@@ -240,8 +246,8 @@ function bindEvents() {
     btn.classList.toggle("active", isPw);
   });
   $("#autoRefresh").addEventListener("change", (e) => {
-    if (e.target.checked) setupAutoRefresh();
-    else clearInterval(autoRefreshTimer);
+    savePrefs({ autoRefresh: e.target.checked });
+    setupAutoRefresh();
     updateAutoRefreshLabel();
   });
 
@@ -286,7 +292,7 @@ function bindEvents() {
     const action = btn.dataset.action;
     if (action === "open-config") openConfigModal();
     else if (action === "retry-init") location.reload();
-    else if (action === "retry-refresh") refreshQuotas(true);
+    else if (action === "retry-refresh") refreshCurrentView(true);
     else if (action === "refresh-one") onRefreshOneCard(btn);
     else if (action === "edit-card") onEditCard(btn.dataset.id);
   });
@@ -348,6 +354,8 @@ function bindEvents() {
 }
 
 function switchView(view) {
+  activeView = view;
+  setupAutoRefresh();
   const tabs = document.querySelectorAll(".view-tab");
   const panes = document.querySelectorAll(".view-pane");
   tabs.forEach((t) => {
@@ -435,58 +443,159 @@ async function loadSettings() {
 }
 
 async function loadChannels() {
+  const revision = ++channelLoadRevision;
   try {
-    const res = await fetch("/api/channels");
+    const res = await fetch("/api/channels", { cache: "no-store", signal: AbortSignal.timeout(15_000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    channels = await res.json();
+    const previous = new Map(channels.map((c) => [c.id, JSON.stringify(c)]));
+    const fresh = await res.json();
+    if (revision !== channelLoadRevision) return;
+    const changed = JSON.stringify(channels) !== JSON.stringify(fresh);
+    channelsLoaded = true;
+    const currentIds = new Set(fresh.map((c) => c.id));
+    for (const old of channels) {
+      if (!currentIds.has(old.id)) quotaRefresher.invalidate(old.id);
+    }
+    for (const c of fresh) {
+      if (previous.has(c.id) && previous.get(c.id) !== JSON.stringify(c)) quotaRefresher.invalidate(c.id);
+    }
+    const oldChannels = channels;
+    quotas = quotas.filter((q) => currentIds.has(canonicalChannelId(q.id, oldChannels)));
+    channels = fresh;
+    for (const c of channels) {
+      if (!quotas.some((q) => canonicalChannelId(q.id, channels) === c.id)) {
+        quotas.push({ id: c.id, type: c.type, name: c.name, category: providersCatalog[c.type]?.category || "unknown",
+          status: c.enabled ? "loading" : "disabled", windows: [] });
+      }
+    }
+    dashboardLoadedOnce = true;
     renderChannelsList();
     renderChannelCount();
     // 首次启动时渠道列表与额度请求并发，若额度响应先回来，卡片可能先用 fallback
     // 元信息渲染；渠道列表到达后补一次轻量重绘，确保管理链接、名称和趋势选择器
     // 立即与最新配置一致。
-    if (dashboardLoadedOnce) renderDashboard();
+    if (changed || !quotas.length) renderDashboard();
   } catch (e) {
+    if (revision !== channelLoadRevision) return;
     toast(t("toast.loadChannelsFailed", { msg: e.message }), "err");
+    if (!channelsLoaded) renderFatalDashboardError(e.message);
   }
 }
 
-async function refreshQuotas(force = false) {
-  const revision = ++quotaRequestRevision;
-  if (quotaAbortController) quotaAbortController.abort();
-  const controller = new AbortController();
-  quotaAbortController = controller;
+const quotaRefresher = createQuotaRefresher({
+  fetchChannel: (id, { force, maxAge, signal }) => {
+    const params = new URLSearchParams({ ids: id, max_age_seconds: String(maxAge) });
+    if (force) params.set("force", "1");
+    return fetchQuotas(`/api/quotas?${params}`, signal);
+  },
+  onResult: (id, data) => {
+    if (!channels.some((c) => c.id === id)) return;
+    const previousIds = quotas.filter((q) => canonicalChannelId(q.id, channels) === id).map((q) => q.id);
+    quotas = quotas.filter((q) => canonicalChannelId(q.id, channels) !== id);
+    quotas.push(...data.channels);
+    dashboardLoadedOnce = true;
+    lastCheckedAt = Date.now();
+    // Most updates only replace this channel's cards. Changed plan structure uses a full render.
+    const sameShape = previousIds.length === data.channels.length && data.channels.every((q) => previousIds.includes(q.id));
+    if (sameShape && data.channels.every((q) => document.querySelector(`.card[data-id="${CSS.escape(q.id)}"]`))) {
+      for (const q of data.channels) {
+        const card = document.querySelector(`.card[data-id="${CSS.escape(q.id)}"]`);
+        card.insertAdjacentHTML("afterend", renderCard(q));
+        card.remove();
+      }
+      renderSummaryChips(quotas);
+    } else renderDashboard();
+    updateFreshnessLabels();
+    saveSnapshot({ channels: quotas, lastCheckedAt });
+  },
+});
+
+const refreshPoller = createPoller({
+  run: () => refreshCurrentView(false),
+  delay: () => {
+    const interval = getRefreshInterval() || DEFAULT_REFRESH_INTERVAL;
+    if (activeView === "usage") return interval;
+    if (quotaTransportFailures) return Math.min(300_000, 30_000 * 2 ** Math.min(quotaTransportFailures - 1, 4));
+    const deadlines = quotas.map((q) => q.cache?.next_query_at).filter(Number.isFinite);
+    return deadlines.length ? Math.max(1000, Math.min(interval, ...deadlines.map((at) => at - Date.now()))) : interval;
+  },
+  enabled: () => $("#autoRefresh").checked && getRefreshInterval() > 0 && !document.hidden && navigator.onLine !== false,
+});
+
+async function refreshCurrentView(force = false) {
+  if (activeView === "usage") {
+    const btn = $("#btnRefresh");
+    btn.classList.add("spinning");
+    btn.setAttribute("aria-busy", "true");
+    try { await refreshUsageView(force); }
+    finally { btn.classList.remove("spinning"); btn.removeAttribute("aria-busy"); }
+    return;
+  }
+  await loadChannels();
+  await Promise.all([refreshQuotas(force), loadLocalUsage()]);
+}
+
+async function refreshQuotas(force = false, ids = null) {
+  if (!channelsLoaded) return;
+  const targets = ids ? channels.filter((c) => ids.includes(c.id)) : channels;
   const btn = $("#btnRefresh");
+  quotaRounds += 1;
   btn.classList.add("spinning");
   btn.setAttribute("aria-busy", "true");
   try {
-    const url = force ? "/api/quotas?force=1" : "/api/quotas";
-    const data = await fetchQuotas(url, controller.signal);
-    if (revision !== quotaRequestRevision || controller.signal.aborted) return;
-    quotas = data.channels;
-    dashboardLoadedOnce = true;
-    renderDashboard();
-    const now = new Date();
-    const ts = now.toLocaleTimeString(getLang() === "zh-CN" ? "zh-CN" : "en-US", { hour12: false });
-    $("#lastUpdated").textContent = t("card.lastUpdated", { time: ts, cached: data.cached ? t("card.cachedSuffix") : "" });
-    saveSnapshot({ channels: data.channels, lastUpdated: ts });
-  } catch (e) {
-    if (e?.name === "AbortError" || revision !== quotaRequestRevision) return;
-    toast(t("toast.refreshFailed", { ctx: dashboardLoadedOnce ? t("toast.refreshCtxKept") : "", msg: e.message }), "err");
-    if (!dashboardLoadedOnce) {
-      // 从未成功加载过：给出明确的错误态，不能伪装成"还没配置渠道"的空状态
-      renderFatalDashboardError(e.message);
+    if (!targets.length && !channels.length) {
+      quotas = [];
+      dashboardLoadedOnce = true;
+      renderDashboard();
+      saveSnapshot({ channels: [] });
+      return;
+    }
+    const results = await Promise.allSettled(targets.map(async (c) => {
+      try {
+        return await quotaRefresher.refresh(c.id, {
+          force, maxAge: Math.max(30, (getRefreshInterval() || DEFAULT_REFRESH_INTERVAL) / 1000),
+        });
+      } catch (error) {
+        if (error?.name !== "AbortError" && channels.some((current) => current.id === c.id)) {
+          for (const q of quotas.filter((q) => canonicalChannelId(q.id, channels) === c.id)) {
+            const hadData = q.status === "ok" || q.status === "stale";
+            q.status = hadData ? "stale" : "error";
+            q.message = error.message;
+            q.cache = { ...q.cache, stale: true };
+          }
+          renderDashboard();
+        }
+        throw error;
+      }
+    }));
+    const errors = results.filter((r) => r.status === "rejected" && r.reason?.name !== "AbortError");
+    quotaTransportFailures = errors.length ? quotaTransportFailures + 1 : 0;
+    if (errors.length) {
+      const msg = errors[0].reason?.message || "Network error";
+      toast(t("toast.refreshFailed", { ctx: dashboardLoadedOnce ? t("toast.refreshCtxKept") : "", msg }), "err");
+      if (!dashboardLoadedOnce) renderFatalDashboardError(msg);
     }
   } finally {
-    if (revision === quotaRequestRevision) {
-      quotaAbortController = null;
-      btn.classList.remove("spinning");
-      btn.removeAttribute("aria-busy");
+    quotaRounds -= 1;
+    if (!quotaRounds) {
+      btn.classList.remove("spinning"); btn.removeAttribute("aria-busy");
+      refreshPoller.schedule();
     }
   }
 }
 
+function updateFreshnessLabels() {
+  for (const q of quotas) {
+    const label = document.querySelector(`.card[data-id="${CSS.escape(q.id)}"] .time`);
+    if (label) label.textContent = freshnessText(q);
+  }
+  if (lastCheckedAt) $("#lastUpdated").textContent = t("card.lastChecked", { time: fmtTime(lastCheckedAt) });
+}
+
 async function fetchQuotas(url, signal) {
-  const res = await fetch(url, signal ? { signal } : undefined);
+  const timeout = AbortSignal.timeout(60_000);
+  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+  const res = await fetch(url, { signal: combined, cache: "no-store" });
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
     try {
@@ -500,17 +609,20 @@ async function fetchQuotas(url, signal) {
   return data;
 }
 
-async function loadLocalUsage() {
+function loadLocalUsage() {
+  if (!localUsageRequest) localUsageRequest = fetchLocalUsage().finally(() => { localUsageRequest = null; });
+  return localUsageRequest;
+}
+
+async function fetchLocalUsage() {
   try {
-    const res = await fetch(`/api/local-usage?days=${LOCAL_USAGE_DAYS}`);
+    const res = await fetch(`/api/local-usage?days=${LOCAL_USAGE_DAYS}`, { signal: AbortSignal.timeout(60_000), cache: "no-store" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     localUsage = await res.json();
     renderLocalUsage();
     saveSnapshot({ localUsage });
   } catch (e) {
-    localUsage = null;
-    $("#localUsage").classList.add("hidden");
-    $("#localUsage").innerHTML = "";
+    if (!localUsage) $("#localUsage").classList.add("hidden");
     toast(t("toast.localUsageFailed", { msg: e.message }), "err");
   }
 }
@@ -524,11 +636,7 @@ function getRefreshInterval() {
 }
 
 function setupAutoRefresh() {
-  clearInterval(autoRefreshTimer);
-  const interval = getRefreshInterval();
-  if ($("#autoRefresh").checked && !document.hidden && interval > 0) {
-    autoRefreshTimer = setInterval(() => refreshQuotas(false), interval);
-  }
+  refreshPoller.schedule();
 }
 
 /* 在自动刷新开关的 label 上显示当前刷新频率（如「自动刷新 · 5m」），
@@ -549,13 +657,14 @@ function updateAutoRefreshLabel() {
 /* 页面隐藏时暂停轮询，重新可见时立即刷新一次并恢复定时 */
 function setupVisibilityAutoRefresh() {
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) {
-      clearInterval(autoRefreshTimer);
-    } else if ($("#autoRefresh").checked) {
-      refreshQuotas(false);
-      setupAutoRefresh();
-    }
+    updateFreshnessLabels();
+    if (document.hidden) refreshPoller.stop();
+    else refreshPoller.tick();
   });
+  window.addEventListener("online", () => refreshPoller.tick());
+  window.addEventListener("offline", () => refreshPoller.stop());
+  // Relative ages keep advancing even when automatic network refresh is disabled.
+  setInterval(() => { if (!document.hidden) updateFreshnessLabels(); }, 15_000);
 }
 
 /* 系统深色/浅色模式切换时，重绘一次以让 ringColor() 等运行时取色的地方生效。
@@ -595,6 +704,7 @@ function restoreSnapshot() {
       }));
       dashboardLoadedOnce = true;
       renderDashboard();
+      lastCheckedAt = snap.lastCheckedAt || null;
       if (snap.lastUpdated) {
         $("#lastUpdated").textContent = t("card.lastUpdated", { time: snap.lastUpdated, cached: t("card.restoringSnapshot") });
       }
@@ -712,7 +822,7 @@ function renderDashboard() {
 function renderSummaryChips(list) {
   const ok = list.filter((q) => q.status === "ok").length;
   const info = list.filter((q) => q.status === "info").length;
-  const warn = list.filter((q) => q.status === "error" || q.status === "not_found").length;
+  const warn = list.filter((q) => q.status === "error" || q.status === "stale" || q.status === "not_found").length;
   const bad = list.filter((q) => q.status === "expired").length;
   const off = list.filter((q) => q.status === "disabled").length;
   // channelBreachesThreshold 现在接受 thresholds 表作为参数（纯函数、可测试），
@@ -755,7 +865,7 @@ function renderCard(q) {
   );
 
   let body = "";
-  if (q.status === "ok") {
+  if (q.status === "ok" || q.status === "stale") {
     const parts = [];
     const hasPercentWindow = (q.windows || []).some(
       (w) => w.remaining_percent != null || w.used_percent != null
@@ -772,6 +882,8 @@ function renderCard(q) {
       parts.push(`<div class="card-amount"><span class="value placeholder">${t("card.noData")}</span></div>`);
     }
     body = `<div class="card-body">${parts.join("")}</div>`;
+  } else if (q.status === "loading") {
+    body = `<div class="card-body"><div class="card-info-msg">${t("status.loading")}</div></div>`;
   } else if (q.status === "info") {
     body = `<div class="card-body"><div class="card-info-msg">${esc(q.message || t("card.noData"))}</div></div>`;
   } else if (isDisabled) {
@@ -972,48 +1084,12 @@ function fmtResetText(r) {
 /* ── 单渠道操作：刷新 / 启停 ────────────────────────────── */
 
 async function onRefreshOneCard(btn) {
+  const id = canonicalChannelId(btn.dataset.id, channels);
   if (btn.disabled) return;
-  const id = btn.dataset.id;
-  const card = btn.closest(".card");
   btn.disabled = true;
   btn.classList.add("spinning");
-  card?.classList.add("card-busy");
-  try {
-    // 只强刷这一张卡：force=1 强制绕过缓存，ids=id 只让后端查这一个渠道
-    // （其余渠道的缓存条目完全不受影响——这正是按 channel id 分别缓存的意义）。
-    // 但火山子卡的 id 带 _agent/_coding 后缀，后端会归一成配置 id 去查询，于是
-    // 哪怕只点了一张子卡的刷新按钮，也可能一次性把同配置下的两张子卡都返回。
-    // 必须把返回的每一张卡都合并进 quotas 并各自重绘，否则"多返回的那张卡"的
-    // 新数据会被直接丢弃，兄弟卡还停在刷新前的旧值上（数据都查回来了却白白丢掉）。
-    const data = await fetchQuotas(`/api/quotas?force=1&ids=${encodeURIComponent(id)}`);
-    for (const fresh of data.channels) {
-      // 局部替换这一条数据（数组先更新，DOM 补丁失败也不会丢数据）
-      const idx = quotas.findIndex((c) => c.id === fresh.id);
-      if (idx >= 0) quotas[idx] = fresh;
-      else quotas.push(fresh);
-      // 被点击的卡片已经有 DOM 引用（card）；一并返回的兄弟卡（如火山 coding 卡）
-      // 需要重新按 id 查 DOM。局部替换（insertAdjacentHTML + remove）是为了避免
-      // 全屏重绘导致其他卡片闪烁，这里对每张返回的卡都做同样的局部替换。
-      const target = fresh.id === id ? card : document.querySelector(`.card[data-id="${CSS.escape(fresh.id)}"]`);
-      if (target) {
-        const newCard = renderCard(fresh);
-        target.insertAdjacentHTML("afterend", newCard);
-        target.remove();
-      }
-      // 找不到对应 DOM 节点（比如这张卡是首次出现）：数据已经写进 quotas 了，
-      // 不强行插入 DOM，下一次全量 renderDashboard() 会自然带出它，不会丢数据。
-    }
-    renderSummaryChips(quotas);
-  } catch (e) {
-    toast(t("toast.refreshOneFailed", { msg: e.message }), "err");
-  } finally {
-    btn.disabled = false;
-    btn.classList.remove("spinning");
-    // 失败路径下卡片没有被局部替换（旧节点还留在 DOM 上），card-busy 必须在这里
-    // 清掉，否则刷新一旦失败卡片会永久停留在 busy 视觉态，直到下一次全量重绘。
-    // 成功路径下旧节点已被 detach，对它 classList.remove 是无害 no-op。
-    card?.classList.remove("card-busy");
-  }
+  try { await refreshQuotas(true, [id]); }
+  finally { btn.disabled = false; btn.classList.remove("spinning"); }
 }
 
 /* 卡片上的编辑按钮：打开配置弹窗并直接进入该渠道的编辑模式。
@@ -1055,8 +1131,9 @@ async function onToggleEnabled(el) {
       throw new Error(err.detail || `HTTP ${res.status}`);
     }
     toast(nextEnabled ? t("toast.channelEnabled") : t("toast.channelDisabled"), "ok");
+    quotaRefresher.invalidate(baseId);
     await loadChannels();
-    await refreshQuotas(true);
+    await refreshQuotas(false, [baseId]);
   } catch (err) {
     // 失败回滚：把同源所有兄弟卡的勾选态翻回（它们在用户眼里是同一个开关）。
     for (const s of peers) {
@@ -1168,7 +1245,7 @@ async function onAutoDetect() {
       const names = added.map((a) => providerLabel(a.type)).join("、");
       toast(t("toast.autoDetectFound", { count: added.length, names }), "ok");
       await loadChannels();
-      await refreshQuotas(true);
+      await refreshQuotas(false);
     } else {
       toast(t("toast.autoDetectNone"), "info");
     }
@@ -1386,7 +1463,7 @@ async function startCodexOAuth(btn) {
       try { popup.close(); } catch { /* 窗口可能已关 */ }
       resetForm();
       await loadChannels();
-      await refreshQuotas(true);
+      await refreshQuotas(false);
     } else {
       toast(t("codex.oauthFailed") + ": " + (result.message || t("card.noData")), "err");
     }
@@ -1507,9 +1584,10 @@ async function onSaveChannel(e) {
 
     toast(editingId ? t("toast.channelUpdated") : t("toast.channelSaved"), "ok");
     if (uploadErr) toast(t("toast.uploadCredentialsFailed", { msg: uploadErr }), "err");
+    quotaRefresher.invalidate(saved.id);
     resetForm();
     await loadChannels();
-    await refreshQuotas(true);
+    await refreshQuotas(false, [saved.id]);
   } catch (err) {
     toast(t("toast.saveFailed", { msg: err.message }), "err");
   }
@@ -1553,9 +1631,10 @@ async function deleteChannel(id) {
   try {
     const res = await fetch(`/api/channels/${id}`, { method: "DELETE" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    quotaRefresher.invalidate(canonicalChannelId(id, channels));
     toast(t("toast.channelDeleted"), "ok");
     await loadChannels();
-    await refreshQuotas(true);
+    await refreshQuotas(false);
   } catch (e) {
     toast(t("toast.deleteFailed", { msg: e.message }), "err");
   }
@@ -1573,13 +1652,14 @@ function fmtTime(ms) {
 }
 
 function freshnessText(q) {
-  if (q.status === "disabled") return t("card.notQueried");
-  if (!q.updated_at) return "";
-  const age = fmtTime(q.updated_at);
-  if (q.cache?.source === "snapshot") return `${t("card.snapshotData")} · ${age}`;
-  if (q.cache?.stale) return `${t("card.staleData")} · ${age}`;
-  if (q.cache?.hit) return `${t("card.cacheData")} · ${age}`;
-  return `${t("card.liveData")} · ${age}`;
+  if (q.status === "disabled" || q.status === "loading") return t("card.notQueried");
+  const now = Date.now();
+  const stale = q.status === "stale" || q.cache?.stale || (q.cache?.next_query_at && now > q.cache.next_query_at);
+  const source = q.status === "error" || q.status === "expired" || q.status === "not_found" ? "card.queryFailed" : q.cache?.source === "snapshot" ? "card.snapshotData" : stale ? "card.staleData" : q.cache?.hit ? "card.cacheData" : "card.liveData";
+  const parts = [q.updated_at ? `${t(source)} · ${fmtTime(q.updated_at)}` : t("card.noData")];
+  const due = q.cache?.next_query_at;
+  if (due) parts.push(t(due > now ? "card.nextQuery" : "card.queryDue", { seconds: Math.max(0, Math.ceil((due - now) / 1000)) }));
+  return parts.join(" · ");
 }
 
 function esc(s) {
@@ -1702,10 +1782,10 @@ function renderRefreshOptions() {
   $("#refreshOptions").querySelectorAll("[data-refresh-val]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const val = Number(btn.dataset.refreshVal);
-      savePrefs({ refreshInterval: val });
+      savePrefs({ refreshInterval: val, autoRefresh: val > 0 });
       if (val === 0) {
         $("#autoRefresh").checked = false;
-        clearInterval(autoRefreshTimer);
+        refreshPoller.stop();
       } else {
         $("#autoRefresh").checked = true;
         setupAutoRefresh();
@@ -1973,8 +2053,9 @@ async function onImportFileSelected(e) {
     }
     const result = await res.json();
     toast(t("toast.importSuccess", { mode: mode === "merge" ? t("toast.modeMerge") : t("toast.modeReplace"), count: result.count }), "ok");
+    for (const c of channels) quotaRefresher.invalidate(c.id);
     await loadChannels();
-    await refreshQuotas(true);
+    await refreshQuotas(false);
     closeConfigModal();
   } catch (err) {
     toast(t("toast.importFailed", { msg: err.message }), "err");

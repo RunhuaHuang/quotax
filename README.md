@@ -20,7 +20,7 @@
 - **订阅渠道免填密钥 + 自动探测**：自动读取本机 CLI 的登录凭据（Claude / Gemini / Grok / Codex / Copilot），**不刷新、不写入**，与你的 agent 共享同一份登录态。服务启动时自动探测本机已登录的 CLI 并创建对应渠道，无需手动添加。
 - **用量统计看板（深度分析）**：独立 Tab，基于 SQLite 持久化的增量采集，提供四桶 token 总览、缓存命中率、按天趋势曲线、模型分布、逐请求日志、成本估算（LiteLLM 单价表 + rebill 回填）。
 - **Codex OAuth 在线授权**：ChatGPT 订阅支持在 WebUI 点一下「通过 ChatGPT 登录」完成 OAuth 授权，自动获取凭据并创建渠道。
-- **按渠道 id 独立缓存 + 请求合并**：成功 5 分钟 / 失败 15 分钟，同一渠道并发查询只打一次上游；手动刷新可立即绕过缓存。
+- **逐渠道刷新 + 请求合并**：成功数据按所选周期更新，临时错误自动退避重试，429 遵守冷却；慢渠道不阻塞其他卡片。
 - **拖拽排序**：卡片可拖拽自定义顺序，顺序持久化到浏览器 `localStorage`。
 - **历史趋势**：每次成功查询自动记录一条趋势点，用 SVG 折线图展示余额 / 剩余百分比随时间的变化。
 - **浏览器无关的后台告警**：阈值持久化到后端；可按周期持续检查，支持桌面通知、Webhook、重复告警冷却和恢复通知，关闭浏览器后仍可运行（默认关闭，需显式开启）。
@@ -38,13 +38,13 @@
 **macOS / Linux：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/v1.3.0/install.sh | bash
 ```
 
 **Windows（PowerShell）：**
 
 ```powershell
-irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/RunhuaHuang/quotax/v1.3.0/install.ps1 | iex
 ```
 
 > - 首次安装会自动准备运行时：**优先复用本机已有的 Python 3.11+**；本机完全没有时才自动安装 Python 3.13。无需用户预装 Python。请耐心等待 1–2 分钟。
@@ -52,10 +52,10 @@ irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
 > - **安装后自动探测**：本机已登录的 Claude / Codex / Gemini / Grok / Copilot CLI 会被自动识别并创建对应渠道，无需手动添加。
 > - **网络不通 / GitHub 被墙？** 脚本内置多源镜像自动 fallback（GitHub → ghfast.top → gh-proxy.com → moeyy）；也可手动指定镜像：
 >   ```bash
->   QUOTAX_MIRROR=https://ghfast.top bash -c "$(curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.sh)"
+>   QUOTAX_MIRROR=https://ghfast.top bash -c "$(curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/v1.3.0/install.sh)"
 >   ```
 >   ```powershell
->   $env:QUOTAX_MIRROR='https://ghfast.top'; irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
+>   $env:QUOTAX_MIRROR='https://ghfast.top'; irm https://raw.githubusercontent.com/RunhuaHuang/quotax/v1.3.0/install.ps1 | iex
 >   ```
 > - **升级**：重新跑一次同样的命令即可，`config.json` / `monitor-state.json` / `usage.db` / `history/` 等个人数据会自动保留。
 
@@ -219,7 +219,9 @@ Webhook 接收 `{"source":"QuotaX","version":1,"event":{...}}` JSON；`event.typ
 
 ## 不抢登录的设计
 
-所有订阅类渠道（Claude / Gemini / Grok / Codex / Copilot）只读本机 CLI 的凭据文件 / 钥匙串，**绝不刷新 token、绝不写入任何凭据副本**——你本机的 agent 登录状态完全不受打扰，QuotaX 只是一个只读的旁观者。token 过期时只会在卡片上提示「已过期」，需要你去对应 CLI 重新登录，QuotaX 不会代你做 OAuth refresh。
+自动探测的订阅渠道只读取本机 CLI 凭据或钥匙串，QuotaX 不会修改这些文件，也不会主动刷新它们的 token。Claude 的 PTY 回退会调用本机 Claude CLI 的 `/usage`；CLI 自身的登录处理由 CLI 决定。
+
+用户主动上传 Codex `auth.json` 或通过 OAuth 授权时，QuotaX 会在自己的用户数据目录 `credentials/` 下保存独立凭据文件，不覆盖 CLI 的登录文件。凭据过期后需要重新登录、授权或上传。
 
 ## CLI 终端集成
 
@@ -236,11 +238,31 @@ uv run quotaboard cost --days 7          # 本地已用 token 统计
 
 退出码：`0` 全部正常；`1` 有 error/expired 渠道；`2` 配置损坏或用法错误——适合在脚本里做健康检查。
 
-## 缓存
+## 刷新与故障恢复
 
-为避免频繁打扰上游接口，每个渠道的查询结果在进程内有独立缓存：**成功缓存 5 分钟，失败缓存 15 分钟**。较长的失败冷却时间主要用于避免 429/临时网络错误被自动刷新反复放大；同一渠道的并发查询会合并成一次上游请求（请求去重 / in-flight 复用）。点顶栏「刷新」按钮可强制绕过缓存立即真查。
+- 首次打开先恢复画面，再按渠道更新；单卡、全局和自动刷新共享请求管理，旧请求不会覆盖编辑后的数据。
+- 自动刷新默认 5 分钟，可选 30 秒至 3 小时。该周期也是成功数据的有效期；HTTP API 可传 `max_age_seconds=30..86400`，默认 300。后台监控按自己的间隔查询，共享缓存与请求合并。
+- 同一渠道只执行一次并发上游查询，全局最多 4 个；每个渠道含排队和多个接口在内最多等待 45 秒。前端逐卡显示结果，不等最慢渠道。
+- 临时错误按 30 / 60 / 120 / 240 / 300 秒退避；浏览器启用自动刷新时会按重试时间提前检查。429 使用 `Retry-After`（秒数或 HTTP 日期），缺失时冷却 15 分钟，手动刷新也不会绕过限流。凭据失效提示重新登录，自动检查间隔为 5 分钟。
+- 查询失败保留最近成功数值，标记 `stale` 并显示错误，旧值不用于触发或解除监控告警。修改密钥或导入配置会清除旧缓存。
+- 卡片显示数据年龄及最早可再次查询时间，顶部显示最近检查时间。自动刷新关闭时，卡片年龄仍继续更新；页面隐藏/离线时暂停轮询，恢复后检查过期数据。
+- 顶部刷新作用于当前视图：额度页同时更新额度和本地用量，用量页执行采集并重载统计。后台每轮采集完成后等待 60 秒再增量采集；多标签页与手动采集共享正在运行的任务。本地汇总扫描缓存 30 秒。
 
-每张卡片会明确显示「实时 / 缓存 / 数据陈旧 / 缓存快照」及数据年龄；这比只在整页顶部显示一次“命中缓存”更准确，混合命中时也能看出每个渠道的数据来源。
+## 数据目录与升级
+
+代码默认安装在 `~/QuotaX`，个人数据独立存放：
+
+| 系统 | 默认数据目录 |
+| --- | --- |
+| macOS | `~/Library/Application Support/QuotaX` |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/quotax` |
+| Windows | `%LOCALAPPDATA%\QuotaX` |
+
+目录包含 `config.json`、`credentials/`、`usage.db`、`history/` 和 `monitor-state.json`。首次启动会将旧安装目录的数据复制到新目录；SQLite 通过备份接口包含已提交的 WAL 数据，迁移失败不会删除原文件。已有新配置优先，遇到有其他数据却缺少配置的目录会停止并提示检查，不混合覆盖。
+
+可用 `QUOTAX_DATA_DIR` 指定整个数据目录；`QUOTABOARD_CONFIG` 指定配置文件时不自动迁移，适合隔离测试或保留旧部署路径。升级前后请勿同时运行旧版和新版写入两份不同数据；回退旧版时可以将 `QUOTABOARD_CONFIG` 指向新目录中的配置。确认迁移后再自行处理旧副本。
+
+备份时先停止服务，再备份整个数据目录。仅导出配置不会包含数据库、趋势记录或上传的凭据文件。卸载程序不删除用户数据。
 
 ## 运行诊断
 
@@ -251,19 +273,47 @@ uv run quotaboard cost --days 7          # 本地已用 token 统计
 
 ## 安全说明
 
-- 服务**只监听 `127.0.0.1`**，不对外暴露。
+- 默认监听 `127.0.0.1`，本机可直接使用；非本机来源或自定义域名未设置访问密码时拒绝访问。
 - API Key / AK·SK / Cookie 仅保存在本地 `config.json`（权限 `600`）；上传或 OAuth 生成的 Codex `auth.json` 保存在同目录 `credentials/`（目录 `700`、文件 `600`）。查询时凭据只发送给用户配置的对应服务商，不经过 QuotaX 自有服务器。
 - 后台监控默认关闭；只有用户显式启用的桌面通知或 Webhook 才会接收告警。Webhook URL 在脱敏导出中会被删除。
-- 订阅渠道只读本机 CLI 凭据，不刷新不写入。
+- 自动读取的 CLI 凭据不会被 QuotaX 修改；主动上传/OAuth 产生的凭据独立保存，详见上文。
 - 默认不跟随重定向（`follow_redirects: false`），防止恶意 base_url 3xx 跳转泄露 Authorization 头。
 - DNS rebinding 防护：校验请求 Host 头白名单，防止恶意网页跨域读取本机接口。
+
+## 远程访问
+
+各自在本机安装是推荐的分享方式。需要访问同一个实例时，设置 `QUOTAX_ACCESS_PASSWORD`（长随机密码），浏览器使用用户名 `quotax` 登录。密码保护页面和全部 API；`/healthz` 仅返回无个人信息的存活状态。Host 白名单和跨站请求检查仍保留。
+
+macOS/Linux 可在安装目录 `quotax.env`（权限 `600`）中设置并重启：
+
+```sh
+QUOTAX_ACCESS_PASSWORD='替换为长随机密码'
+QUOTAX_ALLOWED_HOSTS='quota.example.com'
+```
+
+反向代理将 HTTPS 请求转发至 `127.0.0.1:8900` 并保留 Host。只有需要直接监听局域网时才设置 `QUOTAX_HOST=0.0.0.0`。Basic 登录必须配合 HTTPS；访问密码是整个实例的管理权限，持有者能读取/修改所有渠道和密钥，不提供多用户数据隔离。不要给只应查看额度的人共享这个管理实例。Windows 可在启动服务前设置同名环境变量。
+
+## 打包给朋友与发布检查
+
+```sh
+uv sync --locked
+uv run pytest -q
+node --test tests/frontend/refresh-controller.test.mjs tests/frontend/usage-refresh.test.mjs tests/frontend/view-utils.test.mjs
+uv run ruff check app tests scripts
+uv build --wheel
+uv run python scripts/package_release.py
+```
+
+`dist/quotax-1.3.0-source.zip` 采用源码白名单生成，并附带 SHA-256 校验文件；不包含个人配置、凭据、数据库、虚拟环境或未纳入分发范围的工作文件。朋友解压后在目录运行 `bash install.sh`，Windows 运行 `powershell -ExecutionPolicy Bypass -File .\install.ps1`；本地源码安装无需下载 GitHub 源码，但首次仍需获取依赖。
+
+远程安装默认固定 `v1.3.0` 标签，开发版需显式设置 `QUOTAX_VERSION=main`。**远程安装命令需在维护者发布对应标签后使用；尚未发布时使用本地源码 ZIP。** CI 已配置 macOS / Linux / Windows、Python 3.11 / 3.13 的测试、脚本语法检查、wheel 构建和脱离源码目录的安装冒烟检查；工作流通过后再发布标签。
 
 ## 开发
 
 ```bash
 git clone https://github.com/RunhuaHuang/quotax.git
 cd quotax
-uv sync                      # 安装依赖（复用本机 Python 3.11+）
+uv sync --locked             # 安装依赖（复用本机 Python 3.11+）
 uv run pytest                # 跑全部后端测试
 uv run uvicorn app.main:app --port 8900   # 启动开发服务
 ```

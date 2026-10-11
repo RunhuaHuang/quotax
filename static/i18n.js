@@ -6,12 +6,20 @@ const PREFS_KEY = "quotaboard_prefs";
 
 export const TRANSLATIONS = {
   "zh-CN": {
+    "card.queryFailed": "最近查询失败",
+    "status.loading": "查询中…",
+    "usage.loadFailed": "更新失败，保留上次数据：{{msg}}",
+    "status.stale": "数据已过期",
+    "card.lastChecked": "最近检查：{{time}}",
+    "card.nextQuery": "最早 {{seconds}} 秒后可查询",
+    "card.queryDue": "已到查询时间",
+
     // 顶栏与通用
     "app.subtitle": "统一查看各 AI 渠道余额 · 订阅用量 · Coding Plan 额度",
     "app.autoRefresh": "自动刷新",
     "app.autoRefreshHint": "自动刷新（间隔可在设置里调，页面隐藏时暂停）",
     "app.refresh": "刷新",
-    "app.refreshHint": "强制刷新全部渠道（绕过后端缓存，立即真查）",
+    "app.refreshHint": "刷新当前视图（服务商限流时遵守冷却时间）",
     "app.trend": "趋势",
     "app.trendHint": "历史趋势",
     "app.settings": "设置",
@@ -444,17 +452,25 @@ export const TRANSLATIONS = {
     "category.local": "本地统计",
 
     // Footer
-    "footer.cliReadonly": "所有订阅类渠道只读本机 CLI 凭据（不刷新、不写入），绝不打扰你的 agent 登录状态。",
-    "footer.configStorage": "配置保存在本地 config.json（权限 600）",
+    "footer.cliReadonly": "自动读取的 CLI 凭据不会被修改；主动上传或授权的 Codex 凭据独立保存在本机。",
+    "footer.configStorage": "配置和用量保存在独立的本机用户数据目录",
   },
 
   "en": {
+    "card.queryFailed": "Last query failed",
+    "status.loading": "Loading…",
+    "usage.loadFailed": "Update failed; keeping previous data: {{msg}}",
+    "status.stale": "Stale data",
+    "card.lastChecked": "Last checked: {{time}}",
+    "card.nextQuery": "Eligible in {{seconds}}s",
+    "card.queryDue": "Ready to query",
+
     // Top bar & common
     "app.subtitle": "Unified dashboard for AI credits, subscriptions & Coding Plans",
     "app.autoRefresh": "Auto-refresh",
     "app.autoRefreshHint": "Auto-refresh (interval configurable in settings; pauses when hidden)",
     "app.refresh": "Refresh",
-    "app.refreshHint": "Force refresh all channels (bypass cache, real query)",
+    "app.refreshHint": "Refresh current view (respects provider rate limits)",
     "app.trend": "Trend",
     "app.trendHint": "Historical trend",
     "app.settings": "Settings",
@@ -887,8 +903,8 @@ export const TRANSLATIONS = {
     "category.local": "Local stats",
 
     // Footer
-    "footer.cliReadonly": "All subscription channels only read local CLI credentials (no refresh, no write) — they never disturb your agent login state.",
-    "footer.configStorage": "Config is stored in local config.json (permissions 600).",
+    "footer.cliReadonly": "Auto-read CLI credentials are not modified. Explicit Codex uploads and authorization are stored separately.",
+    "footer.configStorage": "Configuration and usage are stored in a separate local user data directory.",
   },
 };
 

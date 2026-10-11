@@ -11,8 +11,9 @@
 $ErrorActionPreference = "Stop"
 
 $Repo = "RunhuaHuang/quotax"
-$Branch = "main"
-$PermDir = "$env:USERPROFILE\QuotaX"
+$Branch = if ($env:QUOTAX_VERSION) { $env:QUOTAX_VERSION } else { "v1.3.0" }
+if ($Branch -notmatch "^[A-Za-z0-9][A-Za-z0-9._-]*$") { throw "QUOTAX_VERSION 必须是版本标签或分支名。" }
+$PermDir = if ($env:QUOTAX_HOME) { $env:QUOTAX_HOME } else { "$env:USERPROFILE\QuotaX" }
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "quotax-install-$(Get-Random)"
 $Port = if ($env:QUOTAX_PORT) { $env:QUOTAX_PORT } else { "8900" }
 $PreserveDir = $null
@@ -73,8 +74,11 @@ try {
   # 源。可用 $env:QUOTAX_MIRROR pin 指定镜像（覆盖整张列表）。
   Write-Host "Downloading QuotaX..."
   New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
+  $SrcDir = $env:QUOTAX_SOURCE_DIR
+  if (-not $SrcDir -and $PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "app/main.py"))) { $SrcDir = $PSScriptRoot }
+  if (-not $SrcDir) {
   $ZipPath = Join-Path $TmpDir "repo.zip"
-  $ArchivePath = "/$Repo/archive/refs/heads/$Branch.zip"
+  $ArchivePath = "/$Repo/archive/$Branch.zip"
   # GitHub 原生优先，然后国内镜像代理。
   $MirrorPrefixes = @("", "https://ghfast.top", "https://gh-proxy.com", "https://github.moeyy.xyz")
   # 用户 pin 的镜像始终优先（替换整张列表）。
@@ -105,7 +109,8 @@ try {
   if (-not $Downloaded) {
     throw "无法从 GitHub 或任何镜像下载 QuotaX。检查网络，或 pin 指定镜像: `$env:QUOTAX_MIRROR='https://ghfast.top'"
   }
-  $SrcDir = Join-Path $TmpDir "quotax-$Branch"
+  $SrcDir = (Get-ChildItem $TmpDir -Directory -Filter "quotax-*" | Select-Object -First 1).FullName
+  }
 
   # --- 校验下载完整性 ---
   # 下载失败/不完整绝不能破坏已有安装。校验关键文件存在。
@@ -151,7 +156,8 @@ try {
   if (Test-Path $NewDir) { Remove-Item $NewDir -Recurse -Force }
   New-Item -ItemType Directory -Path $NewDir -Force | Out-Null
   # 拷贝源码到临时目录，排除 .git。
-  Get-ChildItem -Path $SrcDir -Force | Where-Object { $_.Name -ne ".git" } | ForEach-Object {
+  $SourceAllowlist = @("app", "static", "scripts", "tests", "docs", ".github", "AGENTS.md", "README.md", "README.en.md", "pyproject.toml", "uv.lock", ".gitignore", "install.sh", "install.ps1", "quotax", "quotax.cmd", "run.sh")
+  Get-ChildItem -Path $SrcDir -Force | Where-Object { $_.Name -in $SourceAllowlist } | ForEach-Object {
     Copy-Item $_.FullName (Join-Path $NewDir $_.Name) -Recurse -Force
   }
   # 校验拷贝结果可用再交换。
@@ -264,7 +270,7 @@ try {
     }
     # --- 同步依赖（uv sync 按 uv.lock 精确安装，复用上一步确定的 Python）---
     Write-Host "安装依赖（首次需下载 FastAPI / httpx 等，请稍候）..."
-    & uv sync --quiet
+    & uv sync --locked --no-dev --quiet
     if ($LASTEXITCODE -ne 0) { throw "uv sync 失败（退出码 $LASTEXITCODE）" }
   } finally {
     Pop-Location
@@ -293,7 +299,7 @@ try {
   $env:QUOTAX_LOG_FILE = $LogFile
   $ArgumentList = @(
     "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command",
-    "& uv run uvicorn app.main:app --host 127.0.0.1 --port $Port *>&1 | Tee-Object -FilePath `$env:QUOTAX_LOG_FILE"
+    "& uv run --locked --no-dev uvicorn app.main:app --host 127.0.0.1 --port $Port *>&1 | Tee-Object -FilePath `$env:QUOTAX_LOG_FILE"
   )
   $Proc = Start-Process -FilePath "powershell.exe" -ArgumentList $ArgumentList `
     -WorkingDirectory $PermDir -WindowStyle Hidden -PassThru
@@ -306,7 +312,7 @@ try {
       if ($Proc.HasExited) {
         throw "服务进程已退出"
       }
-      $Health = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/api/health" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+      $Health = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/healthz" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
       $HealthJson = $Health.Content | ConvertFrom-Json -ErrorAction Stop
       if ($HealthJson.ok -ne $true) {
         throw "健康检查返回 ok=false"

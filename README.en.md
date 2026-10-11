@@ -20,7 +20,7 @@ Top: subscription usage (Claude / Codex / OpenCode, auto-reading local CLI login
 - **Zero-key subscriptions + auto-detect**: Reads local CLI credentials (Claude / Gemini / Grok / Codex / Copilot) — **no refresh, no write**, sharing the same login state as your agent. On startup it auto-detects locally logged-in CLIs and creates channels for them — no manual setup needed.
 - **Usage analytics dashboard**: A dedicated tab with SQLite-persisted incremental collection — four-bucket token overview, cache hit rate, daily trend curves, model distribution, per-request log, cost estimation (LiteLLM pricing + rebill).
 - **Codex OAuth in-browser**: ChatGPT subscriptions support one-click "Login with ChatGPT" OAuth — automatically obtains credentials and creates the channel.
-- **Per-channel cache + request coalescing**: 5 minutes on success / 15 minutes on failure; concurrent queries to the same channel hit the upstream only once, and manual refresh bypasses the cache.
+- **Per-channel refresh + request coalescing**: successful data follows the selected interval, transient errors back off, and 429 cooldowns are respected; slow providers do not delay other cards.
 - **Drag-to-reorder**: Cards can be dragged to customize order; persisted to browser `localStorage`.
 - **History trends**: Each successful query records a data point; SVG line charts show balance / remaining-percent over time.
 - **Browser-independent monitoring**: Thresholds persist in the backend; optional desktop/Webhook alerts, cooldowns, and recovery notifications keep working after the browser closes (off by default until explicitly enabled).
@@ -38,13 +38,13 @@ Open a terminal and paste the command for your OS. The script downloads the sour
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/v1.3.0/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/RunhuaHuang/quotax/v1.3.0/install.ps1 | iex
 ```
 
 > - First install prepares the runtime: **prefers reusing any local Python 3.11+**; only installs Python 3.13 automatically if none is found. No need to pre-install Python. Please allow 1–2 minutes.
@@ -52,10 +52,10 @@ irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
 > - **Auto-detect on install**: locally logged-in CLIs (Claude / Codex / Gemini / Grok / Copilot) are recognized and channels created automatically — no manual setup.
 > - **Network blocked / GitHub firewalled?** The script has built-in multi-mirror fallback (GitHub → ghfast.top → gh-proxy.com → moeyy); or pin a mirror manually:
 >   ```bash
->   QUOTAX_MIRROR=https://ghfast.top bash -c "$(curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.sh)"
+>   QUOTAX_MIRROR=https://ghfast.top bash -c "$(curl -fsSL https://raw.githubusercontent.com/RunhuaHuang/quotax/v1.3.0/install.sh)"
 >   ```
 >   ```powershell
->   $env:QUOTAX_MIRROR='https://ghfast.top'; irm https://raw.githubusercontent.com/RunhuaHuang/quotax/main/install.ps1 | iex
+>   $env:QUOTAX_MIRROR='https://ghfast.top'; irm https://raw.githubusercontent.com/RunhuaHuang/quotax/v1.3.0/install.ps1 | iex
 >   ```
 > - **Upgrade**: just re-run the same command; personal data (`config.json` / `monitor-state.json` / `usage.db` / `history/`) is preserved.
 
@@ -219,7 +219,9 @@ At the bottom of the config modal:
 
 ## Non-intrusive login design
 
-All subscription channels (Claude / Gemini / Grok / Codex / Copilot) only read local CLI credential files / Keychain — **never refresh tokens, never write any credential copy**. Your local agent login state is completely undisturbed; QuotaX is a read-only observer. When a token expires, the card just shows "Expired" — you need to re-login in the corresponding CLI; QuotaX won't do OAuth refresh for you.
+Auto-discovered channels read CLI credential files or Keychain without modifying or proactively refreshing those credentials. Claude's PTY fallback invokes the local CLI's `/usage`; the CLI controls its own authentication behavior.
+
+Explicit Codex uploads and OAuth authorization save separate credential files in QuotaX's `credentials/` data directory. They do not replace the CLI login file. Expired credentials require another login, authorization or upload.
 
 ## CLI integration
 
@@ -236,11 +238,19 @@ uv run quotaboard cost --days 7          # local token usage stats
 
 Exit codes: `0` all OK; `1` has error/expired channels; `2` config corrupted or usage error — handy for health checks in scripts.
 
-## Caching
+## Refresh and recovery
 
-To avoid bothering upstream APIs too often, each channel's query result has an independent in-process cache: **5 minutes on success, 15 minutes on failure**. The longer failure cooldown prevents automatic refreshes from amplifying rate limits or transient network errors. Concurrent queries to the same channel coalesce into one upstream request (dedup / in-flight reuse). Click the top-bar "Refresh" button to force-bypass the cache for a real query.
+The browser updates cards individually, with one shared request per channel and a maximum of four concurrent provider queries. Each channel has a 45-second total deadline, including queue time. Manual refresh cannot be cancelled by automatic refresh, and responses from before an edit/delete cannot restore obsolete cards.
 
-Each card labels its own freshness as Live, Cached, Stale data, or Saved snapshot, together with data age. This remains accurate when only some channels hit cache.
+The selected interval (default five minutes) is the acceptable age of successful data; `GET /api/quotas` accepts `max_age_seconds=30..86400` (default 300). Background monitoring uses its own interval. Temporary failures retry after 30/60/120/240/300 seconds. A 429 respects `Retry-After` (seconds or HTTP date), defaulting to 15 minutes. Manual refresh never bypasses a rate-limit deadline. Expired credentials prompt login and retry automatically after five minutes.
+
+Failed queries keep the last successful numbers with a `stale` status and error message; stale values never trigger or resolve monitoring alerts. Cards show data age and query eligibility, while the header shows the last check. Hidden/offline pages pause polling and resume with an age check. Refresh applies to the current view. Local usage is collected at startup and 60 seconds after each background scan completes; overlapping scans are shared. The local summary endpoint caches scans for 30 seconds.
+
+## Data directory and upgrades
+
+Personal data is separate from the code installation: `~/Library/Application Support/QuotaX` on macOS, `${XDG_DATA_HOME:-~/.local/share}/quotax` on Linux, `%LOCALAPPDATA%\QuotaX` on Windows. Override with `QUOTAX_DATA_DIR`; an explicit `QUOTABOARD_CONFIG` opts out of automatic migration.
+
+On first use, legacy config, credentials, history, monitor state and the SQLite database are copied as one migration. SQLite backup includes committed WAL data. Originals are retained; an existing destination config wins, and ambiguous partial destinations stop with an error. Do not run old and new versions writing different data directories simultaneously. For rollback, explicitly point `QUOTABOARD_CONFIG` at the migrated config. Stop the service before backing up the entire data directory; configuration export alone is not a complete backup. Uninstalling the program does not delete personal data.
 
 ## Diagnostics
 
@@ -251,12 +261,26 @@ Each card labels its own freshness as Live, Cached, Stale data, or Saved snapsho
 
 ## Security
 
-- The service **listens only on `127.0.0.1`** — never exposed externally.
+- The default listener is `127.0.0.1`. Remote peers or custom hostnames are denied unless an access password is configured.
 - API Keys / AK·SK / Cookies are stored only in local `config.json` (permissions `600`); uploaded or OAuth-generated Codex `auth.json` files live under `credentials/` beside it (directory `700`, files `600`). During a query, credentials are sent only to the user-configured provider, never through a QuotaX-owned server.
 - Background monitoring is off by default. Alerts go only to desktop/Webhook destinations explicitly enabled by the user; redacted exports remove the Webhook URL.
-- Subscription channels only read local CLI credentials — no refresh, no write.
+- Auto-discovered CLI credentials are not modified. Explicit uploads and OAuth credentials are stored separately as described above.
 - Redirects are not followed by default (`follow_redirects: false`), preventing malicious base_url 3xx redirects from leaking the Authorization header.
 - DNS-rebinding protection: request Host header is validated against a whitelist, preventing malicious web pages from cross-origin reading of local endpoints.
+
+## Remote access
+
+Prefer a separate local installation for each friend. For a shared instance, set `QUOTAX_ACCESS_PASSWORD` to a long random password and sign in with username `quotax`. All pages and APIs require authentication; `/healthz` exposes only a minimal liveness response. Keep Host validation and use an HTTPS reverse proxy forwarding the original Host to `127.0.0.1:8900`. Add the domain to `QUOTAX_ALLOWED_HOSTS`. Only set `QUOTAX_HOST=0.0.0.0` when a direct LAN listener is required.
+
+On macOS/Linux these variables can live in the installation's `quotax.env` (permissions `600`); restart to apply them. On Windows set the environment before launching. This is shared administrator access, including all credentials and configuration, not isolated multi-user or read-only sharing. HTTP Basic authentication requires HTTPS for remote use.
+
+## Packaging and release checks
+
+Run `uv sync --locked`, `uv run pytest -q`, `node --test tests/frontend/refresh-controller.test.mjs tests/frontend/usage-refresh.test.mjs tests/frontend/view-utils.test.mjs`, `uv run ruff check app tests scripts`, `uv build --wheel`, and `uv run python scripts/package_release.py`.
+
+The allowlisted source ZIP and SHA-256 file exclude personal config, credentials, usage databases and unrelated working files. Extract the ZIP and run `bash install.sh` (macOS/Linux) or `powershell -ExecutionPolicy Bypass -File .\install.ps1` (Windows). Local source installation skips GitHub downloads but still needs dependencies on first install.
+
+Remote installation pins tag `v1.3.0`; explicitly set `QUOTAX_VERSION=main` for development. **The remote commands require the maintainer to publish that tag first; until then, use the local source ZIP.** CI covers macOS/Linux/Windows with Python 3.11/3.13, tests, installer syntax, wheel build and installed-package smoke checks outside the source directory. Publish only after those checks pass.
 
 ## Development
 

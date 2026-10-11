@@ -13,8 +13,20 @@
 set -euo pipefail
 
 REPO="RunhuaHuang/quotax"
-BRANCH="main"
-PERM_DIR="$HOME/QuotaX"
+# Release installs pin a tag. Set QUOTAX_VERSION=main explicitly for development.
+BRANCH="${QUOTAX_VERSION:-v1.3.0}"
+if ! [[ "$BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "Error: QUOTAX_VERSION 必须是版本标签或分支名。" >&2
+  exit 2
+fi
+PERM_DIR="${QUOTAX_HOME:-$HOME/QuotaX}"
+# Apply the same persisted access/bind settings as the normal launcher, including
+# during the first start after an upgrade.
+if [ -f "$PERM_DIR/quotax.env" ]; then
+  set -a
+  . "$PERM_DIR/quotax.env"
+  set +a
+fi
 TMP_DIR=$(mktemp -d)
 PORT="${QUOTAX_PORT:-8900}"
 HOST="${QUOTAX_HOST:-127.0.0.1}"
@@ -31,7 +43,7 @@ fi
 # 不用 [[ =~ ]]：macOS 系统自带 bash 3.2 对含 \[ 的字面量正则解析不可靠（实测
 # 全部 NOMATCH），改用 glob（case）匹配，所有 bash 版本行为一致。
 case "$HOST" in
-  [\[]*[\]) HOST_INNER="${HOST:1:${#HOST}-2}" ;;  # [::1] → ::1
+  \[*\]) HOST_INNER="${HOST:1:${#HOST}-2}" ;;  # [::1] → ::1
   *) HOST_INNER="$HOST" ;;
 esac
 case "$HOST_INNER" in
@@ -40,6 +52,16 @@ case "$HOST_INNER" in
     exit 2
     ;;
 esac
+HOST="$HOST_INNER"
+
+case "$HOST" in
+  0.0.0.0) BROWSER_HOST="127.0.0.1" ;;
+  ::) BROWSER_HOST="[::1]" ;;
+  *:*) BROWSER_HOST="[$HOST]" ;;
+  *) BROWSER_HOST="$HOST" ;;
+esac
+BASE_URL="http://$BROWSER_HOST:$PORT"
+
 
 INSTALL_SWAPPED=0
 OLD_DIR="$PERM_DIR"
@@ -114,7 +136,7 @@ echo "============================================="
 # 而非信任单一源。可用 QUOTAX_MIRROR=<url-prefix> pin 指定镜像（覆盖整张列表）。
 echo "Downloading QuotaX..."
 
-ARCHIVE_PATH="/$REPO/archive/refs/heads/$BRANCH.tar.gz"
+ARCHIVE_PATH="/$REPO/archive/$BRANCH.tar.gz"
 MIRROR_PREFIXES=(
   ""                                  # GitHub 原生（无前缀）
   "https://ghfast.top"                # ghfast 镜像代理
@@ -126,7 +148,12 @@ if [ -n "${QUOTAX_MIRROR:-}" ]; then
   MIRROR_PREFIXES=("$QUOTAX_MIRROR")
 fi
 
-SRC_DIR=""
+SRC_DIR="${QUOTAX_SOURCE_DIR:-}"
+if [ -z "$SRC_DIR" ] && [ -f "${BASH_SOURCE[0]:-}" ]; then
+  SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  if [ -f "$SCRIPT_DIR/app/main.py" ]; then SRC_DIR="$SCRIPT_DIR"; fi
+fi
+if [ -z "$SRC_DIR" ]; then
 # 首选：浅克隆（git 能用就优先走 git，体积更小、能拿到完整文件树）。
 if command -v git &>/dev/null; then
   for _prefix in "${MIRROR_PREFIXES[@]}"; do
@@ -155,12 +182,14 @@ if [ -z "$SRC_DIR" ]; then
     fi
     if curl -fsSL --connect-timeout 15 "$_url" -o "$TMP_DIR/repo.tar.gz" 2>/dev/null; then
       if tar -xzf "$TMP_DIR/repo.tar.gz" -C "$TMP_DIR" 2>/dev/null; then
-        SRC_DIR="$TMP_DIR/quotax-$BRANCH"
+        SRC_DIR=$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d -name "quotax-*" | head -1)
         break
       fi
     fi
   done
 fi
+
+fi # remote download; local source archives skip the network
 
 # 所有源都失败：给出明确报错，而不是带着空的 SRC_DIR 继续往下走。
 if [ -z "$SRC_DIR" ]; then
@@ -237,13 +266,11 @@ fi
 NEW_DIR="$PERM_DIR.new"
 rm -rf "$NEW_DIR"
 mkdir -p "$NEW_DIR"
-# 用 rsync 拷贝（如有），否则回退 cp -R；排除 .git 等版本控制目录。
-if command -v rsync &>/dev/null; then
-  rsync -a --exclude='.git' "$SRC_DIR/" "$NEW_DIR/"
-else
-  cp -R "$SRC_DIR/." "$NEW_DIR/"
-  rm -rf "$NEW_DIR/.git"
-fi
+# Explicit source allowlist: never install the developer's config, credentials or database.
+for item in app static scripts tests docs .github AGENTS.md README.md README.en.md pyproject.toml uv.lock .gitignore install.sh install.ps1 quotax quotax.cmd run.sh; do
+  if [ -e "$SRC_DIR/$item" ]; then cp -R "$SRC_DIR/$item" "$NEW_DIR/$item"; fi
+done
+find "$NEW_DIR" -type d -name __pycache__ -prune -exec rm -rf {} +
 # 校验拷贝结果可用再交换。
 if [ ! -f "$NEW_DIR/app/main.py" ]; then
   echo "Error: 拷贝源码失败（磁盘满？权限？）。" >&2
@@ -357,7 +384,7 @@ fi
 
 # --- 同步依赖（uv sync 按 uv.lock 精确安装，复用上一步确定的 Python）---
 echo "安装依赖（首次需下载 FastAPI / httpx 等，请稍候）..."
-uv sync --quiet
+uv sync --locked --no-dev --quiet
 
 # --- 启动服务 ---
 # 后台启动 uvicorn，输出重定向到日志文件；端口被占用时给出提示。
@@ -379,7 +406,7 @@ if command -v lsof &>/dev/null; then
 fi
 
 # nohup 后台启动，退出本脚本后服务继续运行。
-nohup uv run uvicorn app.main:app --host "$HOST" --port "$PORT" > "$LOG_FILE" 2>&1 &
+nohup uv run --locked --no-dev uvicorn app.main:app --host "$HOST" --port "$PORT" > "$LOG_FILE" 2>&1 &
 APP_PID=$!
 echo "$APP_PID" > "$PID_FILE"
 
@@ -394,7 +421,7 @@ for _ in $(seq 1 30); do
     tail -20 "$LOG_FILE" >&2 2>/dev/null || true
     exit 1
   fi
-  if curl -fsS "http://127.0.0.1:$PORT/api/health" -o "$TMP_DIR/health.json" 2>/dev/null \
+  if curl -fsS --max-time 2 -H "Host: localhost" "$BASE_URL/healthz" -o "$TMP_DIR/health.json" 2>/dev/null \
     && grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$TMP_DIR/health.json"; then
     echo " ✅"
     READY=1
@@ -417,14 +444,14 @@ rm -rf "$PREV_BACKUP" "$BACKUP_DIR"
 INSTALL_SWAPPED=0
 
 # macOS 用 open，Linux 试 xdg-open。
-(command -v open &>/dev/null && open "http://127.0.0.1:$PORT") \
-  || (command -v xdg-open &>/dev/null && xdg-open "http://127.0.0.1:$PORT") \
+(command -v open &>/dev/null && open "$BASE_URL") \
+  || (command -v xdg-open &>/dev/null && xdg-open "$BASE_URL") \
   || true
 
 echo ""
 echo "============================================="
 echo "✅ QuotaX 已启动"
-echo "   地址:  http://127.0.0.1:$PORT"
+echo "   地址:  $BASE_URL"
 echo "   日志:  $LOG_FILE"
 echo "   目录:  $PERM_DIR"
 echo ""

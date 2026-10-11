@@ -39,9 +39,19 @@ fi
 # 不用 [[ =~ ]]：macOS 系统自带 bash 3.2 对含 \[ 的字面量正则解析不可靠（实测
 # 全部 NOMATCH），改用 glob（case）匹配，所有 bash 版本行为一致。
 case "$HOST" in
-  [\[]*[\]) HOST_INNER="${HOST:1:${#HOST}-2}" ;;  # [::1] → ::1
+  \[*\]) HOST_INNER="${HOST:1:${#HOST}-2}" ;;  # [::1] → ::1
   *) HOST_INNER="$HOST" ;;
 esac
+HOST="$HOST_INNER"
+
+case "$HOST" in
+  0.0.0.0) BROWSER_HOST="127.0.0.1" ;;
+  ::) BROWSER_HOST="[::1]" ;;
+  *:*) BROWSER_HOST="[$HOST]" ;;
+  *) BROWSER_HOST="$HOST" ;;
+esac
+BASE_URL="http://$BROWSER_HOST:$PORT"
+
 case "$HOST_INNER" in
   ""|*[!A-Za-z0-9.:-]*)
     echo "Error: QUOTAX_HOST 只能是 IP 地址或主机名（当前值: ${HOST}）。" >&2
@@ -84,7 +94,7 @@ is_running() {
 }
 
 open_browser() {
-  URL="http://127.0.0.1:$PORT"
+  URL="$BASE_URL"
   (command -v open &>/dev/null && open "$URL") \
     || (command -v xdg-open &>/dev/null && xdg-open "$URL") \
     || true
@@ -115,15 +125,15 @@ case "${1:-start}" in
     fi
     # 后台启动 uvicorn，nohup 保证退出终端后服务继续运行。
     mkdir -p "$PERM_DIR"
-    nohup uv run uvicorn app.main:app --host "$HOST" --port "$PORT" > "$LOG_FILE" 2>&1 &
+    nohup uv run --locked --no-dev uvicorn app.main:app --host "$HOST" --port "$PORT" > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     echo -n "启动 QuotaX（端口 ${PORT}）"
     # 轮询等待就绪（最多 30 秒）
     for _ in $(seq 1 30); do
-      if is_running; then
+      if is_running && curl -fsS --max-time 2 -H "Host: localhost" "$BASE_URL/healthz" 2>/dev/null | grep -Eq '"service"[[:space:]]*:[[:space:]]*"quotax"'; then
         echo " ✅"
         open_browser
-        echo "地址: http://127.0.0.1:$PORT"
+        echo "地址: $BASE_URL"
         echo "日志: $LOG_FILE"
         exit 0
       fi
@@ -131,7 +141,7 @@ case "${1:-start}" in
       sleep 1
     done
     echo ""
-    echo "⚠️  服务仍在启动中，请稍后访问 http://127.0.0.1:$PORT"
+    echo "⚠️  服务仍在启动中，请稍后访问 $BASE_URL"
     echo "   日志: $LOG_FILE"
     ;;
 
@@ -161,7 +171,7 @@ case "${1:-start}" in
 
   status)
     if is_running; then
-      echo "✅ QuotaX 运行中 → http://127.0.0.1:$PORT"
+      echo "✅ QuotaX 运行中 → $BASE_URL"
     else
       echo "❌ QuotaX 未运行（用 quotax 启动）"
     fi

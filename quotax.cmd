@@ -60,7 +60,7 @@ set "QUOTAX_RUN_DIR=%PERM_DIR%"
 set "QUOTAX_LOG_FILE=%LOG_FILE%"
 powershell -NoProfile -Command "$path=$env:QUOTAX_LOG_FILE; if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -gt 5MB) { Move-Item -LiteralPath $path -Destination ($path + '.1') -Force }" >nul 2>&1
 start "" /B powershell -NoProfile -WindowStyle Hidden -Command ^
-  "Set-Location -LiteralPath $env:QUOTAX_RUN_DIR; & uv run uvicorn app.main:app --host 127.0.0.1 --port %PORT% *>&1 | Tee-Object -FilePath $env:QUOTAX_LOG_FILE"
+  "Set-Location -LiteralPath $env:QUOTAX_RUN_DIR; & uv run --locked --no-dev uvicorn app.main:app --host 127.0.0.1 --port %PORT% *>&1 | Tee-Object -FilePath $env:QUOTAX_LOG_FILE"
 rem 轮询等待就绪（最多 30 秒）
 for /l %%i in (1,1,30) do (
   call :is_running
