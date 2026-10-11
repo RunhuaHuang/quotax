@@ -34,7 +34,7 @@ def release_files(root: Path):
 
 
 def build(root: Path, output: Path) -> Path:
-    version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+    version = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     output.mkdir(parents=True, exist_ok=True)
     archive = output / f"quotax-{version}-source.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:

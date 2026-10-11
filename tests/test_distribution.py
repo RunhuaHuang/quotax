@@ -7,7 +7,9 @@ from scripts.package_release import build
 def test_source_package_excludes_personal_files_and_keeps_required_modules(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
-    (source / "pyproject.toml").write_text('[project]\nversion="1.3.0"\n')
+    (source / "pyproject.toml").write_text(
+        '[project]\nversion="1.3.0"\ndescription="统一查看额度"\n', encoding="utf-8"
+    )
     (source / "app").mkdir()
     (source / "app" / "main.py").write_text('app = None')
     (source / "static").mkdir()
