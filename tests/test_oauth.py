@@ -47,11 +47,20 @@ def _make_id_token(account_id: str = "acc_123", email: str = "test@example.com",
 # ── PKCE / state 生成 ─────────────────────────────────────────
 
 
-def test_generate_pkce_verifier_is_base64url_no_padding():
+@pytest.mark.parametrize(("random_bytes", "expected"), [
+    (b"\x00" * 96, "A" * 128),  # Valid output need not contain '-' or '_'.
+    (b"\xfb\xff\xff" * 32, "-___" * 32),  # '+' and '/' must be URL-safe.
+])
+def test_generate_pkce_verifier_is_base64url_no_padding(monkeypatch, random_bytes, expected):
+    def token_bytes(length):
+        assert length == 96
+        return random_bytes
+
+    monkeypatch.setattr(oauth.secrets, "token_bytes", token_bytes)
     verifier, _ = oauth.generate_pkce()
     assert len(verifier) == 128  # 96 bytes → 128 base64 chars (no padding)
     assert "=" not in verifier
-    assert "-" in verifier or "_" in verifier  # url-safe alphabet
+    assert verifier == expected
 
 
 def test_generate_pkce_challenge_is_sha256_of_verifier():
