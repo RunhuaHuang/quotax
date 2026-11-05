@@ -28,7 +28,12 @@ jobs:
           QUOTABOARD_CONFIG: ${{ runner.temp }}/quotax-tests/config.json
           QUOTABOARD_USAGE_DB: ${{ runner.temp }}/quotax-tests/usage.db
           QUOTABOARD_HISTORY_DIR: ${{ runner.temp }}/quotax-tests/history
-      - run: node --test tests/frontend/refresh-controller.test.mjs tests/frontend/usage-refresh.test.mjs tests/frontend/view-utils.test.mjs
+      - run: node --test tests/frontend/*.test.mjs
+      - if: runner.os == 'Linux' && matrix.python == '3.13'
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run test:browser
       - if: runner.os != 'Windows'
         run: bash -n install.sh quotax run.sh
       - if: runner.os == 'Windows'

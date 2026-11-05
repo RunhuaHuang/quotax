@@ -24,7 +24,7 @@
 </script>
 <!-- 自托管字体（DM Sans + JetBrains Mono，零外网依赖） -->
 <link rel="stylesheet" href="/static/fonts/fonts.css">
-<link rel="stylesheet" href="/static/styles.css?v=12">
+<link rel="stylesheet" href="/static/styles.css?v=14">
 </head>
 <body>
 
@@ -109,6 +109,16 @@
     <div id="usageView"></div>
   </section>
 </main>
+
+<aside id="versionNotice" class="version-notice hidden" role="status">
+  <span id="versionNoticeText"></span>
+  <button type="button" id="btnReloadVersion" class="btn btn-ghost btn-sm" data-i18n="runtime.reload">重新加载页面</button>
+</aside>
+<details id="runtimeDiagnostics" class="runtime-diagnostics">
+  <summary><span id="runtimeVersion">QuotaX</span><span id="runtimeStatus" data-i18n="runtime.checking">正在连接</span><span data-i18n="runtime.details">运行状态</span></summary>
+  <dl id="runtimeDetails"></dl>
+  <button type="button" id="btnRuntimeRefresh" class="btn btn-ghost btn-sm" data-i18n="runtime.check">检查状态</button>
+</details>
 
 <footer class="footer">
   <span data-i18n="footer.cliReadonly">所有订阅类渠道只读本机 CLI 凭据（不刷新、不写入），绝不打扰你的 agent 登录状态。</span>
@@ -293,7 +303,7 @@
 
 <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 
-<script type="module" src="/static/app.js?v=12"></script>
+<script type="module" src="/static/app.js?v=14"></script>
 
 </body>
 </html>

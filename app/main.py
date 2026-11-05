@@ -10,6 +10,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -43,6 +44,8 @@ _SOURCE_STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 _PACKAGED_STATIC_DIR = Path(__file__).resolve().parent.parent / "quotax_static"
 STATIC_DIR = _SOURCE_STATIC_DIR if _SOURCE_STATIC_DIR.is_dir() else _PACKAGED_STATIC_DIR
 logger = logging.getLogger(__name__)
+STARTED_AT = int(time.time() * 1000)
+INSTANCE_ID = uuid.uuid4().hex
 
 # 火山渠道在后端 /api/quotas 里被拆成 <id>_agent / <id>_coding 两张卡展示（前端
 # 拿到的 channel id 带后缀），但 config / 缓存 / 历史都按原始 id（不带后缀）存取。
@@ -82,6 +85,8 @@ def _canonical_channel_id(channel_id: str) -> str:
 # Callers choose acceptable data age; failures have a separate retry deadline.
 CHANNEL_TIMEOUT_SECONDS = 45
 MAX_QUERY_CONCURRENCY = 4
+CACHE_RETENTION_SECONDS = 30 * 60
+CACHE_SWEEP_SECONDS = 60
 _query_slots: asyncio.Semaphore | None = None
 _query_slots_loop: asyncio.AbstractEventLoop | None = None
 
@@ -96,6 +101,8 @@ def _query_semaphore() -> asyncio.Semaphore:
 
 
 _cache: dict[str, tuple[float, dict]] = {}
+# Rate-limit deadlines are control state, independent of retained query payloads.
+_rate_limits: dict[str, int] = {}
 # 在飞的查询 task，按渠道 id 登记。值是 (task, 发起时的配置代际)——复用一个仍在
 # 运行的 task 前必须比对代际：若期间发生过 import_config / 编辑渠道（_generation
 # 已 bump），旧代际的 task 是用旧配置/旧密钥发起的，它的结果对当前配置已过期，
@@ -133,7 +140,7 @@ _bg_tasks: set[asyncio.Task] = set()
 try:
     APP_VERSION = version("quota-board")
 except PackageNotFoundError:
-    APP_VERSION = "1.3.0"
+    APP_VERSION = "1.3.2"
 
 
 def _spawn_background(coro) -> asyncio.Task:
@@ -165,6 +172,30 @@ async def _collect_usage_shared() -> dict:
     if _usage_collection_task is None or _usage_collection_task.done():
         _usage_collection_task = _spawn_background(asyncio.to_thread(usage_collect.collect_all))
     return await asyncio.shield(_usage_collection_task)
+
+
+def _purge_query_cache(now: float) -> None:
+    """Called under _cache_lock. Retries must not extend the life of old numbers."""
+    cutoff = now - CACHE_RETENTION_SECONDS * 1000
+    for channel_id, (cached_at, payload) in list(_cache.items()):
+        data_at = payload.get("updated_at", cached_at) if payload.get("status") in {"ok", "stale"} else cached_at
+        if min(cached_at, data_at) <= cutoff or cached_at > now:
+            _cache.pop(channel_id, None)
+    for channel_id, deadline in list(_rate_limits.items()):
+        if deadline <= now:
+            _rate_limits.pop(channel_id, None)
+    for channel_id, (task, _) in list(_inflight.items()):
+        if task.done():
+            _inflight.pop(channel_id, None)
+
+
+async def _cache_maintenance_loop() -> None:
+    while True:
+        async with _cache_lock:
+            _purge_query_cache(time.time() * 1000)
+        with _OAUTH_RESULT_LOCK:
+            _purge_oauth_results()
+        await asyncio.sleep(CACHE_SWEEP_SECONDS)
 
 
 @asynccontextmanager
@@ -210,6 +241,7 @@ async def lifespan(_app: FastAPI):
 
     _spawn_background(_collect_usage_on_startup())
     _spawn_background(_usage_maintenance_loop())
+    _spawn_background(_cache_maintenance_loop())
     await monitor_service.start()
     try:
         yield
@@ -324,12 +356,29 @@ async def _enforce_host_whitelist(request: Request, call_next):
     response = await call_next(request)
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
+    elif request.url.path == "/" or request.url.path.startswith("/static/"):
+        # Revalidate cached assets after local upgrades; ETags still avoid body transfers.
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "service": "quotax"}
+
+
+@app.get("/api/runtime")
+def runtime_status():
+    """Cheap status for long-lived browser tabs; never returns credentials."""
+    return {
+        "version": APP_VERSION,
+        "instance_id": INSTANCE_ID,
+        "started_at": STARTED_AT,
+        "installation": str(Path(__file__).resolve().parent.parent),
+        "data_directory": str(config_store.CONFIG_PATH.parent),
+        "collection": usage_collect.get_status(),
+        "cache": {"retention_seconds": CACHE_RETENTION_SECONDS, "sweep_seconds": CACHE_SWEEP_SECONDS},
+    }
 
 
 def _format_validation_error(exc: RequestValidationError) -> str:
@@ -1146,6 +1195,7 @@ async def _invalidate_cache(channel_id: str) -> None:
     async with _cache_lock:
         _generation += 1
         _cache.pop(channel_id, None)
+        _rate_limits.pop(channel_id, None)
         # 编辑渠道（如换密钥）后应真正重新查询，而不是复用一个还在 _inflight 里、
         # 早已完成的旧 task 的旧结果。只摘除已完成的：仍在运行的 task 不能动（否则
         # 会孤立正在后台跑的查询、让等待它的调用者拿不到结果）。
@@ -1219,6 +1269,7 @@ async def _query_and_cache(channel: config_store.Channel, gen: int) -> dict:
     now = int(time.time() * 1000)
     async with _cache_lock:
         if gen == _generation:
+            _purge_query_cache(now)
             previous = _cache.get(channel.id, (0, {}))[1]
             failures = 0 if payload["status"] == "ok" else previous.get("refresh", {}).get("failures", 0) + 1
             refresh = {
@@ -1236,6 +1287,8 @@ async def _query_and_cache(channel: config_store.Channel, gen: int) -> dict:
                            "error_status": payload["status"]}
             payload = {**payload, "refresh": refresh}
             _cache[channel.id] = (now, payload)
+            if refresh["upstream_status"] == 429:
+                _rate_limits[channel.id] = refresh["next_retry_at"]
             # Deleted/reconfigured channels must not regain obsolete history entries.
             if payload["status"] == "ok":
                 _spawn_background(asyncio.to_thread(history_store.record_result, channel.id, payload))
@@ -1253,6 +1306,7 @@ async def _get_channel_result(
     """
     now = time.time() * 1000
     async with _cache_lock:
+        _purge_query_cache(now)
         cached = _cache.get(channel.id)
         if cached is not None:
             cached_at, cached_result = cached
@@ -1264,6 +1318,12 @@ async def _get_channel_result(
                     return cached_result, True
             elif not force and cached_result.get("status") == "ok" and now - cached_at < max_age_seconds * 1000:
                 return cached_result, True
+        if channel.id in _rate_limits:
+            payload = fail("error", "上游请求限流，请等待重试时间后再刷新", id=channel.id,
+                           type=channel.type, name=channel.name, category=channel_category(channel.type)).to_dict()
+            payload["refresh"] = {"upstream_status": 429, "next_retry_at": _rate_limits[channel.id],
+                                  "last_success_at": None}
+            return payload, True
         # 复用 _inflight 里的 task 前，必须先检查它是否已经 done。
         # 否则会发生一个微妙的脏数据路径：某次请求的 awaiter 在 task 跑完前被取消
         # （客户端断连），finally 里观察到 task.done()=False 不摘除它；task 之后在
@@ -1287,6 +1347,12 @@ async def _get_channel_result(
             _query_tasks.add(task)
             task.add_done_callback(_query_tasks.discard)
             _inflight[channel.id] = (task, _generation)
+            # Release completed results even if every shielded caller disconnected.
+            def forget_completed(done, channel_id=channel.id):
+                current = _inflight.get(channel_id)
+                if current is not None and current[0] is done:
+                    _inflight.pop(channel_id, None)
+            task.add_done_callback(forget_completed)
         else:
             task = entry[0]
 
@@ -1339,6 +1405,7 @@ async def quotas(
     """
     if not isinstance(max_age_seconds, int):
         max_age_seconds = 300
+    max_age_seconds = min(max_age_seconds, CACHE_RETENTION_SECONDS)
     channels = await asyncio.to_thread(config_store.list_channels)
     if ids:
         # 归一化 _agent/_coding 后缀：火山渠道在 /api/quotas 返回层被拆成两张卡
@@ -1425,32 +1492,15 @@ monitor_service = monitoring.MonitorService(_monitor_query_results)
 # ── 本地已用统计 ─────────────────────────────────────────────
 
 
-_local_usage_tasks: dict[tuple[str, int], asyncio.Task] = {}
-_local_usage_cache: dict[tuple[str, int], tuple[float, dict]] = {}
-
-
 @app.get("/api/local-usage")
 async def local_usage_endpoint(days: int = 14):
-    """多数据源本地已用统计（目前含 Claude Code transcript + OpenCode），供
-    Claude 订阅没有可用 access token 时的兜底展示，也可单独查看。"""
+    """Read incremental SQLite aggregates; refreshing never rescans all transcripts."""
     days = min(max(days, 1), 90)
-    key = (str(config_store.CONFIG_PATH), days)
-    cached = _local_usage_cache.get(key)
-    if cached and time.monotonic() - cached[0] < 30:
-        return cached[1]
-    task = _local_usage_tasks.get(key)
-    if task is None or task.done():
-        async def collect():
-            result = await asyncio.to_thread(local_usage.get_local_usage, days)
-            _local_usage_cache[key] = (time.monotonic(), result)
-            return result
-        task = _spawn_background(collect())
-        _local_usage_tasks[key] = task
-    try:
-        return await asyncio.shield(task)
-    finally:
-        if task.done() and _local_usage_tasks.get(key) is task:
-            _local_usage_tasks.pop(key, None)
+    data = await asyncio.to_thread(usage_store.query_local_usage, days)
+    status = usage_collect.get_status()
+    data["collected_at"] = status["last_finished_at"]
+    data["collecting"] = status["running"]
+    return data
 
 
 @app.get("/api/opencode-usage")
@@ -1462,7 +1512,7 @@ async def opencode_usage(days: int = 14):
 
 # ── 用量统计（深度分析看板）─────────────────────────────────────
 #
-# 与 /api/local-usage（实时全量聚合、不落库）不同，这一组接口走 SQLite 持久化：
+# 与 /api/local-usage 共用 SQLite 持久化记录：
 # 采集（解析本机 CLI 日志）→ 落库 → 聚合查询（趋势 / 模型分布 / 请求日志）。
 # 数据源：Claude Code / Codex / Gemini CLI / Grok CLI / OpenCode 本地日志，只读。
 # 成本由 PricingTable 估算（LiteLLM 单价表），不是上游真实账单——仅作参考。
@@ -1674,6 +1724,7 @@ async def import_config(payload: dict, mode: Literal["merge", "replace"] = "merg
     async with _cache_lock:
         _generation += 1
         _cache.clear()
+        _rate_limits.clear()
         for cid in [cid for cid, (t, _g) in _inflight.items() if t.done()]:
             _inflight.pop(cid, None)
     monitor_service.reconfigure()

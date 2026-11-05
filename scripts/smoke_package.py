@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix="quotax-smoke-") as tmp:
     client = TestClient(app)  # No lifespan: do not discover accounts or scan the host.
     assert client.get("/healthz").json()["service"] == "quotax"
     assert client.get("/").status_code == 200
-    for asset in ("app.js", "usage.js", "refresh-controller.js", "i18n.js", "styles.css"):
+    for asset in ("app.js", "usage.js", "refresh-controller.js", "api-client.js", "snapshot-cache.js", "i18n.js", "styles.css"):
         assert client.get(f"/static/{asset}").status_code == 200, asset
     assert client.get("/api/quotas").json()["channels"] == []
     print("Installed wheel: endpoints and static modules OK")

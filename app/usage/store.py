@@ -682,6 +682,55 @@ def query_overview(days: int = 14, source: str | None = None, model: str | None 
     }
 
 
+def query_local_usage(days: int = 14) -> dict:
+    """Serve the quota page from the same incremental records as the usage view.
+
+    The window uses UTC calendar days, matching the other usage queries. Session
+    totals are counted across models, not summed from per-model counts (one
+    session can use several models). No transcript or upstream database is read.
+    """
+    conn = get_conn()
+    since = _calendar_window_start_ms(days)
+    sources = (("claude_code", "Claude Code 本地已用统计"), ("opencode", "OpenCode 本地已用统计"))
+    columns = """COUNT(*) AS messages, COUNT(DISTINCT session_id) AS sessions,
+        COALESCE(SUM(input_tokens),0) AS input,
+        COALESCE(SUM(output_tokens),0) AS output,
+        COALESCE(SUM(cache_read),0) AS cache_read,
+        COALESCE(SUM(cache_creation),0) AS cache_write,
+        COALESCE(SUM(CAST(total_cost_usd AS REAL)),0) AS cost,
+        COALESCE(MAX(has_cost),0) AS has_cost"""
+    with _lock:
+        totals = {row["source"]: dict(row) for row in conn.execute(
+            f"SELECT source, {columns} FROM usage_records WHERE timestamp_ms >= ? "
+            "AND source IN ('claude_code', 'opencode') GROUP BY source", (since,)
+        )}
+        models = [dict(row) for row in conn.execute(
+            f"SELECT source, model, {columns} FROM usage_records WHERE timestamp_ms >= ? "
+            "AND source IN ('claude_code', 'opencode') GROUP BY source, model "
+            "ORDER BY SUM(input_tokens+output_tokens+cache_read+cache_creation) DESC", (since,)
+        )]
+        known = {row[0] for row in conn.execute(
+            "SELECT DISTINCT source FROM scan_progress UNION SELECT DISTINCT source FROM usage_records"
+        )}
+    empty = {"messages": 0, "sessions": 0, "input": 0, "output": 0, "cache_read": 0,
+             "cache_write": 0, "cost": 0.0, "has_cost": False}
+    result = []
+    for source, label in sources:
+        source_totals = totals.get(source, empty.copy())
+        source_totals.pop("source", None)
+        source_totals["has_cost"] = bool(source_totals["has_cost"])
+        source_models = []
+        for row in models:
+            if row["source"] == source:
+                row = dict(row)
+                row.pop("source")
+                row["has_cost"] = bool(row["has_cost"])
+                source_models.append(row)
+        result.append({"key": source, "label": label, "available": source in known,
+                       "path": None, "model_stats": source_models, "totals": source_totals})
+    return {"days": days, "sources": result, "source": "database", "timezone": "UTC"}
+
+
 def query_trend(days: int = 14, source: str | None = None, model: str | None = None) -> list[dict]:
     """按天趋势：每天的四桶 token + 成本。用于趋势曲线。
 

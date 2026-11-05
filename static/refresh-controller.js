@@ -56,13 +56,20 @@ export function createQuotaRefresher({ fetchChannel, onResult, concurrency = 4 }
 }
 
 // Completion-based polling: changing tabs/options cannot overlap a slow round.
-export function createPoller({ run, delay, enabled, setTimer = setTimeout, clearTimer = clearTimeout }) {
+export function createPoller({ run, delay, enabled, setTimer = setTimeout, clearTimer = clearTimeout,
+  now = () => Date.now() }) {
   let timer = null;
   let pending = null;
-  function stop() { clearTimer(timer); timer = null; }
+  let recovery = null;
+  let nextAt = null;
+  function stop() { clearTimer(timer); timer = null; nextAt = null; }
   function schedule() {
     stop();
-    if (!pending && enabled()) timer = setTimer(tick, delay());
+    if (!pending && enabled()) {
+      const wait = Math.max(1000, delay());
+      nextAt = now() + wait;
+      timer = setTimer(tick, wait);
+    }
   }
   function tick() {
     stop();
@@ -74,5 +81,65 @@ export function createPoller({ run, delay, enabled, setTimer = setTimeout, clear
     });
     return pending;
   }
-  return { schedule, stop, tick };
+  function resume({ restart = false } = {}) {
+    if (recovery) return recovery;
+    if (!restart || !pending) return tick();
+    // Expired requests settle first, releasing per-channel and view locks.
+    recovery = pending.then(tick).finally(() => { recovery = null; });
+    return recovery;
+  }
+  return { schedule, stop, tick, resume, nextAt: () => nextAt };
+}
+
+// Attach before starting any network work. Repeated wake events share one round;
+// a suspended timer cannot make an old in-flight request block the page forever.
+export function bindRefreshLifecycle({ poller, recover, update = () => {},
+  page = document, host = window, online = () => navigator.onLine !== false,
+  now = () => Date.now(), setHeartbeat = setInterval, clearHeartbeat = clearInterval,
+  afterTurn = (fn) => setTimeout(fn, 0) }) {
+  let lastWake = -Infinity;
+  let lastBeat = now();
+  let disposed = false;
+  const listeners = [];
+  function listen(target, event, fn) {
+    target.addEventListener(event, fn);
+    listeners.push(() => target.removeEventListener(event, fn));
+  }
+  function wake() {
+    update();
+    const expired = recover();
+    if (page.hidden || !online()) { poller.stop(); return; }
+    const time = now();
+    if (!expired && time - lastWake < 1000) return;
+    lastWake = time;
+    resume(expired);
+  }
+  function resume(expired) {
+    // Manual refreshes and startup can also own shared promises outside poller.
+    // Let their rejection/finally chains release locks before starting again.
+    if (expired) afterTurn(() => { if (!disposed) poller.resume({ restart: true }); });
+    else poller.resume();
+  }
+  listen(page, "visibilitychange", () => page.hidden ? poller.stop() : wake());
+  listen(page, "freeze", () => poller.stop());
+  listen(page, "resume", wake);
+  listen(host, "pagehide", () => poller.stop());
+  listen(host, "pageshow", (event) => { if (event.persisted) wake(); });
+  listen(host, "focus", wake);
+  listen(host, "online", wake);
+  listen(host, "offline", () => { lastWake = -Infinity; poller.stop(); update(); });
+  const heartbeat = setHeartbeat(() => {
+    const time = now();
+    const slept = time - lastBeat > 30_000;
+    lastBeat = time;
+    if (!page.hidden) {
+      update();
+      if (slept) wake();
+      else {
+        const expired = recover();
+        if (expired) resume(expired);
+      }
+    }
+  }, 15_000);
+  return () => { disposed = true; clearHeartbeat(heartbeat); listeners.forEach((remove) => remove()); };
 }

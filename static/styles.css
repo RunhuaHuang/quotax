@@ -1026,6 +1026,24 @@ select option { background: var(--popover); color: var(--foreground); }
 .setting-control { display: flex; gap: 8px; flex-wrap: wrap; }
 /* 刷新频率选项较多，缩小内边距以在一行内容纳 */
 /* 刷新频率选项较多（10 个），用 grid 5 列排成整齐的两行，避免末尾孤儿按钮 */
+.runtime-diagnostics, .version-notice {
+  max-width: 1140px;
+  margin: 20px auto;
+  padding: 12px 20px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+.runtime-diagnostics summary { display: flex; flex-wrap: wrap; gap: 12px; cursor: pointer; }
+.runtime-diagnostics summary::before { content: "▸"; }
+.runtime-diagnostics[open] summary::before { content: "▾"; }
+.runtime-diagnostics dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px 20px; }
+.runtime-diagnostics dt { font-weight: 600; }
+.runtime-diagnostics dd { margin: 0; overflow-wrap: anywhere; }
+#runtimeStatus[data-state="offline"], #runtimeStatus[data-state="unreachable"] { color: #d97706; }
+.version-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border: 1px solid #d97706; border-radius: 10px; }
+.version-notice.hidden { display: none; }
+.local-collection-note { color: var(--muted-foreground); font-size: 12px; margin: 0 0 12px; }
+
 #refreshOptions {
   display: grid;
   grid-template-columns: repeat(5, 1fr);

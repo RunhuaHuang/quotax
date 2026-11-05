@@ -354,6 +354,40 @@ def test_local_usage_endpoint_returns_two_sources(client, tmp_path, monkeypatch)
     assert {s["key"] for s in body["sources"]} == {"claude_code", "opencode"}
 
 
+def test_local_usage_refresh_does_not_rescan_transcripts(client, monkeypatch):
+    def forbidden(*args):
+        raise AssertionError("Page refresh must only query the incremental database")
+
+    monkeypatch.setattr(app_main.local_usage, "get_local_usage", forbidden)
+    monkeypatch.setattr(app_main.usage_collect, "collect_all", forbidden)
+    body = client.get("/api/local-usage?days=14").json()
+    assert body["source"] == "database"
+    assert body["timezone"] == "UTC"
+    assert "collected_at" in body
+
+
+def test_runtime_exposes_installation_and_collection_without_credentials(client):
+    response = client.get("/api/runtime")
+    body = response.json()
+    assert response.headers["cache-control"] == "no-store"
+    assert body["version"] == app_main.APP_VERSION
+    assert body["instance_id"]
+    assert body["installation"]
+    assert body["data_directory"] == str(config_store.CONFIG_PATH.parent)
+    assert body["cache"] == {"retention_seconds": 1800, "sweep_seconds": 60}
+    assert set(body) == {"version", "instance_id", "started_at", "installation", "data_directory", "collection", "cache"}
+
+
+def test_upgraded_static_assets_are_revalidated(client):
+    assert client.get("/").headers["cache-control"] == "no-cache"
+    script = client.get("/static/api-client.js")
+    assert script.status_code == 200
+    assert script.headers["cache-control"] == "no-cache"
+    unchanged = client.get("/static/api-client.js", headers={"If-None-Match": script.headers["etag"]})
+    assert unchanged.status_code == 304
+    assert unchanged.headers["cache-control"] == "no-cache"
+
+
 def test_config_corrupted_returns_500_with_detail_not_bare_crash(client):
     config_store.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     config_store.CONFIG_PATH.write_text("{ broken", encoding="utf-8")

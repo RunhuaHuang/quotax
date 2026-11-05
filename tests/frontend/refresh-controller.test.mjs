@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createQuotaRefresher, createPoller } from '../../static/refresh-controller.js';
+import { createQuotaRefresher, createPoller, bindRefreshLifecycle } from '../../static/refresh-controller.js';
 
 function deferred() {
   let resolve, reject;
@@ -98,4 +98,51 @@ test('obsolete network failures cannot overwrite a newer successful card', async
   calls[0].reject(new TypeError('late body decoding failure')); await old;
   assert.equal(errors,0);
   assert.equal(displayed.get('a'),20);
+});
+
+test('wake recovery waits for the expired round then starts exactly one new round', async () => {
+  let first = deferred(), second = deferred(), count = 0;
+  const poller = createPoller({ run: () => ++count === 1 ? first.promise : second.promise,
+    delay: () => 30_000, enabled: () => true, setTimer: () => 1, clearTimer() {} });
+  poller.tick(); await turn();
+  const recovery = poller.resume({ restart: true });
+  assert.strictEqual(poller.resume({ restart: true }), recovery);
+  first.reject(new Error('expired after sleep')); await turn();
+  assert.equal(count, 2);
+  second.resolve(); await recovery;
+  poller.stop();
+});
+
+test('lifecycle covers frozen pages, bfcache, focus, quick reconnect and missed heartbeat', () => {
+  const page = new EventTarget(), host = new EventTarget();
+  page.hidden = false;
+  let clock = 1000, connected = true, expires = 0, heartbeat, stopped = 0;
+  const rounds = [];
+  const cleanup = bindRefreshLifecycle({ page, host, now: () => clock, online: () => connected,
+    recover: () => { const value = expires; expires = 0; return value; },
+    poller: { stop: () => stopped++, resume: (options = {}) => rounds.push(options) },
+    afterTurn: fn => fn(),
+    setHeartbeat: fn => { heartbeat = fn; return 1; }, clearHeartbeat() {},
+  });
+  page.dispatchEvent(new Event('resume'));
+  host.dispatchEvent(new Event('focus'));
+  host.dispatchEvent(Object.assign(new Event('pageshow'), { persisted: true }));
+  assert.equal(rounds.length, 1); // A single thaw can emit all three events.
+  connected = false; host.dispatchEvent(new Event('offline'));
+  connected = true; host.dispatchEvent(new Event('online'));
+  assert.equal(rounds.length, 2); // Even if offline lasted less than one second.
+  page.hidden = true; page.dispatchEvent(new Event('visibilitychange'));
+  page.dispatchEvent(new Event('freeze'));
+  clock += 120_000; expires = 1; page.hidden = false;
+  page.dispatchEvent(new Event('resume'));
+  assert.equal(rounds.at(-1).restart, true);
+  clock += 120_000; expires = 1; heartbeat(); // Sleep without a visibility event.
+  assert.equal(rounds.at(-1).restart, true);
+  clock += 15_000; expires = 1; heartbeat(); // A timed-out request without sleep.
+  assert.equal(rounds.at(-1).restart, true);
+  assert.equal(stopped, 3);
+  cleanup();
+  const before = rounds.length;
+  host.dispatchEvent(new Event('online'));
+  assert.equal(rounds.length, before);
 });

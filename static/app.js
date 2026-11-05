@@ -2,11 +2,15 @@
 
 // 不依赖 DOM/localStorage 的纯函数抽到 view-utils.js（可被 node:test 直接
 // import 测试），这里只 import 使用，避免同一份逻辑两处维护。
-import { normalizeThreeWindows, canonicalChannelId, channelBreachesThreshold, noPercentData, fmtReset } from "./view-utils.js?v=9";
-import { t, thas, toggleLang, getLang } from "./i18n.js?v=12";
+import { normalizeThreeWindows, canonicalChannelId, channelBreachesThreshold, noPercentData, fmtReset } from "./view-utils.js?v=14";
+import { t, thas, toggleLang, getLang } from "./i18n.js?v=14";
 
-import { createQuotaRefresher, createPoller } from "./refresh-controller.js?v=12";
-import { refreshUsageView } from "./usage.js?v=12";
+import { createQuotaRefresher, createPoller, bindRefreshLifecycle } from "./refresh-controller.js?v=14";
+import { refreshUsageView } from "./usage.js?v=14";
+import { apiJSON, expireRequests } from "./api-client.js?v=14";
+import { isFresh, readSnapshot, writeSnapshot } from "./snapshot-cache.js?v=14";
+
+const FRONTEND_VERSION = "1.3.2";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -108,6 +112,13 @@ let quotaRounds = 0;
 let quotaTransportFailures = 0;
 let lastCheckedAt = null;
 let localUsageRequest = null;
+let bootstrapRequest = null;
+let providersLoaded = false;
+let settingsLoaded = false;
+let runtimeRequest = null;
+let runtimeInfo = null;
+let runtimeCheckedAt = 0;
+let runtimeError = null;
 let dashboardLoadedOnce = false;
 let monitorStatus = null;
 let monitorStatusRequestRevision = 0;
@@ -188,27 +199,22 @@ async function init() {
   // 首次打开才显示骨架屏。
   const restored = restoreSnapshot();
   if (!restored) renderSkeletonState();
-  try {
-    await loadProviders();
-  } catch (e) {
-    console.error(e);
-    renderFatalError(t("empty.initFailedTitle") + `: ${t("empty.quotaLoadFailedDesc")} (${e.message})`);
-    return;
-  }
-  await loadSettings();
-  // 快照恢复时 providersCatalog 可能还没就绪（类型标签用 fallback），这里重绘修正
-  if (dashboardLoadedOnce) renderDashboard();
-  await loadChannels();
-  await Promise.all([refreshQuotas(false), loadLocalUsage()]);
-  setupAutoRefresh();
-  updateAutoRefreshLabel();
+  // Recovery listeners must exist even if the first request fails or stalls.
   setupVisibilityAutoRefresh();
   setupThemeReactivity();
   setupLangReactivity();
+  await refreshCurrentView(false);
+  setupAutoRefresh();
+  updateAutoRefreshLabel();
 }
 
 function bindEvents() {
   $("#btnRefresh").addEventListener("click", () => refreshCurrentView(true));
+  $("#btnRuntimeRefresh").addEventListener("click", () => loadRuntimeStatus(true));
+  $("#btnReloadVersion").addEventListener("click", () => location.reload());
+  $("#runtimeDiagnostics").addEventListener("toggle", () => {
+    if ($("#runtimeDiagnostics").open) loadRuntimeStatus(true);
+  });
   $("#btnConfig").addEventListener("click", openConfigModal);
   $("#btnCloseModal").addEventListener("click", closeConfigModal);
   $("#configModal").addEventListener("click", (e) => {
@@ -291,7 +297,7 @@ function bindEvents() {
     if (!btn) return;
     const action = btn.dataset.action;
     if (action === "open-config") openConfigModal();
-    else if (action === "retry-init") location.reload();
+    else if (action === "retry-init") refreshCurrentView(true);
     else if (action === "retry-refresh") refreshCurrentView(true);
     else if (action === "refresh-one") onRefreshOneCard(btn);
     else if (action === "edit-card") onEditCard(btn.dataset.id);
@@ -366,17 +372,28 @@ function switchView(view) {
   panes.forEach((p) => p.classList.toggle("active", p.id === `view-${view}`));
   // 通知用量统计模块：切到它的视图了（它自己决定是否要首次加载）
   document.dispatchEvent(new CustomEvent("quotax:view-change", { detail: { view } }));
+  if (view === "quota") refreshCurrentView(false);
 }
 window.switchView = switchView;
 
 /* ── 数据加载 ───────────────────────────────────────────── */
 
 async function loadProviders() {
-  const res = await fetch("/api/providers");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
+  const data = await apiJSON("/api/providers");
   providersCatalog = data.providers || {};
   categories = data.categories || {};
+  providersLoaded = true;
+  if (dashboardLoadedOnce) renderDashboard();
+}
+
+function ensureBootstrap() {
+  if (!bootstrapRequest) {
+    bootstrapRequest = Promise.all([
+      providersLoaded ? null : loadProviders(),
+      settingsLoaded ? null : loadSettings(),
+    ]).finally(() => { bootstrapRequest = null; });
+  }
+  return bootstrapRequest;
 }
 
 function normalizeBackendSettings(data) {
@@ -403,17 +420,12 @@ async function saveMonitorPatch(patch) {
   const requestPatch = JSON.parse(JSON.stringify(patch));
   const revision = ++settingsSaveRevision;
   const operation = settingsSaveChain.catch(() => {}).then(async () => {
-    const res = await fetch("/api/settings", {
+    const data = await apiJSON("/api/settings", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ monitor: requestPatch }),
     });
-    if (!res.ok) {
-      let detail = `HTTP ${res.status}`;
-      try { detail = (await res.json()).detail || detail; } catch {}
-      throw new Error(detail);
-    }
-    const normalized = normalizeBackendSettings(await res.json());
+    const normalized = normalizeBackendSettings(data);
     // 多次保存严格串行；旧响应不能覆盖用户在等待期间刚输入的较新本地状态。
     if (revision === settingsSaveRevision) appSettings = normalized;
     clearLegacyThresholds();
@@ -426,9 +438,7 @@ async function saveMonitorPatch(patch) {
 async function loadSettings() {
   const legacyThresholds = loadPrefs().thresholds || {};
   try {
-    const res = await fetch("/api/settings", { cache: "no-store" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    appSettings = normalizeBackendSettings(await res.json());
+    appSettings = normalizeBackendSettings(await apiJSON("/api/settings"));
     // 一次性迁移旧版本只存在 localStorage 的阈值。后端已有阈值时以后端为准，
     // 避免多设备/多浏览器之间互相覆盖。
     if (!Object.keys(appSettings.monitor.thresholds).length && Object.keys(legacyThresholds).length) {
@@ -436,6 +446,7 @@ async function loadSettings() {
     } else {
       clearLegacyThresholds();
     }
+    settingsLoaded = true;
   } catch (e) {
     console.warn("后台设置加载失败，暂用浏览器本地阈值", e);
     appSettings = normalizeBackendSettings({ monitor: { thresholds: legacyThresholds } });
@@ -445,10 +456,8 @@ async function loadSettings() {
 async function loadChannels() {
   const revision = ++channelLoadRevision;
   try {
-    const res = await fetch("/api/channels", { cache: "no-store", signal: AbortSignal.timeout(15_000) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const fresh = await apiJSON("/api/channels");
     const previous = new Map(channels.map((c) => [c.id, JSON.stringify(c)]));
-    const fresh = await res.json();
     if (revision !== channelLoadRevision) return;
     const changed = JSON.stringify(channels) !== JSON.stringify(fresh);
     channelsLoaded = true;
@@ -523,6 +532,15 @@ const refreshPoller = createPoller({
 });
 
 async function refreshCurrentView(force = false) {
+  expireRequests();
+  loadRuntimeStatus(force);
+  try { await ensureBootstrap(); }
+  catch (e) {
+    quotaTransportFailures += 1;
+    if (!dashboardLoadedOnce) renderFatalError(e.message);
+    else toast(t("toast.refreshFailed", { ctx: t("toast.refreshCtxKept"), msg: e.message }), "err");
+    return;
+  }
   if (activeView === "usage") {
     const btn = $("#btnRefresh");
     btn.classList.add("spinning");
@@ -532,7 +550,9 @@ async function refreshCurrentView(force = false) {
     return;
   }
   await loadChannels();
-  await Promise.all([refreshQuotas(force), loadLocalUsage()]);
+  // Local aggregates have their own progress and must not hold up quota polling.
+  loadLocalUsage();
+  await refreshQuotas(force);
 }
 
 async function refreshQuotas(force = false, ids = null) {
@@ -585,6 +605,16 @@ async function refreshQuotas(force = false, ids = null) {
 }
 
 function updateFreshnessLabels() {
+  // Expire snapshots and visible cached numbers even when automatic refresh is off.
+  try { readSnapshot(sessionStorage); } catch {}
+  let expired = false;
+  quotas = quotas.map((q) => {
+    if (!["ok", "stale"].includes(q.status) || isFresh(q.updated_at)) return q;
+    expired = true;
+    return { id: q.id, type: q.type, name: q.name, category: q.category,
+      status: "error", message: t("card.cacheExpired"), windows: [], updated_at: null };
+  });
+  if (expired) renderDashboard();
   for (const q of quotas) {
     const label = document.querySelector(`.card[data-id="${CSS.escape(q.id)}"] .time`);
     if (label) label.textContent = freshnessText(q);
@@ -593,18 +623,7 @@ function updateFreshnessLabels() {
 }
 
 async function fetchQuotas(url, signal) {
-  const timeout = AbortSignal.timeout(60_000);
-  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-  const res = await fetch(url, { signal: combined, cache: "no-store" });
-  if (!res.ok) {
-    let detail = `HTTP ${res.status}`;
-    try {
-      const err = await res.json();
-      if (err && err.detail) detail = err.detail;
-    } catch { /* 响应体不是 JSON，用状态码兜底 */ }
-    throw new Error(detail);
-  }
-  const data = await res.json();
+  const data = await apiJSON(url, { signal, timeout: 60_000 });
   data.channels = Array.isArray(data.channels) ? data.channels : [];
   return data;
 }
@@ -616,9 +635,7 @@ function loadLocalUsage() {
 
 async function fetchLocalUsage() {
   try {
-    const res = await fetch(`/api/local-usage?days=${LOCAL_USAGE_DAYS}`, { signal: AbortSignal.timeout(60_000), cache: "no-store" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    localUsage = await res.json();
+    localUsage = await apiJSON(`/api/local-usage?days=${LOCAL_USAGE_DAYS}`);
     renderLocalUsage();
     saveSnapshot({ localUsage });
   } catch (e) {
@@ -656,15 +673,61 @@ function updateAutoRefreshLabel() {
 
 /* 页面隐藏时暂停轮询，重新可见时立即刷新一次并恢复定时 */
 function setupVisibilityAutoRefresh() {
-  document.addEventListener("visibilitychange", () => {
-    updateFreshnessLabels();
-    if (document.hidden) refreshPoller.stop();
-    else refreshPoller.tick();
+  bindRefreshLifecycle({
+    poller: refreshPoller,
+    recover: expireRequests,
+    update: () => {
+      updateFreshnessLabels();
+      renderRuntimeStatus();
+      if ($("#runtimeDiagnostics").open) loadRuntimeStatus();
+    },
   });
-  window.addEventListener("online", () => refreshPoller.tick());
-  window.addEventListener("offline", () => refreshPoller.stop());
-  // Relative ages keep advancing even when automatic network refresh is disabled.
-  setInterval(() => { if (!document.hidden) updateFreshnessLabels(); }, 15_000);
+}
+
+function loadRuntimeStatus(force = false) {
+  if (runtimeRequest) return runtimeRequest;
+  if (!force && Date.now() - runtimeCheckedAt < 30_000) return Promise.resolve();
+  runtimeRequest = apiJSON("/api/runtime", { timeout: 10_000 }).then((info) => {
+    if (runtimeInfo && runtimeInfo.instance_id !== info.instance_id) {
+      providersLoaded = false;
+      settingsLoaded = false;
+    }
+    runtimeInfo = info;
+    runtimeError = null;
+  }).catch((error) => { runtimeError = error.message; }).finally(() => {
+    runtimeCheckedAt = Date.now();
+    runtimeRequest = null;
+    renderRuntimeStatus();
+  });
+  return runtimeRequest;
+}
+
+function renderRuntimeStatus() {
+  const status = $("#runtimeStatus");
+  if (!status) return;
+  const offline = navigator.onLine === false;
+  const state = offline ? "offline" : runtimeError ? "unreachable" : runtimeInfo ? "connected" : "checking";
+  $("#runtimeVersion").textContent = `QuotaX ${runtimeInfo?.version || FRONTEND_VERSION}`;
+  status.textContent = t(`runtime.${state}`);
+  status.dataset.state = state;
+  const changed = runtimeInfo && runtimeInfo.version !== FRONTEND_VERSION;
+  $("#versionNotice").classList.toggle("hidden", !changed);
+  $("#versionNoticeText").textContent = changed ? t("runtime.newVersion", { version: runtimeInfo.version }) : "";
+  if (!$("#runtimeDiagnostics").open) return;
+  const absoluteTime = (value) => value ? new Date(value).toLocaleString(getLang()) : t("runtime.never");
+  const collection = runtimeInfo?.collection || {};
+  const sourceErrors = (collection.last_result?.sources || []).reduce((sum, source) => sum + (source.errors?.length || 0), 0);
+  const rows = [
+    [t("runtime.installation"), runtimeInfo?.installation || "—"],
+    [t("runtime.dataDirectory"), runtimeInfo?.data_directory || "—"],
+    [t("runtime.started"), absoluteTime(runtimeInfo?.started_at)],
+    [t("runtime.checked"), absoluteTime(lastCheckedAt)],
+    [t("runtime.nextRefresh"), refreshPoller.nextAt() ? absoluteTime(refreshPoller.nextAt()) : t("runtime.pausedOrBusy")],
+    [t("runtime.collection"), collection.running ? t("runtime.collecting") : absoluteTime(collection.last_finished_at)],
+    [t("runtime.collectionErrors"), collection.last_error || String(sourceErrors)],
+  ];
+  if (runtimeError) rows.push([t("runtime.connectionError"), runtimeError]);
+  $("#runtimeDetails").innerHTML = rows.map(([label, value]) => `<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join("");
 }
 
 /* 系统深色/浅色模式切换时，重绘一次以让 ringColor() 等运行时取色的地方生效。
@@ -682,19 +745,15 @@ function setupThemeReactivity() {
 
 /* ── 仪表盘渲染 ─────────────────────────────────────────── */
 
-const SNAPSHOT_KEY = "quotaboard_snapshot";
-
 function saveSnapshot(patch) {
   try {
-    const cur = JSON.parse(sessionStorage.getItem(SNAPSHOT_KEY) || "{}");
-    Object.assign(cur, patch);
-    sessionStorage.setItem(SNAPSHOT_KEY, JSON.stringify(cur));
+    writeSnapshot(sessionStorage, patch);
   } catch {}
 }
 
 function restoreSnapshot() {
   try {
-    const snap = JSON.parse(sessionStorage.getItem(SNAPSHOT_KEY) || "null");
+    const snap = readSnapshot(sessionStorage);
     if (!snap || typeof snap !== "object") return false;
     let restored = false;
     if (Array.isArray(snap.channels) && snap.channels.length) {
@@ -1160,7 +1219,9 @@ function renderLocalUsage() {
     return;
   }
   wrap.classList.remove("hidden");
-  wrap.innerHTML = visible.map((s) => renderLocalSource(s, localUsage.days)).join("");
+  const collected = localUsage.collecting ? t("runtime.collecting") : localUsage.collected_at ? fmtTime(localUsage.collected_at) : t("runtime.never");
+  const note = localUsage.source === "database" ? `<p class="local-collection-note">${esc(t("local.incremental", { time: collected }))}</p>` : "";
+  wrap.innerHTML = note + visible.map((s) => renderLocalSource(s, localUsage.days)).join("");
 }
 
 function renderLocalSource(source, days) {
@@ -1716,6 +1777,7 @@ function applyLang() {
   if (dashboardLoadedOnce) renderDashboard();
   renderLocalUsage();
   updateAutoRefreshLabel();
+  renderRuntimeStatus();
   // 打开的弹窗同步重绘
   if (!$("#settingsModal").classList.contains("hidden")) openSettingsModal();
   if (!$("#configModal").classList.contains("hidden")) {

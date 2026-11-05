@@ -34,6 +34,45 @@ def _record(uuid: str, timestamp_ms: int) -> dict:
     }
 
 
+def test_local_summary_uses_incremental_records_and_matches_overview(isolated_usage_db):
+    now = int(datetime.now(UTC).timestamp() * 1000)
+    first = {**_record("a", now), "input_tokens": 10, "cache_creation": 2, "cache_read": 4}
+    second = {**_record("b", now), "model": "another-model", "input_tokens": 20,
+              "total_cost_usd": "0.25", "has_cost": True}
+    old = _record("old", now - 30 * 86_400_000)
+    store.upsert_records("claude_code", [first, second, old])
+    store.upsert_records("opencode", [{**_record("o", now), "input_tokens": 50}])
+    store.upsert_records("codex", [{**_record("c", now), "input_tokens": 999}])
+    result = store.query_local_usage(14)
+    claude, opencode = result["sources"]
+    assert result["source"] == "database"
+    assert result["timezone"] == "UTC"
+    assert claude["available"] is True
+    assert claude["totals"]["input"] == 30
+    assert claude["totals"]["messages"] == 2
+    assert claude["totals"]["sessions"] == 1  # Same session, two models.
+    assert claude["totals"]["cache_write"] == 2
+    assert claude["totals"]["cache_read"] == 4
+    assert claude["totals"]["cost"] == .25
+    assert claude["totals"]["has_cost"] is True
+    assert len(claude["model_stats"]) == 2
+    assert opencode["totals"]["input"] == 50
+    overview = store.query_overview(14, "claude_code")
+    assert claude["totals"]["input"] == overview["input"]
+    assert claude["totals"]["messages"] == overview["requests"]
+
+
+def test_local_summary_keeps_known_sources_visible_without_recent_records(isolated_usage_db):
+    now = int(datetime.now(UTC).timestamp() * 1000)
+    store.upsert_records("claude_code", [_record("old", now - 30 * 86_400_000)])
+    result = store.query_local_usage(1)
+    claude, opencode = result["sources"]
+    assert claude["available"] is True
+    assert claude["totals"]["messages"] == 0
+    assert claude["model_stats"] == []
+    assert opencode["available"] is False
+
+
 def test_cleanup_deletes_expired_records_and_missing_file_cursors(isolated_usage_db):
     now_ms = int(datetime(2026, 8, 10, tzinfo=UTC).timestamp() * 1000)
     old_ms = now_ms - 400 * 86_400_000

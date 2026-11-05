@@ -531,7 +531,7 @@ def _aggregate_from_messages(cur, since_ms: int) -> dict:
 
 
 def get_local_usage(days: int = 14) -> dict:
-    """GET /api/local-usage 的数据来源：汇总所有本地统计数据源。
+    """CLI 的独立只读统计：汇总本地日志；Web 页使用 usage.store 的增量聚合。
 
     每个 source 字段名保持一致：key / label / available / message / path /
     model_stats / totals；不可用时 model_stats=[]、totals={}。

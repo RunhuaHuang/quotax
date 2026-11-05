@@ -14,6 +14,7 @@ from app.refresh_policy import record_http_error, retry_delay_ms, upstream_error
 @pytest.fixture
 def setup_refresh(monkeypatch, isolated_config):
     m._cache.clear()
+    m._rate_limits.clear()
     m._inflight.clear()
     monkeypatch.setattr(m.config_store, "HISTORY_DIR", isolated_config.parent / "history")
     clock = [1_000_000.0]
@@ -46,6 +47,84 @@ async def test_short_refresh_interval_actually_queries_when_due(setup_refresh, m
     clock[0] += 1
     assert not (await m._get_channel_result(c, False, 30))[1]
     assert len(calls) == 2
+
+
+async def test_cache_expires_at_thirty_minutes_even_with_long_requested_age(setup_refresh, monkeypatch):
+    c, clock = setup_refresh
+    calls = []
+
+    async def query(c):
+        calls.append(c.id)
+        return success(c)
+
+    monkeypatch.setattr(m, "query_channel", query)
+    await m._get_channel_result(c, False, 86400)
+    clock[0] += 1799
+    assert (await m._get_channel_result(c, False, 86400))[1]
+    clock[0] += 1
+    assert not (await m._get_channel_result(c, False, 86400))[1]
+    assert len(calls) == 2
+
+
+async def test_repeated_failures_do_not_renew_old_success(setup_refresh, monkeypatch):
+    c, clock = setup_refresh
+    responses = [success(c), failure(c), failure(c)]
+
+    async def query(_):
+        return responses.pop(0)
+
+    monkeypatch.setattr(m, "query_channel", query)
+    await m._get_channel_result(c, True)
+    clock[0] += 1790
+    assert (await m._get_channel_result(c, True))[0]["status"] == "stale"
+    clock[0] += 10
+    result, _ = await m._get_channel_result(c, True)
+    assert result["status"] == "error"
+    assert result["windows"] == []
+    assert result["refresh"]["last_success_at"] is None
+
+
+async def test_background_sweep_removes_idle_cache_without_requests(setup_refresh, monkeypatch):
+    c, clock = setup_refresh
+    m._cache[c.id] = (clock[0] * 1000, success(c).to_dict())
+    clock[0] += 1800
+    tick = asyncio.Event()
+
+    async def wait_for_next_sweep(_):
+        tick.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(m.asyncio, "sleep", wait_for_next_sweep)
+    task = asyncio.create_task(m._cache_maintenance_loop())
+    await tick.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not m._cache
+
+
+async def test_cache_expiry_preserves_long_upstream_rate_limit(setup_refresh, monkeypatch):
+    c, clock = setup_refresh
+    calls = []
+
+    async def query(c):
+        calls.append(c.id)
+        record_http_error(429, "3600")
+        return failure(c)
+
+    monkeypatch.setattr(m, "query_channel", query)
+    await m._get_channel_result(c, True)
+    clock[0] += 1800
+    result, _ = await m._get_channel_result(c, True)
+    assert c.id not in m._cache
+    assert result["refresh"]["upstream_status"] == 429
+    assert result["windows"] == []
+    assert len(calls) == 1
+    clock[0] += 1800
+    await m._get_channel_result(c, True)
+    assert len(calls) == 2
+    await m._invalidate_cache(c.id)
+    assert c.id not in m._rate_limits
 
 
 async def test_failure_keeps_good_values_backs_off_and_recovers(setup_refresh, monkeypatch):

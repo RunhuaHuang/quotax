@@ -32,6 +32,9 @@ credentials/
 .playwright-mcp/
 .ruff_cache/
 .pytest_cache/
+node_modules/
+test-results/
+playwright-report/
 
 # 系统文件
 .DS_Store

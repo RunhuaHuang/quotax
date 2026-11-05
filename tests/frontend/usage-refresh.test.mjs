@@ -2,15 +2,16 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { createApiClient } from '../../static/api-client.js';
 
 function setup() {
   const calls=[];
-  const context=vm.createContext({ AbortController, AbortSignal, Date,
+  const context=vm.createContext({ AbortController, AbortSignal, Date, expireRequests:()=>0,
     document:{addEventListener(){}},window:{addEventListener(){}},localStorage:{getItem:()=>null},
     begin: kind=>new Promise(resolve=>calls.push({kind,resolve})),
   });
   const code=readFileSync(new URL('../../static/usage.js',import.meta.url),'utf8')
-    .replace(/^import .*;$/m,'').replace('export function refreshUsageView','function refreshUsageView');
+    .replace(/^import .*;$/mg,'').replace('export function refreshUsageView','function refreshUsageView');
   vm.runInContext(code,context);
   vm.runInContext('loadAll=()=>begin("read"); collectNow=()=>begin("collect");',context);
   return {context,calls};
@@ -39,13 +40,14 @@ test('automatic read cannot cancel active manual collection',async()=>{
 
 function actualSetup() {
   const calls=[];
+  const client=createApiClient({fetchFn:(url,options)=>new Promise(resolve=>calls.push({url,options,resolve}))});
   const context=vm.createContext({ AbortController, AbortSignal, Date, URLSearchParams,
+    apiJSON:client.json,expireRequests:client.expire,
     document:{addEventListener(){},querySelector:()=>null},
     window:{addEventListener(){}},localStorage:{getItem:()=>null,setItem(){}},
-    fetch:(url,options)=>new Promise(resolve=>calls.push({url,options,resolve})),
   });
   const code=readFileSync(new URL('../../static/usage.js',import.meta.url),'utf8')
-    .replace(/^import .*;$/m,'').replace('export function refreshUsageView','function refreshUsageView');
+    .replace(/^import .*;$/mg,'').replace('export function refreshUsageView','function refreshUsageView');
   vm.runInContext(code,context);
   vm.runInContext('renderUsage=()=>{}; renderUsageSkeleton=()=>{}; usageState.loaded=true; usageState.overview={requests:10};',context);
   return {context,calls};

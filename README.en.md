@@ -142,7 +142,7 @@ This is not "not logged in", so QuotaX **does not** prompt "please re-login". In
 
 Switch via the top-bar "Quota / **Usage**" tab. The Usage tab is a standalone analytics dashboard backed by SQLite-persisted incremental collection — trend / model distribution / request log / cost estimation. Design reference: [Buktal/VaultOne](https://github.com/Buktal/VaultOne).
 
-Unlike the quota page's local stats (real-time full aggregation, no persistence, just a current-window summary), this one **persists parsed results** to `usage.db` (same dir as config.json), enabling history trends, per-request detail, and incremental scanning (no full re-scan).
+Parsed results persist to `usage.db` (same directory as config.json), enabling history trends, per-request detail, and incremental scanning. Since 1.3.1, the quota page's local summary reads the same database using UTC calendar days, instead of rescanning every transcript on refresh. The last collection time is shown above the summary. The standalone CLI local-statistics command can still read logs directly.
 
 ### Data sources
 
@@ -242,9 +242,15 @@ Exit codes: `0` all OK; `1` has error/expired channels; `2` config corrupted or 
 
 The browser updates cards individually, with one shared request per channel and a maximum of four concurrent provider queries. Each channel has a 45-second total deadline, including queue time. Manual refresh cannot be cancelled by automatic refresh, and responses from before an edit/delete cannot restore obsolete cards.
 
-The selected interval (default five minutes) is the acceptable age of successful data; `GET /api/quotas` accepts `max_age_seconds=30..86400` (default 300). Background monitoring uses its own interval. Temporary failures retry after 30/60/120/240/300 seconds. A 429 respects `Retry-After` (seconds or HTTP date), defaulting to 15 minutes. Manual refresh never bypasses a rate-limit deadline. Expired credentials prompt login and retry automatically after five minutes.
+The selected interval (default five minutes) is the acceptable age of successful data, capped at 30 minutes; `GET /api/quotas` accepts `max_age_seconds=30..86400` (default 300). Background monitoring uses its own interval. Temporary failures retry after 30/60/120/240/300 seconds. A 429 respects `Retry-After` (seconds or HTTP date), defaulting to 15 minutes. Manual refresh never bypasses a rate-limit deadline. Expired credentials prompt login and retry automatically after five minutes.
 
-Failed queries keep the last successful numbers with a `stale` status and error message; stale values never trigger or resolve monitoring alerts. Cards show data age and query eligibility, while the header shows the last check. Hidden/offline pages pause polling and resume with an age check. Refresh applies to the current view. Local usage is collected at startup and 60 seconds after each background scan completes; overlapping scans are shared. The local summary endpoint caches scans for 30 seconds.
+Failed queries keep the last successful numbers for up to 30 minutes with a `stale` status and error message; stale values never trigger or resolve monitoring alerts. Cards show data age and query eligibility, while the header shows the last check. Hidden/offline pages pause polling and resume with an age check. Refresh applies to the current view. Local usage is collected at startup and 60 seconds after each background scan completes; overlapping scans are shared. The local summary endpoint queries SQLite without scanning transcripts or delaying quota refreshes.
+
+Query payloads and session snapshots expire after 30 minutes. The backend sweeps every minute even without browser requests, and refuses expired entries on access. The page clears snapshots periodically and on resume; legacy snapshots without timestamps are discarded. Retries and updates to other channels cannot extend old data. Longer upstream rate-limit deadlines remain enforced. Accounts, preferences, usage history and original CLI transcripts are preserved.
+
+Refresh requests have a deadline covering response-body decoding. Page resume, focus, bfcache restoration, reconnect and missed heartbeats check elapsed wall time and release expired requests before retrying. Recovery does not turn automatic refresh back on when it was disabled. Startup failures can be retried in the same tab.
+
+The runtime panel at the bottom shows the actual service version, installation/data directories, collection state and next refresh. Static assets are revalidated after upgrades. A version-change notice lets you save any unfinished edits before reloading.
 
 ## Data directory and upgrades
 
@@ -255,6 +261,7 @@ On first use, legacy config, credentials, history, monitor state and the SQLite 
 ## Diagnostics
 
 - `GET /api/health`: version, config status, SQLite size/records, latest collection, and monitor state;
+- `GET /api/runtime`: lightweight version, installation/data directory and collection status for the browser;
 - `GET /api/monitor/status`: scheduler state, previous/next run, active alerts, and latest error;
 - `POST /api/monitor/run`: run an immediate check (force refresh by default);
 - `GET /api/usage/status` / `POST /api/usage/cleanup`: local usage collection and retention diagnostics.
@@ -276,7 +283,9 @@ On macOS/Linux these variables can live in the installation's `quotax.env` (perm
 
 ## Packaging and release checks
 
-Run `uv sync --locked`, `uv run pytest -q`, `node --test tests/frontend/refresh-controller.test.mjs tests/frontend/usage-refresh.test.mjs tests/frontend/view-utils.test.mjs`, `uv run ruff check app tests scripts`, `uv build --wheel`, and `uv run python scripts/package_release.py`.
+Run `uv sync --locked`, `uv run pytest -q`, `node --test tests/frontend/*.test.mjs`, `uv run ruff check app tests scripts`, `uv build --wheel`, and `uv run python scripts/package_release.py`.
+
+Browser tests: `npm ci`, `npx playwright install chromium`, then `npm run test:browser`. With Chrome already installed, use `QUOTAX_TEST_BROWSER_CHANNEL=chrome npm run test:browser`. Tests use temporary storage and mock accounts; they never read host credentials or query real providers.
 
 The allowlisted source ZIP and SHA-256 file exclude personal config, credentials, usage databases and unrelated working files. Extract the ZIP and run `bash install.sh` (macOS/Linux) or `powershell -ExecutionPolicy Bypass -File .\install.ps1` (Windows). Local source installation skips GitHub downloads but still needs dependencies on first install.
 

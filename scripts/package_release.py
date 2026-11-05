@@ -12,7 +12,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FILES = {"AGENTS.md", "README.md", "README.en.md", "pyproject.toml", "uv.lock", ".gitignore",
-         "install.sh", "install.ps1", "quotax", "quotax.cmd", "run.sh"}
+         "install.sh", "install.ps1", "quotax", "quotax.cmd", "run.sh",
+         "package.json", "package-lock.json", "playwright.config.js"}
 DIRECTORIES = {"app", "static", "tests", "scripts", ".github", "docs"}
 EXCLUDED = {"__pycache__", ".pytest_cache", ".ruff_cache", ".DS_Store"}
 

@@ -5,7 +5,8 @@
 // 本文件是独立 ES module（与 app.js 作用域隔离），自带 $ / esc / fmtTime 等工具，
 // 不依赖 app.js 暴露全局变量——避免加载顺序耦合。
 
-import { t, getLang } from "./i18n.js?v=12";
+import { t, getLang } from "./i18n.js?v=14";
+import { apiJSON, expireRequests } from "./api-client.js?v=14";
 
 const $ = (sel) => document.querySelector(sel);
 const USAGE_DAYS_KEY = "quotaboard_prefs.usage_days";
@@ -41,7 +42,7 @@ function beginUsageRequest() {
   return {
     data: { overview: usageState.overview, trend: usageState.trend, models: usageState.models, log: usageState.log, filters: usageState.filters },
     revision: usageRequestRevision,
-    signal: AbortSignal.any([controller.signal, AbortSignal.timeout(60_000)]),
+    signal: controller.signal,
     days: usageState.days,
     source: usageState.source,
     model: usageState.model,
@@ -89,6 +90,7 @@ function saveUsagePrefs() {
 
 // Re-entering a view checks age instead of permanently keeping the first snapshot.
 export function refreshUsageView(force = false) {
+  expireRequests();
   if (usageRefreshPromise) {
     if (usageRefreshUpgrade) return usageRefreshUpgrade;
     if (!force || usageRefreshForced) return usageRefreshPromise;
@@ -146,9 +148,7 @@ async function loadAll() {
 async function loadOverview(ctx = beginUsageRequest()) {
   try {
     const p = usageParams(ctx);
-    const res = await fetch(`/api/usage/overview?${p}`, { signal: ctx.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const data = await apiJSON(`/api/usage/overview?${p}`, { signal: ctx.signal, timeout: 60_000 });
     if (isCurrentUsageRequest(ctx)) ctx.data.overview = data;
   } catch (e) {
     if (e?.name !== "AbortError" && ctx.revision === usageRequestRevision) usageLoadError = e.message;
@@ -158,9 +158,7 @@ async function loadOverview(ctx = beginUsageRequest()) {
 async function loadTrend(ctx = beginUsageRequest()) {
   try {
     const p = usageParams(ctx);
-    const res = await fetch(`/api/usage/trend?${p}`, { signal: ctx.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const data = await apiJSON(`/api/usage/trend?${p}`, { signal: ctx.signal, timeout: 60_000 });
     if (isCurrentUsageRequest(ctx)) ctx.data.trend = data;
   } catch (e) {
     if (e?.name !== "AbortError" && ctx.revision === usageRequestRevision) usageLoadError = e.message;
@@ -170,9 +168,7 @@ async function loadTrend(ctx = beginUsageRequest()) {
 async function loadModels(ctx = beginUsageRequest()) {
   try {
     const p = usageParams(ctx, { metric: ctx.metric });
-    const res = await fetch(`/api/usage/models?${p}`, { signal: ctx.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const data = await apiJSON(`/api/usage/models?${p}`, { signal: ctx.signal, timeout: 60_000 });
     if (isCurrentUsageRequest(ctx)) ctx.data.models = data;
   } catch (e) {
     if (e?.name !== "AbortError" && ctx.revision === usageRequestRevision) usageLoadError = e.message;
@@ -184,9 +180,7 @@ async function loadLog({ append = false } = {}, ctx = beginUsageRequest()) {
     const currentRows = usageState.log?.rows || [];
     const offset = append ? currentRows.length : 0;
     const p = usageParams(ctx, { limit: "200", offset: String(offset) });
-    const res = await fetch(`/api/usage/log?${p}`, { signal: ctx.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const page = await res.json();
+    const page = await apiJSON(`/api/usage/log?${p}`, { signal: ctx.signal, timeout: 60_000 });
     if (!isCurrentUsageRequest(ctx)) return;
     ctx.data.log = append
       ? { ...page, rows: [...currentRows, ...(page.rows || [])], offset: offset }
@@ -200,9 +194,7 @@ async function loadLog({ append = false } = {}, ctx = beginUsageRequest()) {
 
 async function loadFilters(ctx = beginUsageRequest()) {
   try {
-    const res = await fetch(`/api/usage/filters?days=${ctx.days}`, { signal: ctx.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const data = await apiJSON(`/api/usage/filters?days=${ctx.days}`, { signal: ctx.signal, timeout: 60_000 });
     if (isCurrentUsageRequest(ctx)) ctx.data.filters = data;
   } catch (e) {
     if (e?.name !== "AbortError" && isCurrentUsageRequest(ctx)) {
@@ -219,12 +211,10 @@ function collectNow() {
 async function performCollection() {
   usageState.collecting = true;
   // Collection changes server state and must survive read/filter cancellation.
-  const signal = AbortSignal.timeout(60_000);
   const btn = $("#usageCollectBtn");
   if (btn) { btn.disabled = true; btn.textContent = t("usage.collecting"); }
   try {
-    const res = await fetch("/api/usage/collect", { method: "POST", signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    await apiJSON("/api/usage/collect", { method: "POST", timeout: 60_000 });
     await reloadAll();
   } catch (e) {
     if (e?.name !== "AbortError") toast(t("usage.collectFailed", { msg: e.message }), "err");

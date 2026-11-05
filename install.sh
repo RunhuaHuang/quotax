@@ -267,7 +267,7 @@ NEW_DIR="$PERM_DIR.new"
 rm -rf "$NEW_DIR"
 mkdir -p "$NEW_DIR"
 # Explicit source allowlist: never install the developer's config, credentials or database.
-for item in app static scripts tests docs .github AGENTS.md README.md README.en.md pyproject.toml uv.lock .gitignore install.sh install.ps1 quotax quotax.cmd run.sh; do
+for item in app static scripts tests docs .github AGENTS.md README.md README.en.md pyproject.toml uv.lock package.json package-lock.json playwright.config.js .gitignore install.sh install.ps1 quotax quotax.cmd run.sh; do
   if [ -e "$SRC_DIR/$item" ]; then cp -R "$SRC_DIR/$item" "$NEW_DIR/$item"; fi
 done
 find "$NEW_DIR" -type d -name __pycache__ -prune -exec rm -rf {} +

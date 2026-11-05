@@ -156,7 +156,7 @@ try {
   if (Test-Path $NewDir) { Remove-Item $NewDir -Recurse -Force }
   New-Item -ItemType Directory -Path $NewDir -Force | Out-Null
   # 拷贝源码到临时目录，排除 .git。
-  $SourceAllowlist = @("app", "static", "scripts", "tests", "docs", ".github", "AGENTS.md", "README.md", "README.en.md", "pyproject.toml", "uv.lock", ".gitignore", "install.sh", "install.ps1", "quotax", "quotax.cmd", "run.sh")
+  $SourceAllowlist = @("app", "static", "scripts", "tests", "docs", ".github", "AGENTS.md", "README.md", "README.en.md", "pyproject.toml", "uv.lock", "package.json", "package-lock.json", "playwright.config.js", ".gitignore", "install.sh", "install.ps1", "quotax", "quotax.cmd", "run.sh")
   Get-ChildItem -Path $SrcDir -Force | Where-Object { $_.Name -in $SourceAllowlist } | ForEach-Object {
     Copy-Item $_.FullName (Join-Path $NewDir $_.Name) -Recurse -Force
   }
